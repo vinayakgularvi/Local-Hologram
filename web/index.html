@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Local Hologram — 2D twin</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="header">
+        <h1>Local Hologram</h1>
+        <p class="tagline">Type → think → speak → lip sync (photo)</p>
+      </header>
+
+      <main class="main">
+        <section class="stage" aria-label="Avatar">
+          <div class="avatar-wrap">
+            <div
+              id="avatar-root"
+              class="avatar-host"
+              style="--mouth-open: 0"
+              role="img"
+              aria-label="Presenter avatar with lip sync"
+            >
+              <div class="photo-avatar">
+                <div class="photo-avatar__frame">
+                  <!-- In-flow image sets frame height so the full photo fits (contain). Canvas matches and draws mouth warp. -->
+                  <img
+                    id="photo-avatar-img"
+                    class="photo-avatar__img"
+                    src="/avatar-photo.png"
+                    alt=""
+                    width="800"
+                    height="1200"
+                    decoding="async"
+                  />
+                  <canvas id="photo-avatar-canvas" class="photo-avatar__canvas" aria-hidden="true"></canvas>
+                </div>
+              </div>
+            </div>
+            <div id="emotion-label" class="emotion-label" aria-live="polite">neutral</div>
+            <p class="calibrate-hint">
+              <strong>MediaPipe</strong> auto-detects mouth &amp; eyes when possible. Lip sync follows your audio; idle
+              blinks use AI eye positions. If the face isn’t found, tune <code>--mouth-cx</code> … in
+              <code>styles.css</code>.
+            </p>
+          </div>
+        </section>
+
+        <section class="panel">
+          <label for="user-input" class="label">Your message</label>
+          <textarea
+            id="user-input"
+            rows="3"
+            placeholder="Ask something…"
+            autocomplete="off"
+          ></textarea>
+          <div class="actions">
+            <button type="button" id="send-btn" class="btn primary">Send</button>
+            <button type="button" id="speak-direct-btn" class="btn ghost" title="Speak your text without the model">
+              Speak only
+            </button>
+          </div>
+          <p id="status" class="status" role="status"></p>
+          <div class="reply-box">
+            <h2 class="reply-title">Reply</h2>
+            <p id="reply-text" class="reply-text"></p>
+          </div>
+        </section>
+      </main>
+
+      <footer class="footer">
+        <small>Brain: Gemini · Voice: Edge TTS + Web Audio · Face: MediaPipe landmarks + canvas · Fallback: Web Speech</small>
+      </footer>
+    </div>
+    <script type="module" src="/main.ts"></script>
+  </body>
+</html>
