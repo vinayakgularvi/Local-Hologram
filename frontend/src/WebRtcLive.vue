@@ -23,7 +23,15 @@ const finalTranscript = ref("");
 const interimTranscript = ref("");
 
 /** Silence after last speech before auto-stopping recognition (ms) */
-const SILENCE_MS = 1500;
+const SILENCE_MS = Math.max(
+  250,
+  Number.parseInt(import.meta.env.VITE_VOICE_SILENCE_MS || "550", 10) || 550
+);
+/** Once we get a final chunk, stop quickly to reduce turn latency. */
+const FINAL_RESULT_STOP_MS = Math.max(
+  120,
+  Number.parseInt(import.meta.env.VITE_VOICE_FINAL_STOP_MS || "220", 10) || 220
+);
 let silenceTimer = null;
 let voiceSessionCancelled = false;
 
@@ -199,7 +207,7 @@ function clearSilenceTimer() {
   }
 }
 
-function scheduleSilenceStop() {
+function scheduleStopAfter(delayMs) {
   clearSilenceTimer();
   silenceTimer = window.setTimeout(() => {
     silenceTimer = null;
@@ -210,7 +218,11 @@ function scheduleSilenceStop() {
         /* ignore */
       }
     }
-  }, SILENCE_MS);
+  }, Math.max(80, delayMs));
+}
+
+function scheduleSilenceStop() {
+  scheduleStopAfter(SILENCE_MS);
 }
 
 async function runVoicePipeline(userText) {
@@ -278,25 +290,31 @@ function toggleMic() {
   const SR = speechRecCtor.value;
   recInstance = new SR();
   recInstance.lang = (typeof navigator !== "undefined" && navigator.language) || "en-US";
-  recInstance.continuous = true;
+  // Single utterance mode returns final results faster than long continuous mode.
+  recInstance.continuous = false;
   recInstance.interimResults = true;
+  recInstance.maxAlternatives = 1;
   finalTranscript.value = "";
   interimTranscript.value = "";
 
   recInstance.onresult = (event) => {
     let interim = "";
     let hasText = false;
+    let sawFinal = false;
     for (let i = event.resultIndex; i < event.results.length; i++) {
       const piece = event.results[i][0].transcript;
       if (piece.trim()) hasText = true;
       if (event.results[i].isFinal) {
+        sawFinal = true;
         finalTranscript.value += `${piece.trim()} `;
       } else {
         interim += piece;
       }
     }
     interimTranscript.value = interim;
-    if (hasText) {
+    if (sawFinal) {
+      scheduleStopAfter(FINAL_RESULT_STOP_MS);
+    } else if (hasText) {
       scheduleSilenceStop();
     }
   };

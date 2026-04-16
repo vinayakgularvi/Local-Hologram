@@ -52,6 +52,7 @@ def _env_first_int(*keys: str, default: int) -> int:
 OLLAMA_BASE = os.environ.get("OLLAMA_BASE", "http://10.29.145.124:8000").rstrip("/")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "AFM-4.5B-Q4_K_M.gguf")
 MODEL_API_STYLE = os.environ.get("MODEL_API_STYLE", "auto").strip().lower()
+VOICE_MAX_TOKENS = max(16, _env_first_int("VOICE_MAX_TOKENS", default=96))
 VOICE_OLLAMA_INSTRUCTION = os.environ.get(
     "VOICE_OLLAMA_INSTRUCTION",
     "You are a hologram voice assistant. Reply in at most 2 short natural sentences "
@@ -215,6 +216,8 @@ def _is_openai_compatible_style() -> bool:
 async def _stream_openai_compatible(
     prompt: str,
     metrics: dict[str, Any] | None = None,
+    *,
+    max_tokens: int | None = None,
 ) -> AsyncIterator[str]:
     base = OLLAMA_BASE[:-3] if OLLAMA_BASE.endswith("/v1") else OLLAMA_BASE
     payload = {
@@ -224,6 +227,8 @@ async def _stream_openai_compatible(
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    if max_tokens is not None:
+        payload["max_tokens"] = int(max_tokens)
     async with httpx.AsyncClient(timeout=300.0) as client:
         async with client.stream(
             "POST",
@@ -265,6 +270,8 @@ async def _stream_openai_compatible(
 async def _stream_ollama_native(
     prompt: str,
     metrics: dict[str, Any] | None = None,
+    *,
+    max_tokens: int | None = None,
 ) -> AsyncIterator[str]:
     payload = {
         "model": OLLAMA_MODEL,
@@ -272,6 +279,8 @@ async def _stream_ollama_native(
         "stream": True,
         "options": {"temperature": 0.7},
     }
+    if max_tokens is not None:
+        payload["options"]["num_predict"] = int(max_tokens)
     async with httpx.AsyncClient(timeout=300.0) as client:
         async with client.stream(
             "POST",
@@ -314,19 +323,26 @@ async def _stream_ollama_native(
 async def ollama_stream_tokens(
     prompt: str,
     metrics: dict[str, Any] | None = None,
+    *,
+    max_tokens: int | None = None,
 ) -> AsyncIterator[str]:
     """Yields incremental text tokens from configured model server stream API."""
     if _is_openai_compatible_style():
-        async for tok in _stream_openai_compatible(prompt, metrics):
+        async for tok in _stream_openai_compatible(prompt, metrics, max_tokens=max_tokens):
             yield tok
     else:
-        async for tok in _stream_ollama_native(prompt, metrics):
+        async for tok in _stream_ollama_native(prompt, metrics, max_tokens=max_tokens):
             yield tok
 
 
-async def ollama_generate(prompt: str, metrics: dict[str, Any] | None = None) -> str:
+async def ollama_generate(
+    prompt: str,
+    metrics: dict[str, Any] | None = None,
+    *,
+    max_tokens: int | None = None,
+) -> str:
     parts: list[str] = []
-    async for t in ollama_stream_tokens(prompt, metrics):
+    async for t in ollama_stream_tokens(prompt, metrics, max_tokens=max_tokens):
         parts.append(t)
     text = "".join(parts).strip()
     if not text:
@@ -554,6 +570,7 @@ async def health():
         "ollama": OLLAMA_BASE,
         "model": OLLAMA_MODEL,
         "model_api_style": MODEL_API_STYLE,
+        "voice_max_tokens": VOICE_MAX_TOKENS,
         "lipsync_file_api": LIPSYNC_FILE_API_URL,
         "checkpoint_path": LIPSYNC_CHECKPOINT_PATH,
         "fps": LIPSYNC_FPS,
@@ -596,7 +613,7 @@ async def voice_turn(body: VoiceTurnBody):
     )
     t0 = time.perf_counter()
     ollama_metrics: dict[str, Any] = {}
-    answer = await ollama_generate(prompt, ollama_metrics)
+    answer = await ollama_generate(prompt, ollama_metrics, max_tokens=VOICE_MAX_TOKENS)
     total_ms = (time.perf_counter() - t0) * 1000.0
     if os.environ.get("ANALYTICS_DISABLE", "").strip().lower() not in (
         "1",
