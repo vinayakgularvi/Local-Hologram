@@ -13,6 +13,9 @@ export default defineConfig({
             return;
           }
           const path = req.url.split("?")[0];
+          if (path === "/favicon.ico") {
+            req.url = "/favicon.svg";
+          }
           if (path === "/analytics" || path === "/analystics") {
             req.url = "/";
           }

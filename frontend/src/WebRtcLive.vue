@@ -21,6 +21,11 @@ const micListening = ref(false);
 const voiceThinking = ref(false);
 const finalTranscript = ref("");
 const interimTranscript = ref("");
+const WEBRTC_ICE_GATHER_TIMEOUT_MS = Math.max(
+  80,
+  Number.parseInt(import.meta.env.VITE_WEBRTC_ICE_GATHER_TIMEOUT_MS || "250", 10) || 250
+);
+const WEBRTC_STUN_URL = String(import.meta.env.VITE_WEBRTC_STUN_URL || "stun:stun.l.google.com:19302").trim();
 
 /** Silence after last speech before auto-stopping recognition (ms) */
 const SILENCE_MS = Math.max(
@@ -34,6 +39,7 @@ const FINAL_RESULT_STOP_MS = Math.max(
 );
 let silenceTimer = null;
 let voiceSessionCancelled = false;
+let toneAudioCtx = null;
 
 const speechRecCtor = computed(() => {
   if (typeof window === "undefined") return null;
@@ -70,18 +76,37 @@ fetch(signalingUrl("/api/webrtc"))
     proxyConfigured.value = false;
   });
 
-function waitIceGatheringComplete(conn) {
+function waitIceGatheringFast(conn) {
   if (conn.iceGatheringState === "complete") {
     return Promise.resolve();
   }
   return new Promise((resolve) => {
+    let done = false;
+    const timer = window.setTimeout(() => {
+      finish();
+    }, WEBRTC_ICE_GATHER_TIMEOUT_MS);
+    const finish = () => {
+      if (done) return;
+      done = true;
+      window.clearTimeout(timer);
+      conn.removeEventListener("icegatheringstatechange", onState);
+      conn.removeEventListener("icecandidate", onCandidate);
+      resolve();
+    };
     const onState = () => {
       if (conn.iceGatheringState === "complete") {
-        conn.removeEventListener("icegatheringstatechange", onState);
-        resolve();
+        finish();
+      }
+    };
+    const onCandidate = (ev) => {
+      const cand = ev?.candidate?.candidate || "";
+      // Host candidate is typically available first on local/LAN and enables fast offer send.
+      if (cand.includes(" typ host ")) {
+        finish();
       }
     };
     conn.addEventListener("icegatheringstatechange", onState);
+    conn.addEventListener("icecandidate", onCandidate);
   });
 }
 
@@ -91,7 +116,7 @@ async function negotiate() {
   pc.addTransceiver("audio", { direction: "recvonly" });
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
-  await waitIceGatheringComplete(pc);
+  await waitIceGatheringFast(pc);
   const local = pc.localDescription;
   if (!local) throw new Error("Missing local description");
 
@@ -126,13 +151,19 @@ async function connect() {
   try {
     const config = {
       sdpSemantics: "unified-plan",
-      iceServers: [{ urls: ["stun:stun.l.google.com:19302"] }],
+      iceServers: WEBRTC_STUN_URL ? [{ urls: [WEBRTC_STUN_URL] }] : [],
     };
     pc = new RTCPeerConnection(config);
     pc.addEventListener("track", (evt) => {
       const stream = evt.streams[0];
       if (!stream) return;
       if (evt.track.kind === "video" && videoEl.value) {
+        try {
+          // Hint decoder for detail-first quality where supported (helps with 4K-like streams).
+          evt.track.contentHint = "detail";
+        } catch {
+          /* ignore unsupported browsers */
+        }
         const v = videoEl.value;
         v.srcObject = stream;
         const onReady = () => {
@@ -223,6 +254,63 @@ function scheduleStopAfter(delayMs) {
 
 function scheduleSilenceStop() {
   scheduleStopAfter(SILENCE_MS);
+}
+
+function playMicTone(kind) {
+  if (typeof window === "undefined") return;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return;
+  const emit = () => {
+    if (!toneAudioCtx || toneAudioCtx.state !== "running") return;
+    const now = toneAudioCtx.currentTime;
+    const osc = toneAudioCtx.createOscillator();
+    const gain = toneAudioCtx.createGain();
+    osc.type = kind === "tap" ? "square" : "triangle";
+    if (kind === "tap") {
+      osc.frequency.setValueAtTime(1200, now);
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(0.32, now + 0.006);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.055);
+      osc.stop(now + 0.065);
+    } else if (kind === "on") {
+      osc.frequency.setValueAtTime(980, now);
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(0.24, now + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.14);
+      osc.stop(now + 0.16);
+    } else {
+      osc.frequency.setValueAtTime(620, now);
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(0.2, now + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.12);
+      osc.stop(now + 0.14);
+    }
+    osc.connect(gain);
+    gain.connect(toneAudioCtx.destination);
+    osc.start(now);
+    osc.onended = () => {
+      try {
+        osc.disconnect();
+        gain.disconnect();
+      } catch {
+        /* ignore */
+      }
+    };
+  };
+  try {
+    if (!toneAudioCtx) {
+      toneAudioCtx = new AC();
+    }
+    if (toneAudioCtx.state === "suspended") {
+      void toneAudioCtx.resume().then(() => {
+        emit();
+      });
+      return;
+    }
+    emit();
+  } catch {
+    /* ignore audio tone failures */
+  }
 }
 
 async function runVoicePipeline(userText) {
@@ -337,6 +425,7 @@ function toggleMic() {
     clearSilenceTimer();
     recInstance = null;
     micListening.value = false;
+    playMicTone("off");
     if (voiceSessionCancelled) {
       voiceSessionCancelled = false;
       finalTranscript.value = "";
@@ -361,10 +450,11 @@ function toggleMic() {
   }
 }
 
+function onMicPointerDown() {
+  playMicTone("tap");
+}
+
 const liveCaption = computed(() => {
-  if (voiceThinking.value) {
-    return "Getting reply…";
-  }
   return `${finalTranscript.value} ${interimTranscript.value}`.trim();
 });
 
@@ -417,6 +507,7 @@ onUnmounted(() => {
                 ? 'Listening… tap to cancel'
                 : 'Tap to speak'
           "
+          @pointerdown="onMicPointerDown"
           @click="toggleMic"
         >
           <svg

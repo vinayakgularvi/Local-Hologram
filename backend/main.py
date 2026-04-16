@@ -141,6 +141,35 @@ app.add_middleware(
 )
 
 app.mount("/outputs", StaticFiles(directory=str(OUTPUT_DIR)), name="outputs")
+_analytics_subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
+
+
+def _analytics_snapshot(limit: int = 40) -> dict[str, Any]:
+    return {
+        "summary": {"kind": "voice_turns", **get_summary()},
+        "recent": get_recent_voice_turns(limit),
+    }
+
+
+async def _publish_analytics_snapshot() -> None:
+    if not _analytics_subscribers:
+        return
+    payload = _analytics_snapshot(limit=40)
+    stale: list[asyncio.Queue[dict[str, Any]]] = []
+    for q in list(_analytics_subscribers):
+        try:
+            q.put_nowait(payload)
+        except asyncio.QueueFull:
+            try:
+                _ = q.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                q.put_nowait(payload)
+            except asyncio.QueueFull:
+                stale.append(q)
+    for q in stale:
+        _analytics_subscribers.discard(q)
 
 
 async def _forward_webrtc_post(subpath: str, request: Request) -> Response:
@@ -630,6 +659,7 @@ async def voice_turn(body: VoiceTurnBody):
             ollama_total_duration_ns=ollama_metrics.get("total_duration_ns"),
             ollama_load_duration_ns=ollama_metrics.get("load_duration_ns"),
         )
+        await _publish_analytics_snapshot()
     return {"answer": answer, "heard": user_text}
 
 
@@ -645,6 +675,33 @@ async def analytics_voice_turns(limit: int = 50):
     return {"items": get_recent_voice_turns(limit)}
 
 
+@app.get("/api/analytics/stream")
+async def analytics_stream():
+    """SSE stream of analytics snapshots (push updates, no client polling)."""
+    q: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=1)
+    _analytics_subscribers.add(q)
+
+    async def gen() -> AsyncIterator[str]:
+        try:
+            # Send initial state immediately.
+            yield sse_event({"type": "snapshot", **_analytics_snapshot(limit=40)})
+            while True:
+                try:
+                    payload = await asyncio.wait_for(q.get(), timeout=20.0)
+                    yield sse_event({"type": "snapshot", **payload})
+                except asyncio.TimeoutError:
+                    # Keep-alive comment for proxies and idle connections.
+                    yield ": keepalive\n\n"
+        finally:
+            _analytics_subscribers.discard(q)
+
+    return StreamingResponse(
+        flush_sse_stream(gen()),
+        media_type="text/event-stream",
+        headers=dict(SSE_STREAM_HEADERS),
+    )
+
+
 class AnalyticsResetBody(BaseModel):
     secret: str = Field(..., min_length=1, max_length=256)
 
@@ -656,6 +713,7 @@ async def analytics_reset(body: AnalyticsResetBody):
     if not expected or body.secret != expected:
         raise HTTPException(status_code=403, detail="Invalid or unset ANALYTICS_RESET_SECRET.")
     n = clear_all()
+    await _publish_analytics_snapshot()
     return {"cleared": n}
 
 

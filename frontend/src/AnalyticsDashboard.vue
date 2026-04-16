@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 
 const loading = ref(true);
 const err = ref("");
@@ -7,6 +7,9 @@ const summary = ref(null);
 const recent = ref([]);
 const resetSecret = ref("");
 const resetMsg = ref("");
+const streamState = ref("connecting");
+const lastUpdatedAt = ref("");
+let es = null;
 
 function apiUrl(path) {
   const p = path.startsWith("/") ? path : `/${path}`;
@@ -22,10 +25,16 @@ function apiUrl(path) {
   return p;
 }
 
-async function loadAll() {
-  loading.value = true;
+function applySnapshot(payload) {
+  summary.value = payload.summary || null;
+  recent.value = Array.isArray(payload.recent) ? payload.recent : [];
+  lastUpdatedAt.value = new Date().toISOString();
   err.value = "";
-  resetMsg.value = "";
+  loading.value = false;
+}
+
+async function loadBootstrap() {
+  loading.value = true;
   try {
     const [s, r] = await Promise.all([
       fetch(apiUrl("/api/analytics/summary")),
@@ -33,20 +42,51 @@ async function loadAll() {
     ]);
     if (!s.ok) throw new Error(await s.text());
     if (!r.ok) throw new Error(await r.text());
-    summary.value = await s.json();
-    const rd = await r.json();
-    recent.value = rd.items || [];
+    const sum = await s.json();
+    const rows = await r.json();
+    applySnapshot({ summary: sum, recent: rows.items || [] });
   } catch (e) {
     err.value = e instanceof Error ? e.message : String(e);
-    summary.value = null;
-    recent.value = [];
-  } finally {
     loading.value = false;
   }
 }
 
-onMounted(() => {
-  void loadAll();
+function startStream() {
+  if (es) es.close();
+  streamState.value = "connecting";
+  es = new EventSource(apiUrl("/api/analytics/stream"));
+  es.onopen = () => {
+    streamState.value = "live";
+  };
+  es.onmessage = (ev) => {
+    try {
+      const data = JSON.parse(ev.data);
+      if (data.type === "snapshot") {
+        applySnapshot(data);
+      }
+    } catch {
+      // ignore malformed chunks
+    }
+  };
+  es.onerror = () => {
+    streamState.value = "reconnecting";
+  };
+}
+
+function stopStream() {
+  if (es) {
+    es.close();
+    es = null;
+  }
+}
+
+onMounted(async () => {
+  await loadBootstrap();
+  startStream();
+});
+
+onUnmounted(() => {
+  stopStream();
 });
 
 function fmtMs(v) {
@@ -94,6 +134,34 @@ const cards = computed(() => {
   ];
 });
 
+const recentLatencyBars = computed(() => {
+  const rows = [...recent.value].reverse().slice(-24);
+  const maxVal = Math.max(1, ...rows.map((r) => Number(r.total_request_ms || 0)));
+  return rows.map((r) => ({
+    id: r.id,
+    label: `#${r.id}`,
+    ms: Number(r.total_request_ms || 0),
+    pct: Math.max(3, (Number(r.total_request_ms || 0) / maxVal) * 100),
+  }));
+});
+
+const recentTokenBars = computed(() => {
+  const rows = [...recent.value].reverse().slice(-24);
+  const maxVal = Math.max(
+    1,
+    ...rows.map((r) => Number((r.prompt_tokens || 0) + (r.completion_tokens || 0)))
+  );
+  return rows.map((r) => {
+    const total = Number((r.prompt_tokens || 0) + (r.completion_tokens || 0));
+    return {
+      id: r.id,
+      label: `#${r.id}`,
+      total,
+      pct: Math.max(3, (total / maxVal) * 100),
+    };
+  });
+});
+
 async function submitReset() {
   resetMsg.value = "";
   if (!resetSecret.value.trim()) {
@@ -114,7 +182,6 @@ async function submitReset() {
     }
     resetMsg.value = `Cleared ${data.cleared ?? 0} record(s).`;
     resetSecret.value = "";
-    await loadAll();
   } catch (e) {
     resetMsg.value = e instanceof Error ? e.message : String(e);
   }
@@ -123,20 +190,41 @@ async function submitReset() {
 
 <template>
   <div class="dash">
-    <router-link to="/" class="dash__back">← Live</router-link>
     <div class="dash__head">
       <h1 class="dash__title">Analytics</h1>
-      <p class="dash__sub">
-        Metrics from mic → <code>/api/voice-turn</code> → Ollama (stored locally on the API server).
-      </p>
-      <div class="dash__actions">
-        <button type="button" class="btn" :disabled="loading" @click="loadAll">
-          {{ loading ? "Loading…" : "Refresh" }}
-        </button>
+      <div class="dash__live">
+        <span class="dash__dot" :class="`dash__dot--${streamState}`" />
+        <span>
+          {{ streamState === "live" ? "Live updates" : streamState === "connecting" ? "Connecting stream…" : "Reconnecting…" }}
+        </span>
+        <span v-if="lastUpdatedAt" class="dash__updated">Last update: {{ fmtTs(lastUpdatedAt) }}</span>
       </div>
     </div>
 
     <p v-if="err" class="dash__err" role="alert">{{ err }}</p>
+
+    <section v-if="!err && summary" class="viz-grid">
+      <article class="viz-card">
+        <h2 class="viz-card__title">Recent latency trend</h2>
+        <div class="bars">
+          <div v-for="b in recentLatencyBars" :key="`l-${b.id}`" class="bar-row" :title="`${b.label}: ${fmtMs(b.ms)}`">
+            <span class="bar-row__label">{{ b.label }}</span>
+            <div class="bar-row__track"><div class="bar-row__fill" :style="{ width: `${b.pct}%` }" /></div>
+            <span class="bar-row__value">{{ fmtMs(b.ms) }}</span>
+          </div>
+        </div>
+      </article>
+      <article class="viz-card">
+        <h2 class="viz-card__title">Recent token usage</h2>
+        <div class="bars">
+          <div v-for="b in recentTokenBars" :key="`t-${b.id}`" class="bar-row" :title="`${b.label}: ${fmtNum(b.total)}`">
+            <span class="bar-row__label">{{ b.label }}</span>
+            <div class="bar-row__track bar-row__track--tokens"><div class="bar-row__fill bar-row__fill--tokens" :style="{ width: `${b.pct}%` }" /></div>
+            <span class="bar-row__value">{{ fmtNum(b.total) }}</span>
+          </div>
+        </div>
+      </article>
+    </section>
 
     <div v-if="!err && summary" class="dash__grid">
       <article v-for="(c, i) in cards" :key="i" class="card">
@@ -214,51 +302,62 @@ async function submitReset() {
   padding: clamp(1rem, 2.5vw, 2.5rem);
   max-width: 120rem;
   margin: 0 auto;
-  background: #e4e2e2;
-}
-
-.dash__back {
-  display: inline-block;
-  margin-bottom: 1rem;
-  font-size: clamp(0.9rem, 1.3vw, 1rem);
-  font-weight: 600;
-  color: #0d6f6f;
-  text-decoration: none;
-}
-
-.dash__back:hover {
-  text-decoration: underline;
+  background:
+    radial-gradient(120rem 40rem at 8% -12%, rgba(56, 189, 248, 0.14), transparent 58%),
+    radial-gradient(100rem 40rem at 92% -10%, rgba(139, 92, 246, 0.16), transparent 55%),
+    #e4e2e2;
 }
 
 .dash__head {
-  margin-bottom: 1.5rem;
+  margin-bottom: 1.25rem;
+  padding: 1rem 1.1rem;
+  border-radius: 16px;
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.82), rgba(255, 255, 255, 0.58));
+  border: 1px solid rgba(255, 255, 255, 0.72);
+  box-shadow:
+    0 6px 20px rgba(15, 23, 42, 0.06),
+    inset 0 1px 0 rgba(255, 255, 255, 0.75);
+  backdrop-filter: blur(8px);
+}
+
+.dash__live {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: #444;
+  font-size: 0.9rem;
+  flex-wrap: wrap;
+}
+
+.dash__updated {
+  color: #666;
+}
+
+.dash__dot {
+  width: 0.65rem;
+  height: 0.65rem;
+  border-radius: 50%;
+  background: #888;
+}
+
+.dash__dot--live {
+  background: #15a34a;
+  box-shadow: 0 0 0 4px rgba(21, 163, 74, 0.18);
+  animation: pulse-live 1.4s ease-in-out infinite;
+}
+
+.dash__dot--connecting,
+.dash__dot--reconnecting {
+  background: #d97706;
+  box-shadow: 0 0 0 4px rgba(217, 119, 6, 0.15);
 }
 
 .dash__title {
   margin: 0 0 0.35rem;
-  font-size: clamp(1.5rem, 2.5vw, 2.25rem);
+  font-size: clamp(1.55rem, 2.7vw, 2.4rem);
   font-weight: 700;
-  color: #1a1a1a;
-}
-
-.dash__sub {
-  margin: 0 0 1rem;
-  font-size: clamp(0.9rem, 1.4vw, 1.05rem);
-  color: #444;
-  max-width: 48rem;
-}
-
-.dash__sub code {
-  font-size: 0.9em;
-  background: rgba(0, 0, 0, 0.06);
-  padding: 0.1em 0.35em;
-  border-radius: 4px;
-}
-
-.dash__actions {
-  display: flex;
-  gap: 0.5rem;
-  flex-wrap: wrap;
+  color: #111827;
+  letter-spacing: 0.01em;
 }
 
 .dash__err {
@@ -269,6 +368,78 @@ async function submitReset() {
   margin: 0 0 1rem;
 }
 
+.viz-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(22rem, 1fr));
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.viz-card {
+  background: #fff;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 14px;
+  padding: 1rem;
+  box-shadow:
+    0 8px 22px rgba(2, 6, 23, 0.08),
+    inset 0 1px 0 rgba(255, 255, 255, 0.62);
+}
+
+.viz-card__title {
+  margin: 0 0 0.75rem;
+  font-size: 0.95rem;
+  font-weight: 700;
+}
+
+.bars {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  max-height: 21rem;
+  overflow: auto;
+}
+
+.bar-row {
+  display: grid;
+  grid-template-columns: 2.6rem 1fr 5.2rem;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.bar-row__label {
+  font-size: 0.75rem;
+  color: #666;
+  font-variant-numeric: tabular-nums;
+}
+
+.bar-row__track {
+  height: 0.55rem;
+  border-radius: 999px;
+  background: #e8edf3;
+  overflow: hidden;
+}
+
+.bar-row__track--tokens {
+  background: #ede9fe;
+}
+
+.bar-row__fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #06b6d4, #3b82f6);
+}
+
+.bar-row__fill--tokens {
+  background: linear-gradient(90deg, #8b5cf6, #ec4899);
+}
+
+.bar-row__value {
+  font-size: 0.76rem;
+  color: #333;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
 .dash__grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
@@ -277,11 +448,13 @@ async function submitReset() {
 }
 
 .card {
-  background: #fff;
-  border: 1px solid rgba(0, 0, 0, 0.08);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(255, 255, 255, 0.94));
+  border: 1px solid rgba(0, 0, 0, 0.07);
   border-radius: 14px;
   padding: 1.1rem 1.25rem;
-  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.04);
+  box-shadow:
+    0 8px 22px rgba(2, 6, 23, 0.08),
+    inset 0 1px 0 rgba(255, 255, 255, 0.62);
 }
 
 .card--wide {
@@ -320,7 +493,8 @@ async function submitReset() {
   overflow: auto;
   border: 1px solid rgba(0, 0, 0, 0.08);
   border-radius: 12px;
-  background: #fff;
+  background: rgba(255, 255, 255, 0.95);
+  box-shadow: 0 8px 20px rgba(2, 6, 23, 0.07);
 }
 
 .table {
@@ -417,5 +591,11 @@ async function submitReset() {
   margin: 0.5rem 0 0;
   font-size: 0.9rem;
   color: #333;
+}
+
+@keyframes pulse-live {
+  50% {
+    box-shadow: 0 0 0 6px rgba(21, 163, 74, 0.1);
+  }
 }
 </style>
