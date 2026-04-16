@@ -1,10 +1,6 @@
-<script setup>
-import WebRtcLive from "./WebRtcLive.vue";
-</script>
-
 <template>
   <div class="app-root">
-    <WebRtcLive />
+    <router-view />
   </div>
 </template>
 
@@ -27,7 +23,7 @@ body {
   margin: 0;
   min-height: 100dvh;
   font-family: "DM Sans", system-ui, sans-serif;
-  background: #fff;
+  background: #e4e2e2;
   color: var(--text);
 }
 
@@ -44,7 +40,5 @@ body {
   display: flex;
   flex-direction: column;
   align-items: stretch;
-  justify-content: flex-start;
-  padding: 0;
 }
 </style>

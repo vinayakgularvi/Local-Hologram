@@ -2,6 +2,8 @@
 import { ref, computed, onMounted, onUnmounted } from "vue";
 
 const busy = ref(false);
+/** True once the remote video is actually rendering (not only SDP done). */
+const videoReady = ref(false);
 const started = ref(false);
 const proxyConfigured = ref(null);
 const sessionId = ref("0");
@@ -101,8 +103,13 @@ async function negotiate() {
   await pc.setRemoteDescription(answer);
 }
 
+function markVideoReadyOnce() {
+  videoReady.value = true;
+}
+
 async function connect() {
   webrtcError.value = "";
+  videoReady.value = false;
   if (proxyConfigured.value === false) {
     webrtcError.value = "Server is not configured for WebRTC signaling.";
     return;
@@ -118,7 +125,13 @@ async function connect() {
       const stream = evt.streams[0];
       if (!stream) return;
       if (evt.track.kind === "video" && videoEl.value) {
-        videoEl.value.srcObject = stream;
+        const v = videoEl.value;
+        v.srcObject = stream;
+        const onReady = () => {
+          markVideoReadyOnce();
+        };
+        v.addEventListener("playing", onReady, { once: true });
+        v.addEventListener("loadeddata", onReady, { once: true });
       } else if (evt.track.kind === "audio" && audioEl.value) {
         audioEl.value.srcObject = stream;
       }
@@ -132,6 +145,7 @@ async function connect() {
     started.value = true;
   } catch (e) {
     webrtcError.value = e instanceof Error ? e.message : String(e);
+    videoReady.value = false;
     if (pc) {
       pc.close();
       pc = null;
@@ -144,6 +158,7 @@ async function connect() {
 function disconnect() {
   stopMicInternal({ cancel: true });
   started.value = false;
+  videoReady.value = false;
   if (videoEl.value) videoEl.value.srcObject = null;
   if (audioEl.value) audioEl.value.srcObject = null;
   if (pc) {
@@ -348,6 +363,19 @@ onUnmounted(() => {
   <section class="panel">
     <div class="media-stack">
       <div class="video-wrap">
+        <div
+          v-if="!videoReady && !webrtcError"
+          class="video-loading"
+          role="status"
+          aria-live="polite"
+          aria-busy="true"
+        >
+          <div class="video-loading__track" aria-hidden="true">
+            <div class="video-loading__fill" />
+          </div>
+          <span class="video-loading__label">{{ busy ? "Connecting…" : "Loading video…" }}</span>
+        </div>
+
         <video ref="videoEl" class="video" autoplay playsinline />
         <div class="video-rail video-rail--left" aria-hidden="true" />
         <div class="video-rail video-rail--right" aria-hidden="true" />
@@ -418,9 +446,8 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <div v-if="webrtcError || busy" class="bottom-bar">
-      <p v-if="busy && !webrtcError" class="status" role="status">Connecting…</p>
-      <p v-if="webrtcError" class="err" role="alert">{{ webrtcError }}</p>
+    <div v-if="webrtcError" class="bottom-bar">
+      <p class="err" role="alert">{{ webrtcError }}</p>
     </div>
   </section>
 </template>
@@ -446,7 +473,10 @@ onUnmounted(() => {
   padding: 0;
 }
 
+/* Fixed design resolution 2490 × 3840 — UI scales with container (cqw/cqh) */
 .video-wrap {
+  container-type: size;
+  container-name: stage;
   position: relative;
   flex: none;
   aspect-ratio: 2490 / 3840;
@@ -473,7 +503,8 @@ onUnmounted(() => {
   top: 0;
   bottom: 0;
   z-index: 1;
-  width: clamp(4.25rem, 20vw, 15rem);
+  /* ~240px at 2490px wide */
+  width: clamp(2rem, 9.65cqw, 15rem);
   background: #e4e2e2;
   pointer-events: none;
 }
@@ -486,6 +517,58 @@ onUnmounted(() => {
   right: 0;
 }
 
+.video-loading {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: clamp(0.5rem, 1.25cqh, 1.5rem);
+  background: rgba(228, 226, 226, 0.94);
+  backdrop-filter: blur(8px);
+}
+
+.video-loading__label {
+  font-size: clamp(1rem, 1.45cqw, 2.25rem);
+  font-weight: 600;
+  color: #333;
+}
+
+.video-loading__track {
+  width: min(58cqw, 92%);
+  height: max(4px, 0.22cqw);
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.1);
+  overflow: hidden;
+}
+
+.video-loading__fill {
+  height: 100%;
+  width: 42%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #00b4b4, #6b52d8);
+  animation: video-load-slide 1.35s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .video-loading__fill {
+    animation: none;
+    width: 100%;
+    opacity: 0.85;
+  }
+}
+
+@keyframes video-load-slide {
+  0% {
+    transform: translateX(-115%);
+  }
+  100% {
+    transform: translateX(310%);
+  }
+}
+
 .caption {
   position: absolute;
   left: 50%;
@@ -493,23 +576,26 @@ onUnmounted(() => {
   transform: translateX(-50%);
   z-index: 3;
   box-sizing: border-box;
-  width: min(40rem, calc(100% - min(7.5rem, 14vw) - 2rem));
+  /* stay inside rails + safe horizontal inset */
+  width: min(88cqw, calc(100% - 21cqw));
   margin: 0;
-  padding: calc(0.9rem + env(safe-area-inset-top)) 1rem 0.75rem;
-  min-height: 2.75rem;
-  max-height: 36vh;
+  padding: calc(1.1cqh + env(safe-area-inset-top)) clamp(1rem, 3cqw, 3rem)
+    clamp(0.65cqh, 1.25rem, 2rem);
+  min-height: clamp(2.5rem, 4cqh, 5rem);
+  max-height: min(30cqh, 40vh);
   overflow-y: auto;
-  font-size: clamp(1.2rem, 4.5vw, 1.85rem);
-  line-height: 1.42;
+  /* ~54px at 2490-wide stage */
+  font-size: clamp(1.125rem, 2.18cqw, 3.5rem);
+  line-height: 1.38;
   font-weight: 600;
-  letter-spacing: 0.01em;
+  letter-spacing: 0.015em;
   text-align: center;
   color: #fff;
   text-shadow:
     0 0 1px rgba(0, 0, 0, 0.95),
-    0 0 14px rgba(0, 0, 0, 0.75),
-    0 1px 3px rgba(0, 0, 0, 0.9),
-    0 2px 12px rgba(0, 0, 0, 0.55);
+    0 0 clamp(8px, 0.65cqw, 18px) rgba(0, 0, 0, 0.75),
+    0 clamp(1px, 0.12cqw, 4px) clamp(2px, 0.35cqw, 8px) rgba(0, 0, 0, 0.9),
+    0 clamp(2px, 0.2cqw, 10px) clamp(8px, 0.55cqw, 20px) rgba(0, 0, 0, 0.55);
   overflow-wrap: anywhere;
   pointer-events: none;
   -webkit-font-smoothing: antialiased;
@@ -518,16 +604,17 @@ onUnmounted(() => {
 .mic-fab {
   position: absolute;
   top: 27%;
-  right: max(1rem, env(safe-area-inset-right));
+  right: max(1rem, env(safe-area-inset-right), 3.5cqw);
   bottom: auto;
   transform: translateY(-50%);
   z-index: 3;
-  width: min(7.5rem, 14vw);
-  height: min(7.5rem, 14vw);
-  min-width: 2.75rem;
-  min-height: 2.75rem;
+  /* ~170–180px on 2490-wide canvas */
+  width: clamp(3.25rem, 7.2cqw, 11.5rem);
+  height: clamp(3.25rem, 7.2cqw, 11.5rem);
+  min-width: 3rem;
+  min-height: 3rem;
   padding: 0;
-  border: 1px solid #e0e0e0;
+  border: max(1px, 0.06cqw) solid #e0e0e0;
   border-radius: 50%;
   cursor: pointer;
   display: flex;
@@ -536,7 +623,7 @@ onUnmounted(() => {
   color: #333;
   background: #fff;
   box-shadow:
-    0 2px 14px rgba(0, 0, 0, 0.08),
+    0 clamp(2px, 0.15cqw, 8px) clamp(10px, 0.65cqw, 18px) rgba(0, 0, 0, 0.08),
     0 0 0 1px rgba(255, 255, 255, 0.9) inset;
   transition:
     transform 0.15s ease,
@@ -548,7 +635,7 @@ onUnmounted(() => {
 .mic-fab:hover:not(:disabled) {
   transform: translateY(-50%) scale(1.05);
   border-color: #ccc;
-  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.1);
+  box-shadow: 0 clamp(3px, 0.2cqw, 10px) clamp(14px, 0.85cqw, 22px) rgba(0, 0, 0, 0.1);
 }
 
 .mic-fab:disabled {
@@ -561,16 +648,16 @@ onUnmounted(() => {
   border-color: rgba(0, 200, 200, 0.55);
   background: rgba(0, 200, 200, 0.1);
   box-shadow:
-    0 0 0 2px rgba(0, 200, 200, 0.35),
-    0 4px 18px rgba(0, 180, 180, 0.15);
+    0 0 0 max(2px, 0.1cqw) rgba(0, 200, 200, 0.35),
+    0 clamp(3px, 0.2cqw, 8px) clamp(14px, 0.85cqw, 24px) rgba(0, 180, 180, 0.15);
   animation: mic-pulse 1.4s ease-in-out infinite;
 }
 
 @keyframes mic-pulse {
   50% {
     box-shadow:
-      0 0 0 3px rgba(0, 200, 200, 0.2),
-      0 4px 22px rgba(0, 180, 180, 0.12);
+      0 0 0 max(3px, 0.14cqw) rgba(0, 200, 200, 0.2),
+      0 clamp(4px, 0.25cqw, 10px) clamp(16px, 1cqw, 26px) rgba(0, 180, 180, 0.12);
   }
 }
 
@@ -587,7 +674,9 @@ onUnmounted(() => {
   left: 0;
   right: 0;
   z-index: 4;
-  padding: 0.5rem 0.75rem calc(0.5rem + env(safe-area-inset-bottom));
+  /* Match 2490×3840 typography when bar is full viewport width */
+  padding: clamp(0.5rem, calc(100vw * 28 / 2490), 1.35rem) clamp(0.75rem, calc(100vw * 56 / 2490), 2.25rem)
+    calc(0.55rem + env(safe-area-inset-bottom));
   background: rgba(255, 255, 255, 0.94);
   backdrop-filter: blur(10px);
   border-top: 1px solid rgba(0, 0, 0, 0.06);
@@ -605,15 +694,10 @@ onUnmounted(() => {
   border: 0;
 }
 
-.status {
-  margin: 0;
-  font-size: 0.85rem;
-  color: #444;
-}
-
 .err {
   margin: 0;
-  font-size: 0.85rem;
+  font-size: clamp(0.9rem, calc(100vw * 30 / 2490), 1.85rem);
+  line-height: 1.35;
   color: #b00020;
 }
 </style>

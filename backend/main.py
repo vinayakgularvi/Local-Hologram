@@ -23,6 +23,7 @@ from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from analytics_store import clear_all, get_recent_voice_turns, get_summary, init_db, record_voice_turn
 from chunk_pipeline import ffmpeg_concat_videos, ffprobe_duration_seconds, run_chunked_lipsync
 from realtime_lipsync import process_segment_sync, split_next_segment
 
@@ -123,6 +124,12 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="Lip-Sync Agent")
 
+
+@app.on_event("startup")
+def _analytics_startup() -> None:
+    init_db()
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.environ.get("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(","),
@@ -195,8 +202,14 @@ def _timing_payload(
     return json.dumps(d, ensure_ascii=False, default=str)
 
 
-async def ollama_stream_tokens(prompt: str) -> AsyncIterator[str]:
-    """Yields incremental text tokens from Ollama's streaming /api/generate."""
+async def ollama_stream_tokens(
+    prompt: str,
+    metrics: dict[str, Any] | None = None,
+) -> AsyncIterator[str]:
+    """Yields incremental text tokens from Ollama's streaming /api/generate.
+
+    If ``metrics`` is provided, the final ``done`` chunk fills token counts and durations.
+    """
     payload = {
         "model": OLLAMA_MODEL,
         "prompt": prompt,
@@ -232,12 +245,19 @@ async def ollama_stream_tokens(prompt: str) -> AsyncIterator[str]:
                 if piece:
                     yield piece
                 if data.get("done"):
+                    if metrics is not None:
+                        metrics["prompt_eval_count"] = data.get("prompt_eval_count")
+                        metrics["eval_count"] = data.get("eval_count")
+                        metrics["total_duration_ns"] = data.get("total_duration")
+                        metrics["load_duration_ns"] = data.get("load_duration")
+                        metrics["prompt_eval_duration_ns"] = data.get("prompt_eval_duration")
+                        metrics["eval_duration_ns"] = data.get("eval_duration")
                     break
 
 
-async def ollama_generate(prompt: str) -> str:
+async def ollama_generate(prompt: str, metrics: dict[str, Any] | None = None) -> str:
     parts: list[str] = []
-    async for t in ollama_stream_tokens(prompt):
+    async for t in ollama_stream_tokens(prompt, metrics):
         parts.append(t)
     text = "".join(parts).strip()
     if not text:
@@ -504,8 +524,52 @@ async def voice_turn(body: VoiceTurnBody):
         f"{VOICE_OLLAMA_INSTRUCTION}\n\nUser said:\n{user_text}\n\n"
         "Assistant (spoken reply only, no markdown):"
     )
-    answer = await ollama_generate(prompt)
+    t0 = time.perf_counter()
+    ollama_metrics: dict[str, Any] = {}
+    answer = await ollama_generate(prompt, ollama_metrics)
+    total_ms = (time.perf_counter() - t0) * 1000.0
+    if os.environ.get("ANALYTICS_DISABLE", "").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+    ):
+        record_voice_turn(
+            heard_chars=len(user_text),
+            answer_chars=len(answer),
+            total_request_ms=total_ms,
+            ollama_wall_ms=total_ms,
+            prompt_tokens=ollama_metrics.get("prompt_eval_count"),
+            completion_tokens=ollama_metrics.get("eval_count"),
+            ollama_total_duration_ns=ollama_metrics.get("total_duration_ns"),
+            ollama_load_duration_ns=ollama_metrics.get("load_duration_ns"),
+        )
     return {"answer": answer, "heard": user_text}
+
+
+@app.get("/api/analytics/summary")
+async def analytics_summary():
+    """Aggregates for dashboard (voice /mic → Ollama turns)."""
+    s = get_summary()
+    return {"kind": "voice_turns", **s}
+
+
+@app.get("/api/analytics/voice-turns")
+async def analytics_voice_turns(limit: int = 50):
+    return {"items": get_recent_voice_turns(limit)}
+
+
+class AnalyticsResetBody(BaseModel):
+    secret: str = Field(..., min_length=1, max_length=256)
+
+
+@app.post("/api/analytics/reset")
+async def analytics_reset(body: AnalyticsResetBody):
+    """Clears stored analytics when ``ANALYTICS_RESET_SECRET`` matches (kiosk / admin)."""
+    expected = os.environ.get("ANALYTICS_RESET_SECRET", "").strip()
+    if not expected or body.secret != expected:
+        raise HTTPException(status_code=403, detail="Invalid or unset ANALYTICS_RESET_SECRET.")
+    n = clear_all()
+    return {"cleared": n}
 
 
 @app.post("/api/lipsync")
@@ -1011,6 +1075,12 @@ async def lipsync_qa_stream(
         media_type="text/event-stream",
         headers=dict(SSE_STREAM_HEADERS),
     )
+
+
+# Built frontend from `frontend` → `backend/static/dist` (e.g. Docker image)
+_spa_dist = _BACKEND_DIR / "static" / "dist"
+if _spa_dist.is_dir():
+    app.mount("/", StaticFiles(directory=str(_spa_dist), html=True), name="spa")
 
 
 if __name__ == "__main__":
