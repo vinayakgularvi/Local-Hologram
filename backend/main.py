@@ -49,8 +49,9 @@ def _env_first_int(*keys: str, default: int) -> int:
     return default
 
 
-OLLAMA_BASE = os.environ.get("OLLAMA_BASE", "http://127.0.0.1:11434").rstrip("/")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:8b")
+OLLAMA_BASE = os.environ.get("OLLAMA_BASE", "http://10.29.145.124:8000").rstrip("/")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "AFM-4.5B-Q4_K_M.gguf")
+MODEL_API_STYLE = os.environ.get("MODEL_API_STYLE", "auto").strip().lower()
 VOICE_OLLAMA_INSTRUCTION = os.environ.get(
     "VOICE_OLLAMA_INSTRUCTION",
     "You are a hologram voice assistant. Reply in at most 2 short natural sentences "
@@ -202,14 +203,69 @@ def _timing_payload(
     return json.dumps(d, ensure_ascii=False, default=str)
 
 
-async def ollama_stream_tokens(
+def _is_openai_compatible_style() -> bool:
+    if MODEL_API_STYLE in ("openai", "v1", "chat"):
+        return True
+    if MODEL_API_STYLE in ("ollama", "native"):
+        return False
+    # auto mode: bases that already point to /v1 are treated as OpenAI-compatible.
+    return OLLAMA_BASE.endswith("/v1")
+
+
+async def _stream_openai_compatible(
     prompt: str,
     metrics: dict[str, Any] | None = None,
 ) -> AsyncIterator[str]:
-    """Yields incremental text tokens from Ollama's streaming /api/generate.
+    base = OLLAMA_BASE[:-3] if OLLAMA_BASE.endswith("/v1") else OLLAMA_BASE
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.7,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        async with client.stream(
+            "POST",
+            f"{base}/v1/chat/completions",
+            json=payload,
+            headers={"Accept": "text/event-stream"},
+        ) as response:
+            if response.status_code >= 400:
+                body = await response.aread()
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Model API error {response.status_code}: {body.decode()[:500]}",
+                )
+            async for raw in response.aiter_lines():
+                line = raw.strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                chunk = line[5:].strip()
+                if chunk == "[DONE]":
+                    break
+                try:
+                    data = json.loads(chunk)
+                except json.JSONDecodeError:
+                    continue
+                if data.get("error"):
+                    raise HTTPException(status_code=502, detail=str(data["error"]))
+                if metrics is not None and isinstance(data.get("usage"), dict):
+                    usage = data["usage"]
+                    metrics["prompt_eval_count"] = usage.get("prompt_tokens")
+                    metrics["eval_count"] = usage.get("completion_tokens")
+                choices = data.get("choices") or []
+                if choices:
+                    delta = choices[0].get("delta") or {}
+                    piece = delta.get("content") or ""
+                    if piece:
+                        yield piece
 
-    If ``metrics`` is provided, the final ``done`` chunk fills token counts and durations.
-    """
+
+async def _stream_ollama_native(
+    prompt: str,
+    metrics: dict[str, Any] | None = None,
+) -> AsyncIterator[str]:
     payload = {
         "model": OLLAMA_MODEL,
         "prompt": prompt,
@@ -253,6 +309,19 @@ async def ollama_stream_tokens(
                         metrics["prompt_eval_duration_ns"] = data.get("prompt_eval_duration")
                         metrics["eval_duration_ns"] = data.get("eval_duration")
                     break
+
+
+async def ollama_stream_tokens(
+    prompt: str,
+    metrics: dict[str, Any] | None = None,
+) -> AsyncIterator[str]:
+    """Yields incremental text tokens from configured model server stream API."""
+    if _is_openai_compatible_style():
+        async for tok in _stream_openai_compatible(prompt, metrics):
+            yield tok
+    else:
+        async for tok in _stream_ollama_native(prompt, metrics):
+            yield tok
 
 
 async def ollama_generate(prompt: str, metrics: dict[str, Any] | None = None) -> str:
@@ -484,6 +553,7 @@ async def health():
         "ok": True,
         "ollama": OLLAMA_BASE,
         "model": OLLAMA_MODEL,
+        "model_api_style": MODEL_API_STYLE,
         "lipsync_file_api": LIPSYNC_FILE_API_URL,
         "checkpoint_path": LIPSYNC_CHECKPOINT_PATH,
         "fps": LIPSYNC_FPS,
