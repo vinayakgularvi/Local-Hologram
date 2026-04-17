@@ -137,6 +137,54 @@ const llmForm = ref({
 const llmSaveBusy = ref(false);
 const llmSaveStatus = ref("");
 
+/** Vector database hub (Pinecone, Milvus) — credentials for future ingest / RAG backends */
+const activeVectorDbSource = ref(null);
+const pineconeForm = ref({
+  pinecone_api_key: "",
+  pinecone_index_name: "",
+  pinecone_host: "",
+});
+const milvusForm = ref({
+  milvus_uri: "",
+  milvus_token: "",
+  milvus_db_name: "",
+  milvus_collection_name: "",
+});
+const pineconeConnectBusy = ref(false);
+const pineconeConnectStatus = ref("");
+const milvusConnectBusy = ref(false);
+const milvusConnectStatus = ref("");
+
+const weaviateForm = ref({
+  weaviate_url: "",
+  weaviate_api_key: "",
+  weaviate_class_name: "",
+});
+const qdrantForm = ref({
+  qdrant_url: "",
+  qdrant_api_key: "",
+  qdrant_collection_name: "",
+});
+const elasticsearchForm = ref({
+  elasticsearch_url: "",
+  elasticsearch_api_key: "",
+  elasticsearch_index_name: "",
+});
+const weaviateConnectBusy = ref(false);
+const weaviateConnectStatus = ref("");
+const qdrantConnectBusy = ref(false);
+const qdrantConnectStatus = ref("");
+const elasticsearchConnectBusy = ref(false);
+const elasticsearchConnectStatus = ref("");
+
+const azureAiSearchForm = ref({
+  azure_ai_search_endpoint: "",
+  azure_ai_search_api_key: "",
+  azure_ai_search_index_name: "",
+});
+const azureAiSearchConnectBusy = ref(false);
+const azureAiSearchConnectStatus = ref("");
+
 let mediaRecorder = null;
 let mediaStream = null;
 let recordChunks = [];
@@ -303,6 +351,10 @@ function openVoiceHubStep(step) {
 
 function toggleLlmSource(id) {
   activeLlmSource.value = activeLlmSource.value === id ? null : id;
+}
+
+function toggleVectorDbSource(id) {
+  activeVectorDbSource.value = activeVectorDbSource.value === id ? null : id;
 }
 
 async function loadStudioSummary() {
@@ -481,6 +533,144 @@ async function connectDropboxStudio() {
   }
 }
 
+async function connectPineconeStudio() {
+  pineconeConnectBusy.value = true;
+  pineconeConnectStatus.value = "";
+  try {
+    const res = await fetch(apiUrl("/api/studio/integrations/pinecone"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(pineconeForm.value),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const d = data.detail;
+      throw new Error(typeof d === "string" ? d : JSON.stringify(d));
+    }
+    pineconeConnectStatus.value = "Saved.";
+    await loadStudioSummary();
+  } catch (e) {
+    pineconeConnectStatus.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    pineconeConnectBusy.value = false;
+  }
+}
+
+async function connectMilvusStudio() {
+  milvusConnectBusy.value = true;
+  milvusConnectStatus.value = "";
+  try {
+    const res = await fetch(apiUrl("/api/studio/integrations/milvus"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(milvusForm.value),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const d = data.detail;
+      throw new Error(typeof d === "string" ? d : JSON.stringify(d));
+    }
+    milvusConnectStatus.value = "Saved.";
+    await loadStudioSummary();
+  } catch (e) {
+    milvusConnectStatus.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    milvusConnectBusy.value = false;
+  }
+}
+
+async function connectWeaviateStudio() {
+  weaviateConnectBusy.value = true;
+  weaviateConnectStatus.value = "";
+  try {
+    const res = await fetch(apiUrl("/api/studio/integrations/weaviate"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(weaviateForm.value),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const d = data.detail;
+      throw new Error(typeof d === "string" ? d : JSON.stringify(d));
+    }
+    weaviateConnectStatus.value = "Saved.";
+    await loadStudioSummary();
+  } catch (e) {
+    weaviateConnectStatus.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    weaviateConnectBusy.value = false;
+  }
+}
+
+async function connectQdrantStudio() {
+  qdrantConnectBusy.value = true;
+  qdrantConnectStatus.value = "";
+  try {
+    const res = await fetch(apiUrl("/api/studio/integrations/qdrant"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(qdrantForm.value),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const d = data.detail;
+      throw new Error(typeof d === "string" ? d : JSON.stringify(d));
+    }
+    qdrantConnectStatus.value = "Saved.";
+    await loadStudioSummary();
+  } catch (e) {
+    qdrantConnectStatus.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    qdrantConnectBusy.value = false;
+  }
+}
+
+async function connectElasticsearchStudio() {
+  elasticsearchConnectBusy.value = true;
+  elasticsearchConnectStatus.value = "";
+  try {
+    const res = await fetch(apiUrl("/api/studio/integrations/elasticsearch"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(elasticsearchForm.value),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const d = data.detail;
+      throw new Error(typeof d === "string" ? d : JSON.stringify(d));
+    }
+    elasticsearchConnectStatus.value = "Saved.";
+    await loadStudioSummary();
+  } catch (e) {
+    elasticsearchConnectStatus.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    elasticsearchConnectBusy.value = false;
+  }
+}
+
+async function connectAzureAiSearchStudio() {
+  azureAiSearchConnectBusy.value = true;
+  azureAiSearchConnectStatus.value = "";
+  try {
+    const res = await fetch(apiUrl("/api/studio/integrations/azure-ai-search"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(azureAiSearchForm.value),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const d = data.detail;
+      throw new Error(typeof d === "string" ? d : JSON.stringify(d));
+    }
+    azureAiSearchConnectStatus.value = "Saved.";
+    await loadStudioSummary();
+  } catch (e) {
+    azureAiSearchConnectStatus.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    azureAiSearchConnectBusy.value = false;
+  }
+}
+
 async function clearStudioIntegration(section) {
   const labels = {
     sharepoint: "SharePoint",
@@ -490,6 +680,12 @@ async function clearStudioIntegration(section) {
     azure_blob: "Azure Blob Storage",
     gcs: "Google Cloud Storage",
     llm: "LLM provider",
+    pinecone: "Pinecone",
+    milvus: "Milvus",
+    weaviate: "Weaviate",
+    qdrant: "Qdrant",
+    elasticsearch: "Elasticsearch",
+    azure_ai_search: "Azure AI Search",
   };
   if (!window.confirm(`Remove saved ${labels[section] || section} settings from this server?`)) {
     return;
@@ -1977,6 +2173,412 @@ function formatIso(iso) {
           </div>
         </article>
 
+        <article class="flow-card flow-card--vector-hub">
+          <div class="flow-card__head flow-card__head--rag">
+            <span class="step-badge step-badge--vector">Vec</span>
+            <div>
+              <h3>Vector database integrations</h3>
+              <p class="flow-card__sub">
+                Pinecone, Milvus, Weaviate, Qdrant, Elasticsearch, and Azure AI Search credentials for vector search. Values
+                are stored in Studio on this host; ChromaDB above remains the active RAG index until a vector pipeline is
+                wired in.
+              </p>
+            </div>
+          </div>
+
+          <div class="vector-db-grid" role="group" aria-label="Vector database connectors">
+            <button
+              type="button"
+              class="kb-tile"
+              :class="{ 'kb-tile--active': activeVectorDbSource === 'pinecone' }"
+              @click="toggleVectorDbSource('pinecone')"
+            >
+              <div class="kb-tile__main">
+                <span class="kb-tile__brand kb-tile__brand--pinecone">Pinecone</span>
+                <span class="kb-tile__title">Serverless / pod index</span>
+                <span class="kb-tile__meta">{{ studioSummary?.sections?.pinecone?.has_saved ? "Saved" : "Not saved" }}</span>
+              </div>
+              <span class="kb-tile__icon kb-tile__icon--pinecone" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 3 4 7v10l8 4 8-4V7l-8-4Z" />
+                  <path d="M4 7l8 4 8-4M12 11v10" />
+                </svg>
+              </span>
+              <span v-if="studioSummary?.sections?.pinecone?.has_saved" class="kb-tile__saved">Saved</span>
+            </button>
+            <button
+              type="button"
+              class="kb-tile"
+              :class="{ 'kb-tile--active': activeVectorDbSource === 'milvus' }"
+              @click="toggleVectorDbSource('milvus')"
+            >
+              <div class="kb-tile__main">
+                <span class="kb-tile__brand kb-tile__brand--milvus">Milvus</span>
+                <span class="kb-tile__title">Self-hosted / Zilliz</span>
+                <span class="kb-tile__meta">{{ studioSummary?.sections?.milvus?.has_saved ? "Saved" : "Not saved" }}</span>
+              </div>
+              <span class="kb-tile__icon kb-tile__icon--milvus" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+                  <ellipse cx="12" cy="6" rx="8" ry="3" />
+                  <path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6" />
+                  <path d="M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6" />
+                </svg>
+              </span>
+              <span v-if="studioSummary?.sections?.milvus?.has_saved" class="kb-tile__saved">Saved</span>
+            </button>
+            <button
+              type="button"
+              class="kb-tile"
+              :class="{ 'kb-tile--active': activeVectorDbSource === 'weaviate' }"
+              @click="toggleVectorDbSource('weaviate')"
+            >
+              <div class="kb-tile__main">
+                <span class="kb-tile__brand kb-tile__brand--weaviate">Weaviate</span>
+                <span class="kb-tile__title">Graph + vectors</span>
+                <span class="kb-tile__meta">{{ studioSummary?.sections?.weaviate?.has_saved ? "Saved" : "Not saved" }}</span>
+              </div>
+              <span class="kb-tile__icon kb-tile__icon--weaviate" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 3v18M5 8l7-5 7 5M5 16l7 5 7-5" />
+                  <circle cx="12" cy="12" r="2.5" />
+                </svg>
+              </span>
+              <span v-if="studioSummary?.sections?.weaviate?.has_saved" class="kb-tile__saved">Saved</span>
+            </button>
+            <button
+              type="button"
+              class="kb-tile"
+              :class="{ 'kb-tile--active': activeVectorDbSource === 'qdrant' }"
+              @click="toggleVectorDbSource('qdrant')"
+            >
+              <div class="kb-tile__main">
+                <span class="kb-tile__brand kb-tile__brand--qdrant">Qdrant</span>
+                <span class="kb-tile__title">Filterable vectors</span>
+                <span class="kb-tile__meta">{{ studioSummary?.sections?.qdrant?.has_saved ? "Saved" : "Not saved" }}</span>
+              </div>
+              <span class="kb-tile__icon kb-tile__icon--qdrant" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 2 4 6v12l8 4 8-4V6l-8-4Z" />
+                  <path d="M12 22V10M4 6l8 4 8-4" />
+                </svg>
+              </span>
+              <span v-if="studioSummary?.sections?.qdrant?.has_saved" class="kb-tile__saved">Saved</span>
+            </button>
+            <button
+              type="button"
+              class="kb-tile"
+              :class="{ 'kb-tile--active': activeVectorDbSource === 'elasticsearch' }"
+              @click="toggleVectorDbSource('elasticsearch')"
+            >
+              <div class="kb-tile__main">
+                <span class="kb-tile__brand kb-tile__brand--elastic">Elasticsearch</span>
+                <span class="kb-tile__title">dense_vector + BM25</span>
+                <span class="kb-tile__meta">{{ studioSummary?.sections?.elasticsearch?.has_saved ? "Saved" : "Not saved" }}</span>
+              </div>
+              <span class="kb-tile__icon kb-tile__icon--elastic" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M4 15s2-3 8-3 8 3 8 3" />
+                  <path d="M4 9s2 3 8 3 8-3 8-3" />
+                  <circle cx="12" cy="12" r="2" />
+                </svg>
+              </span>
+              <span v-if="studioSummary?.sections?.elasticsearch?.has_saved" class="kb-tile__saved">Saved</span>
+            </button>
+            <button
+              type="button"
+              class="kb-tile"
+              :class="{ 'kb-tile--active': activeVectorDbSource === 'azure_ai_search' }"
+              @click="toggleVectorDbSource('azure_ai_search')"
+            >
+              <div class="kb-tile__main">
+                <span class="kb-tile__brand kb-tile__brand--azure-search">Azure AI Search</span>
+                <span class="kb-tile__title">Cognitive Search</span>
+                <span class="kb-tile__meta">{{ studioSummary?.sections?.azure_ai_search?.has_saved ? "Saved" : "Not saved" }}</span>
+              </div>
+              <span class="kb-tile__icon kb-tile__icon--azure-search" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="11" cy="11" r="7" />
+                  <path d="M21 21l-4.3-4.3" />
+                </svg>
+              </span>
+              <span v-if="studioSummary?.sections?.azure_ai_search?.has_saved" class="kb-tile__saved">Saved</span>
+            </button>
+          </div>
+
+          <p v-if="!activeVectorDbSource" class="kb-hint status status--muted">
+            Select a vector database above to save connection settings.
+          </p>
+
+          <div v-else class="kb-detail">
+            <div v-show="activeVectorDbSource === 'pinecone'" class="kb-detail__panel">
+              <h4 class="kb-detail__h">Connect Pinecone</h4>
+              <p class="status status--muted kb-detail__fine">
+                Use the index name from the Pinecone console. Optional <strong>Host</strong> is the gRPC/HTTPS index endpoint
+                (serverless regions). Leave API key blank to keep an existing saved key.
+              </p>
+              <div class="studio-form-grid">
+                <label class="field studio-form-grid__full">
+                  <span>API key</span>
+                  <input
+                    v-model="pineconeForm.pinecone_api_key"
+                    type="password"
+                    autocomplete="off"
+                    placeholder="pcsk_… or leave blank if already saved"
+                  />
+                </label>
+                <label class="field studio-form-grid__full">
+                  <span>Index name</span>
+                  <input v-model="pineconeForm.pinecone_index_name" type="text" autocomplete="off" placeholder="my-index" />
+                </label>
+                <label class="field studio-form-grid__full">
+                  <span>Index host (optional)</span>
+                  <input
+                    v-model="pineconeForm.pinecone_host"
+                    type="text"
+                    autocomplete="off"
+                    placeholder="https://…-svc.pinecone.io"
+                  />
+                </label>
+              </div>
+              <div class="actions">
+                <button type="button" class="btn" :disabled="pineconeConnectBusy" @click="connectPineconeStudio">
+                  {{ pineconeConnectBusy ? "Saving…" : "Save Pinecone" }}
+                </button>
+                <button
+                  v-if="studioSummary?.sections?.pinecone?.has_saved"
+                  type="button"
+                  class="btn btn--secondary"
+                  @click="clearStudioIntegration('pinecone')"
+                >
+                  Clear saved Pinecone
+                </button>
+              </div>
+              <p v-if="pineconeConnectStatus" class="status">{{ pineconeConnectStatus }}</p>
+            </div>
+
+            <div v-show="activeVectorDbSource === 'milvus'" class="kb-detail__panel">
+              <h4 class="kb-detail__h">Connect Milvus</h4>
+              <p class="status status--muted kb-detail__fine">
+                <strong>URI</strong> is your Milvus or Zilliz Cloud endpoint (e.g. <code>https://…api…zillizcloud.com:443</code>).
+                Token is required for Zilliz Cloud; optional for local Milvus. Leave token blank to keep a saved token.
+              </p>
+              <div class="studio-form-grid">
+                <label class="field studio-form-grid__full">
+                  <span>URI</span>
+                  <input
+                    v-model="milvusForm.milvus_uri"
+                    type="text"
+                    autocomplete="off"
+                    placeholder="http://127.0.0.1:19530 or Zilliz HTTPS endpoint"
+                  />
+                </label>
+                <label class="field studio-form-grid__full">
+                  <span>Token (optional)</span>
+                  <input
+                    v-model="milvusForm.milvus_token"
+                    type="password"
+                    autocomplete="off"
+                    placeholder="Zilliz API key or leave blank if already saved"
+                  />
+                </label>
+                <label class="field">
+                  <span>Database name (optional)</span>
+                  <input v-model="milvusForm.milvus_db_name" type="text" autocomplete="off" placeholder="default" />
+                </label>
+                <label class="field">
+                  <span>Collection name</span>
+                  <input v-model="milvusForm.milvus_collection_name" type="text" autocomplete="off" placeholder="kb_chunks" />
+                </label>
+              </div>
+              <div class="actions">
+                <button type="button" class="btn" :disabled="milvusConnectBusy" @click="connectMilvusStudio">
+                  {{ milvusConnectBusy ? "Saving…" : "Save Milvus" }}
+                </button>
+                <button
+                  v-if="studioSummary?.sections?.milvus?.has_saved"
+                  type="button"
+                  class="btn btn--secondary"
+                  @click="clearStudioIntegration('milvus')"
+                >
+                  Clear saved Milvus
+                </button>
+              </div>
+              <p v-if="milvusConnectStatus" class="status">{{ milvusConnectStatus }}</p>
+            </div>
+
+            <div v-show="activeVectorDbSource === 'weaviate'" class="kb-detail__panel">
+              <h4 class="kb-detail__h">Connect Weaviate</h4>
+              <p class="status status--muted kb-detail__fine">
+                <strong>URL</strong> is the REST/GraphQL endpoint (e.g. <code>http://localhost:8080</code> or your WCS cluster URL).
+                <strong>Class name</strong> is the target collection/schema class. Leave API key blank to keep a saved key.
+              </p>
+              <div class="studio-form-grid">
+                <label class="field studio-form-grid__full">
+                  <span>URL</span>
+                  <input v-model="weaviateForm.weaviate_url" type="text" autocomplete="off" placeholder="https://your-cluster.weaviate.network" />
+                </label>
+                <label class="field studio-form-grid__full">
+                  <span>API key (optional)</span>
+                  <input
+                    v-model="weaviateForm.weaviate_api_key"
+                    type="password"
+                    autocomplete="off"
+                    placeholder="Anonymous local: leave empty"
+                  />
+                </label>
+                <label class="field studio-form-grid__full">
+                  <span>Class name</span>
+                  <input v-model="weaviateForm.weaviate_class_name" type="text" autocomplete="off" placeholder="Document" />
+                </label>
+              </div>
+              <div class="actions">
+                <button type="button" class="btn" :disabled="weaviateConnectBusy" @click="connectWeaviateStudio">
+                  {{ weaviateConnectBusy ? "Saving…" : "Save Weaviate" }}
+                </button>
+                <button
+                  v-if="studioSummary?.sections?.weaviate?.has_saved"
+                  type="button"
+                  class="btn btn--secondary"
+                  @click="clearStudioIntegration('weaviate')"
+                >
+                  Clear saved Weaviate
+                </button>
+              </div>
+              <p v-if="weaviateConnectStatus" class="status">{{ weaviateConnectStatus }}</p>
+            </div>
+
+            <div v-show="activeVectorDbSource === 'qdrant'" class="kb-detail__panel">
+              <h4 class="kb-detail__h">Connect Qdrant</h4>
+              <p class="status status--muted kb-detail__fine">
+                <strong>URL</strong> is the HTTP API base (e.g. <code>http://localhost:6333</code> or Qdrant Cloud HTTPS URL).
+                API key is required for Qdrant Cloud; optional for local. Leave key blank to keep a saved key.
+              </p>
+              <div class="studio-form-grid">
+                <label class="field studio-form-grid__full">
+                  <span>URL</span>
+                  <input v-model="qdrantForm.qdrant_url" type="text" autocomplete="off" placeholder="http://127.0.0.1:6333" />
+                </label>
+                <label class="field studio-form-grid__full">
+                  <span>API key (optional)</span>
+                  <input v-model="qdrantForm.qdrant_api_key" type="password" autocomplete="off" placeholder="Cloud key or leave blank if saved" />
+                </label>
+                <label class="field studio-form-grid__full">
+                  <span>Collection name</span>
+                  <input v-model="qdrantForm.qdrant_collection_name" type="text" autocomplete="off" placeholder="kb_chunks" />
+                </label>
+              </div>
+              <div class="actions">
+                <button type="button" class="btn" :disabled="qdrantConnectBusy" @click="connectQdrantStudio">
+                  {{ qdrantConnectBusy ? "Saving…" : "Save Qdrant" }}
+                </button>
+                <button
+                  v-if="studioSummary?.sections?.qdrant?.has_saved"
+                  type="button"
+                  class="btn btn--secondary"
+                  @click="clearStudioIntegration('qdrant')"
+                >
+                  Clear saved Qdrant
+                </button>
+              </div>
+              <p v-if="qdrantConnectStatus" class="status">{{ qdrantConnectStatus }}</p>
+            </div>
+
+            <div v-show="activeVectorDbSource === 'elasticsearch'" class="kb-detail__panel">
+              <h4 class="kb-detail__h">Connect Elasticsearch</h4>
+              <p class="status status--muted kb-detail__fine">
+                <strong>URL</strong> is the cluster REST root (e.g. <code>https://localhost:9200</code> or Elastic Cloud endpoint).
+                <strong>API key</strong> can be the Base64 <code>id:api_key</code> form (Elastic Cloud) or leave blank for local/no auth.
+                <strong>Index name</strong> should hold your <code>dense_vector</code> mapping when you wire ingest.
+              </p>
+              <div class="studio-form-grid">
+                <label class="field studio-form-grid__full">
+                  <span>URL</span>
+                  <input v-model="elasticsearchForm.elasticsearch_url" type="text" autocomplete="off" placeholder="https://my-deployment.es.region.cloud.es.io:443" />
+                </label>
+                <label class="field studio-form-grid__full">
+                  <span>API key (optional)</span>
+                  <input
+                    v-model="elasticsearchForm.elasticsearch_api_key"
+                    type="password"
+                    autocomplete="off"
+                    placeholder="Elastic API key or leave blank if saved"
+                  />
+                </label>
+                <label class="field studio-form-grid__full">
+                  <span>Index name</span>
+                  <input v-model="elasticsearchForm.elasticsearch_index_name" type="text" autocomplete="off" placeholder="kb_vectors" />
+                </label>
+              </div>
+              <div class="actions">
+                <button type="button" class="btn" :disabled="elasticsearchConnectBusy" @click="connectElasticsearchStudio">
+                  {{ elasticsearchConnectBusy ? "Saving…" : "Save Elasticsearch" }}
+                </button>
+                <button
+                  v-if="studioSummary?.sections?.elasticsearch?.has_saved"
+                  type="button"
+                  class="btn btn--secondary"
+                  @click="clearStudioIntegration('elasticsearch')"
+                >
+                  Clear saved Elasticsearch
+                </button>
+              </div>
+              <p v-if="elasticsearchConnectStatus" class="status">{{ elasticsearchConnectStatus }}</p>
+            </div>
+
+            <div v-show="activeVectorDbSource === 'azure_ai_search'" class="kb-detail__panel">
+              <h4 class="kb-detail__h">Connect Azure AI Search</h4>
+              <p class="status status--muted kb-detail__fine">
+                <strong>Endpoint</strong> is your search service URL (e.g. <code>https://my-search.search.windows.net</code>).
+                Use an <strong>admin key</strong> or <strong>query key</strong> from Keys in the Azure portal. Leave the key
+                blank to keep an existing saved key when you only change endpoint or index.
+              </p>
+              <div class="studio-form-grid">
+                <label class="field studio-form-grid__full">
+                  <span>Endpoint</span>
+                  <input
+                    v-model="azureAiSearchForm.azure_ai_search_endpoint"
+                    type="text"
+                    autocomplete="off"
+                    placeholder="https://your-service.search.windows.net"
+                  />
+                </label>
+                <label class="field studio-form-grid__full">
+                  <span>API key</span>
+                  <input
+                    v-model="azureAiSearchForm.azure_ai_search_api_key"
+                    type="password"
+                    autocomplete="off"
+                    placeholder="Admin or query key — leave blank if already saved"
+                  />
+                </label>
+                <label class="field studio-form-grid__full">
+                  <span>Index name</span>
+                  <input
+                    v-model="azureAiSearchForm.azure_ai_search_index_name"
+                    type="text"
+                    autocomplete="off"
+                    placeholder="kb-index"
+                  />
+                </label>
+              </div>
+              <div class="actions">
+                <button type="button" class="btn" :disabled="azureAiSearchConnectBusy" @click="connectAzureAiSearchStudio">
+                  {{ azureAiSearchConnectBusy ? "Saving…" : "Save Azure AI Search" }}
+                </button>
+                <button
+                  v-if="studioSummary?.sections?.azure_ai_search?.has_saved"
+                  type="button"
+                  class="btn btn--secondary"
+                  @click="clearStudioIntegration('azure_ai_search')"
+                >
+                  Clear saved Azure AI Search
+                </button>
+              </div>
+              <p v-if="azureAiSearchConnectStatus" class="status">{{ azureAiSearchConnectStatus }}</p>
+            </div>
+          </div>
+        </article>
+
         <article class="flow-card flow-card--llm-hub">
           <div class="flow-card__head flow-card__head--rag">
             <span class="step-badge step-badge--rag">LLM</span>
@@ -3043,6 +3645,78 @@ input[type="password"]:focus {
 
 .flow-card--kb-hub::before {
   background: linear-gradient(180deg, #0ea5e9, #6366f1);
+}
+
+.flow-card--vector-hub::before {
+  background: linear-gradient(180deg, #6366f1, #14b8a6);
+}
+
+.step-badge--vector {
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  background: linear-gradient(145deg, #4f46e5, #0d9488);
+  box-shadow: 0 6px 16px rgba(79, 70, 229, 0.28);
+}
+
+.vector-db-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.65rem;
+  margin-bottom: 0.35rem;
+}
+
+.kb-tile__brand--pinecone {
+  color: #4338ca;
+}
+
+.kb-tile__icon--pinecone {
+  color: #4338ca;
+  background: rgba(67, 56, 202, 0.12);
+}
+
+.kb-tile__brand--milvus {
+  color: #0f766e;
+}
+
+.kb-tile__icon--milvus {
+  color: #0f766e;
+  background: rgba(15, 118, 110, 0.12);
+}
+
+.kb-tile__brand--weaviate {
+  color: #5b21b6;
+}
+
+.kb-tile__icon--weaviate {
+  color: #5b21b6;
+  background: rgba(91, 33, 182, 0.12);
+}
+
+.kb-tile__brand--qdrant {
+  color: #b91c1c;
+}
+
+.kb-tile__icon--qdrant {
+  color: #b91c1c;
+  background: rgba(185, 28, 28, 0.1);
+}
+
+.kb-tile__brand--elastic {
+  color: #b45309;
+}
+
+.kb-tile__icon--elastic {
+  color: #b45309;
+  background: rgba(180, 83, 9, 0.12);
+}
+
+.kb-tile__brand--azure-search {
+  color: #0078d4;
+}
+
+.kb-tile__icon--azure-search {
+  color: #0078d4;
+  background: rgba(0, 120, 212, 0.12);
 }
 
 .kb-grid {

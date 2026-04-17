@@ -1632,6 +1632,43 @@ class StudioAzureBlobConnect(BaseModel):
     azure_blob_prefix: str = Field("", max_length=2048)
 
 
+class StudioPineconeConnect(BaseModel):
+    pinecone_api_key: str = Field("", max_length=512)
+    pinecone_index_name: str = Field("", max_length=256)
+    pinecone_host: str = Field("", max_length=512)
+
+
+class StudioMilvusConnect(BaseModel):
+    milvus_uri: str = Field("", max_length=2048)
+    milvus_token: str = Field("", max_length=8192)
+    milvus_db_name: str = Field("", max_length=256)
+    milvus_collection_name: str = Field("", max_length=256)
+
+
+class StudioWeaviateConnect(BaseModel):
+    weaviate_url: str = Field("", max_length=2048)
+    weaviate_api_key: str = Field("", max_length=8192)
+    weaviate_class_name: str = Field("", max_length=256)
+
+
+class StudioQdrantConnect(BaseModel):
+    qdrant_url: str = Field("", max_length=2048)
+    qdrant_api_key: str = Field("", max_length=8192)
+    qdrant_collection_name: str = Field("", max_length=256)
+
+
+class StudioElasticsearchConnect(BaseModel):
+    elasticsearch_url: str = Field("", max_length=2048)
+    elasticsearch_api_key: str = Field("", max_length=8192)
+    elasticsearch_index_name: str = Field("", max_length=256)
+
+
+class StudioAzureAISearchConnect(BaseModel):
+    azure_ai_search_endpoint: str = Field("", max_length=2048)
+    azure_ai_search_api_key: str = Field("", max_length=8192)
+    azure_ai_search_index_name: str = Field("", max_length=256)
+
+
 class StudioLLMConnect(BaseModel):
     llm_provider: str = Field("", max_length=32)
     ollama_base: str = Field("", max_length=2048)
@@ -1989,6 +2026,139 @@ async def studio_integrations_connect_llm(body: StudioLLMConnect):
     return {"ok": True, "summary": studio_integrations_summary(), "config": _llm_public_config()}
 
 
+@app.post("/api/studio/integrations/pinecone")
+async def studio_integrations_connect_pinecone(body: StudioPineconeConnect):
+    """Save Pinecone API settings to studio_integrations.json (ingest/query wiring is separate)."""
+    prev = studio_read_section_strings("pinecone")
+    api_key = body.pinecone_api_key.strip() or prev.get("PINECONE_API_KEY", "")
+    index_name = body.pinecone_index_name.strip() or prev.get("PINECONE_INDEX_NAME", "")
+    if not api_key or not index_name:
+        raise HTTPException(
+            status_code=400,
+            detail="PINECONE_API_KEY and PINECONE_INDEX_NAME are required (paste a new API key or keep one already saved).",
+        )
+    host = body.pinecone_host.strip()
+    vals: dict[str, str | None] = {
+        "PINECONE_API_KEY": api_key,
+        "PINECONE_INDEX_NAME": index_name,
+        "PINECONE_HOST": host if host else None,
+    }
+    studio_save_section("pinecone", vals)
+    return {"ok": True, "summary": studio_integrations_summary()}
+
+
+@app.post("/api/studio/integrations/milvus")
+async def studio_integrations_connect_milvus(body: StudioMilvusConnect):
+    """Save Milvus / Zilliz connection settings to studio_integrations.json."""
+    prev = studio_read_section_strings("milvus")
+    uri = body.milvus_uri.strip() or prev.get("MILVUS_URI", "")
+    collection = body.milvus_collection_name.strip() or prev.get("MILVUS_COLLECTION_NAME", "")
+    if not uri or not collection:
+        raise HTTPException(
+            status_code=400,
+            detail="MILVUS_URI and MILVUS_COLLECTION_NAME are required.",
+        )
+    token = body.milvus_token.strip() or prev.get("MILVUS_TOKEN", "")
+    db = body.milvus_db_name.strip() or prev.get("MILVUS_DB_NAME", "")
+    vals: dict[str, str | None] = {
+        "MILVUS_URI": uri,
+        "MILVUS_COLLECTION_NAME": collection,
+        "MILVUS_TOKEN": token if token else None,
+        "MILVUS_DB_NAME": db if db else None,
+    }
+    studio_save_section("milvus", vals)
+    return {"ok": True, "summary": studio_integrations_summary()}
+
+
+@app.post("/api/studio/integrations/weaviate")
+async def studio_integrations_connect_weaviate(body: StudioWeaviateConnect):
+    """Save Weaviate connection settings to studio_integrations.json."""
+    prev = studio_read_section_strings("weaviate")
+    url = body.weaviate_url.strip() or prev.get("WEAVIATE_URL", "")
+    class_name = body.weaviate_class_name.strip() or prev.get("WEAVIATE_CLASS_NAME", "")
+    if not url or not class_name:
+        raise HTTPException(
+            status_code=400,
+            detail="WEAVIATE_URL and WEAVIATE_CLASS_NAME are required.",
+        )
+    api_key = body.weaviate_api_key.strip() or prev.get("WEAVIATE_API_KEY", "")
+    vals: dict[str, str | None] = {
+        "WEAVIATE_URL": url,
+        "WEAVIATE_CLASS_NAME": class_name,
+        "WEAVIATE_API_KEY": api_key if api_key else None,
+    }
+    studio_save_section("weaviate", vals)
+    return {"ok": True, "summary": studio_integrations_summary()}
+
+
+@app.post("/api/studio/integrations/qdrant")
+async def studio_integrations_connect_qdrant(body: StudioQdrantConnect):
+    """Save Qdrant connection settings to studio_integrations.json."""
+    prev = studio_read_section_strings("qdrant")
+    url = body.qdrant_url.strip() or prev.get("QDRANT_URL", "")
+    collection = body.qdrant_collection_name.strip() or prev.get("QDRANT_COLLECTION_NAME", "")
+    if not url or not collection:
+        raise HTTPException(
+            status_code=400,
+            detail="QDRANT_URL and QDRANT_COLLECTION_NAME are required.",
+        )
+    api_key = body.qdrant_api_key.strip() or prev.get("QDRANT_API_KEY", "")
+    vals: dict[str, str | None] = {
+        "QDRANT_URL": url,
+        "QDRANT_COLLECTION_NAME": collection,
+        "QDRANT_API_KEY": api_key if api_key else None,
+    }
+    studio_save_section("qdrant", vals)
+    return {"ok": True, "summary": studio_integrations_summary()}
+
+
+@app.post("/api/studio/integrations/elasticsearch")
+async def studio_integrations_connect_elasticsearch(body: StudioElasticsearchConnect):
+    """Save Elasticsearch connection settings to studio_integrations.json."""
+    prev = studio_read_section_strings("elasticsearch")
+    url = body.elasticsearch_url.strip() or prev.get("ELASTICSEARCH_URL", "")
+    index_name = body.elasticsearch_index_name.strip() or prev.get("ELASTICSEARCH_INDEX_NAME", "")
+    if not url or not index_name:
+        raise HTTPException(
+            status_code=400,
+            detail="ELASTICSEARCH_URL and ELASTICSEARCH_INDEX_NAME are required.",
+        )
+    api_key = body.elasticsearch_api_key.strip() or prev.get("ELASTICSEARCH_API_KEY", "")
+    vals: dict[str, str | None] = {
+        "ELASTICSEARCH_URL": url,
+        "ELASTICSEARCH_INDEX_NAME": index_name,
+        "ELASTICSEARCH_API_KEY": api_key if api_key else None,
+    }
+    studio_save_section("elasticsearch", vals)
+    return {"ok": True, "summary": studio_integrations_summary()}
+
+
+@app.post("/api/studio/integrations/azure-ai-search")
+async def studio_integrations_connect_azure_ai_search(body: StudioAzureAISearchConnect):
+    """Save Azure AI Search (formerly Cognitive Search) settings to studio_integrations.json."""
+    prev = studio_read_section_strings("azure_ai_search")
+    endpoint = body.azure_ai_search_endpoint.strip() or prev.get("AZURE_AI_SEARCH_ENDPOINT", "")
+    index_name = body.azure_ai_search_index_name.strip() or prev.get("AZURE_AI_SEARCH_INDEX_NAME", "")
+    if not endpoint or not index_name:
+        raise HTTPException(
+            status_code=400,
+            detail="AZURE_AI_SEARCH_ENDPOINT and AZURE_AI_SEARCH_INDEX_NAME are required.",
+        )
+    api_key = body.azure_ai_search_api_key.strip() or prev.get("AZURE_AI_SEARCH_API_KEY", "")
+    if not api_key:
+        raise HTTPException(
+            status_code=400,
+            detail="AZURE_AI_SEARCH_API_KEY is required (paste an admin or query key, or keep one already saved).",
+        )
+    vals: dict[str, str | None] = {
+        "AZURE_AI_SEARCH_ENDPOINT": endpoint.rstrip("/"),
+        "AZURE_AI_SEARCH_INDEX_NAME": index_name,
+        "AZURE_AI_SEARCH_API_KEY": api_key,
+    }
+    studio_save_section("azure_ai_search", vals)
+    return {"ok": True, "summary": studio_integrations_summary()}
+
+
 @app.post("/api/studio/integrations/google-drive")
 async def studio_integrations_connect_google_drive(
     folder_id: str = Form(""),
@@ -2035,6 +2205,12 @@ async def studio_integrations_clear(section: str):
         "azure_blob",
         "gcs",
         "llm",
+        "pinecone",
+        "milvus",
+        "weaviate",
+        "qdrant",
+        "elasticsearch",
+        "azure_ai_search",
     ):
         raise HTTPException(status_code=404, detail="Unknown section.")
     studio_delete_section(section)

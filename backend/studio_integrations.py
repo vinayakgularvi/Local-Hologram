@@ -84,6 +84,37 @@ INTEGRATION_KEYS: dict[str, tuple[str, ...]] = {
         "GOOGLE_GEMINI_BASE_URL",
         "GOOGLE_GEMINI_MODEL",
     ),
+    "pinecone": (
+        "PINECONE_API_KEY",
+        "PINECONE_INDEX_NAME",
+        "PINECONE_HOST",
+    ),
+    "milvus": (
+        "MILVUS_URI",
+        "MILVUS_TOKEN",
+        "MILVUS_DB_NAME",
+        "MILVUS_COLLECTION_NAME",
+    ),
+    "weaviate": (
+        "WEAVIATE_URL",
+        "WEAVIATE_API_KEY",
+        "WEAVIATE_CLASS_NAME",
+    ),
+    "qdrant": (
+        "QDRANT_URL",
+        "QDRANT_API_KEY",
+        "QDRANT_COLLECTION_NAME",
+    ),
+    "elasticsearch": (
+        "ELASTICSEARCH_URL",
+        "ELASTICSEARCH_API_KEY",
+        "ELASTICSEARCH_INDEX_NAME",
+    ),
+    "azure_ai_search": (
+        "AZURE_AI_SEARCH_ENDPOINT",
+        "AZURE_AI_SEARCH_API_KEY",
+        "AZURE_AI_SEARCH_INDEX_NAME",
+    ),
 }
 
 
