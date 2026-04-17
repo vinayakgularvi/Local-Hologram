@@ -191,7 +191,13 @@ async function submitReset() {
 <template>
   <div class="dash">
     <div class="dash__head">
-      <h1 class="dash__title">Analytics</h1>
+      <div class="dash__head-main">
+        <h1 class="dash__title">Analytics</h1>
+        <nav class="dash__nav" aria-label="App sections">
+          <router-link class="dash-link dash-link--ghost" to="/">Live hologram</router-link>
+          <router-link class="dash-link dash-link--ghost" to="/avatar">Avatar Studio</router-link>
+        </nav>
+      </div>
       <div class="dash__live">
         <span class="dash__dot" :class="`dash__dot--${streamState}`" />
         <span>
@@ -320,6 +326,45 @@ async function submitReset() {
   backdrop-filter: blur(8px);
 }
 
+.dash__head-main {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.65rem 1rem;
+  margin-bottom: 0.6rem;
+}
+
+.dash__nav {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.dash-link {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.38rem 0.85rem;
+  border-radius: 999px;
+  font-size: 0.82rem;
+  font-weight: 600;
+  text-decoration: none;
+  border: 1px solid rgba(148, 163, 184, 0.45);
+  transition: background 0.15s ease, border-color 0.15s ease, transform 0.12s ease;
+}
+
+.dash-link--ghost {
+  background: rgba(255, 255, 255, 0.55);
+  color: #334155;
+}
+
+.dash-link--ghost:hover {
+  background: #fff;
+  border-color: rgba(20, 184, 166, 0.45);
+  transform: translateY(-1px);
+}
+
 .dash__live {
   display: flex;
   align-items: center;
@@ -353,7 +398,7 @@ async function submitReset() {
 }
 
 .dash__title {
-  margin: 0 0 0.35rem;
+  margin: 0;
   font-size: clamp(1.55rem, 2.7vw, 2.4rem);
   font-weight: 700;
   color: #111827;

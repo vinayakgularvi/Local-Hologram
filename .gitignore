@@ -4,5 +4,10 @@
 backend/.venv/
 backend/__pycache__/
 backend/outputs/
+backend/data/chroma/
+backend/data/studio_integrations.json
+backend/data/studio_gdrive_credentials.json
+backend/data/studio_gcs_credentials.json
+backend/secrets/
 frontend/node_modules/
 frontend/dist/

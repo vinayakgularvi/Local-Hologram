@@ -13,6 +13,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, AsyncIterator
+from urllib.parse import urlparse
 
 import edge_tts
 import httpx
@@ -21,16 +22,64 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from gradio_client import Client, handle_file
 from pydantic import BaseModel, Field
 
 from analytics_store import clear_all, get_recent_voice_turns, get_summary, init_db, record_voice_turn
+from rag_store import (
+    delete_source,
+    get_status as rag_get_status,
+    ingest_file,
+    list_sources as rag_list_sources,
+    query_documents,
+    reset_collection as rag_reset_collection,
+)
+from google_drive_sync import is_configured as gdrive_is_configured
+from google_drive_sync import live_sync_mark_done as gdrive_live_sync_mark_done
+from google_drive_sync import live_sync_mark_start as gdrive_live_sync_mark_start
+from google_drive_sync import public_config as gdrive_public_config
+from google_drive_sync import sync_to_chroma as gdrive_sync_to_chroma
+from dropbox_sync import is_configured as dropbox_is_configured
+from dropbox_sync import live_sync_mark_done as dropbox_live_sync_mark_done
+from dropbox_sync import live_sync_mark_start as dropbox_live_sync_mark_start
+from dropbox_sync import public_config as dropbox_public_config
+from dropbox_sync import sync_to_chroma as dropbox_sync_to_chroma
+from s3_sync import is_configured as s3_is_configured
+from s3_sync import live_sync_mark_done as s3_live_sync_mark_done
+from s3_sync import live_sync_mark_start as s3_live_sync_mark_start
+from s3_sync import public_config as s3_public_config
+from s3_sync import sync_to_chroma as s3_sync_to_chroma
+from azure_blob_sync import is_configured as azure_blob_is_configured
+from azure_blob_sync import live_sync_mark_done as azure_blob_live_sync_mark_done
+from azure_blob_sync import live_sync_mark_start as azure_blob_live_sync_mark_start
+from azure_blob_sync import public_config as azure_blob_public_config
+from azure_blob_sync import sync_to_chroma as azure_blob_sync_to_chroma
+from gcs_sync import is_configured as gcs_is_configured
+from gcs_sync import live_sync_mark_done as gcs_live_sync_mark_done
+from gcs_sync import live_sync_mark_start as gcs_live_sync_mark_start
+from gcs_sync import public_config as gcs_public_config
+from gcs_sync import sync_to_chroma as gcs_sync_to_chroma
+from sharepoint_sync import is_configured as sharepoint_is_configured
+from sharepoint_sync import live_sync_mark_done, live_sync_mark_start
+from sharepoint_sync import public_config as sharepoint_public_config
+from sharepoint_sync import sync_to_chroma as sharepoint_sync_to_chroma
 from chunk_pipeline import ffmpeg_concat_videos, ffprobe_duration_seconds, run_chunked_lipsync
 from realtime_lipsync import process_segment_sync, split_next_segment
+from studio_integrations import (
+    apply_studio_integrations_to_environ,
+    delete_section as studio_delete_section,
+    public_summary as studio_integrations_summary,
+    read_section_strings as studio_read_section_strings,
+    save_section as studio_save_section,
+)
+from studio_integrations import GDRIVE_CREDENTIALS_SAVED as STUDIO_GDRIVE_CREDENTIALS_PATH
+from studio_integrations import GCS_CREDENTIALS_SAVED as STUDIO_GCS_CREDENTIALS_PATH
 
 _BACKEND_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _BACKEND_DIR.parent
 load_dotenv(_REPO_ROOT / ".env")
 load_dotenv(_BACKEND_DIR / ".env")
+apply_studio_integrations_to_environ()
 
 
 def _env_first_float(*keys: str, default: float) -> float:
@@ -49,9 +98,31 @@ def _env_first_int(*keys: str, default: int) -> int:
     return default
 
 
-OLLAMA_BASE = os.environ.get("OLLAMA_BASE", "http://10.29.145.124:8000").rstrip("/")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "AFM-4.5B-Q4_K_M.gguf")
-MODEL_API_STYLE = os.environ.get("MODEL_API_STYLE", "auto").strip().lower()
+def _ollama_base() -> str:
+    v = os.environ.get("OLLAMA_BASE", "").strip()
+    return (v or "http://10.29.145.124:8000").rstrip("/")
+
+
+def _ollama_model() -> str:
+    v = os.environ.get("OLLAMA_MODEL", "").strip()
+    return v or "AFM-4.5B-Q4_K_M.gguf"
+
+
+def _model_api_style() -> str:
+    return os.environ.get("MODEL_API_STYLE", "auto").strip().lower()
+
+
+def _llm_provider() -> str:
+    v = os.environ.get("LLM_PROVIDER", "").strip().lower()
+    if v in ("openai", "anthropic", "google"):
+        return v
+    return "local"
+
+
+def _google_gemini_api_key() -> str:
+    return (os.environ.get("GOOGLE_API_KEY", "").strip() or os.environ.get("GEMINI_API_KEY", "").strip())
+
+
 VOICE_MAX_TOKENS = max(16, _env_first_int("VOICE_MAX_TOKENS", default=96))
 VOICE_OLLAMA_INSTRUCTION = os.environ.get(
     "VOICE_OLLAMA_INSTRUCTION",
@@ -120,16 +191,344 @@ LIPSYNC_CHUNK_PARALLEL = max(1, _env_first_int("LIPSYNC_CHUNK_PARALLEL", default
 
 # LiveTalking-style WebRTC signaling (POST /offer, /human, /record) — proxied to this origin when set
 WEBRTC_SIGNALING_BASE = os.environ.get("WEBRTC_SIGNALING_BASE", "").strip().rstrip("/")
+AVATAR_API_BASE = os.environ.get("AVATAR_API_BASE", "http://10.29.145.124:9000").strip().rstrip("/")
+AVATAR_SAMPLE_TEXT = os.environ.get(
+    "AVATAR_SAMPLE_TEXT",
+    (
+        "What used to take weeks of casting, recording, and editing now takes minutes. "
+        "Generate character voices in over 70 languages, adjust the delivery in real time, "
+        "and keep your production moving. This is text-to-speech built for creators."
+    ),
+).strip()
+
+RAG_MAX_UPLOAD_BYTES = max(256_000, _env_first_int("RAG_MAX_UPLOAD_MB", default=25) * 1024 * 1024)
+RAG_CHUNK_SIZE = max(200, _env_first_int("RAG_CHUNK_SIZE", default=900))
+RAG_CHUNK_OVERLAP = max(0, _env_first_int("RAG_CHUNK_OVERLAP", default=120))
+RAG_ALLOWED_SUFFIXES = frozenset({".pdf", ".docx", ".txt", ".md"})
+
+# RAG → /api/voice-turn (mic STT → Ollama): retrieve chunks from Chroma, inject into prompt.
+VOICE_RAG_ENABLED = os.environ.get("VOICE_RAG_ENABLED", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+VOICE_RAG_N_RESULTS = max(1, min(20, _env_first_int("VOICE_RAG_N_RESULTS", default=6)))
+VOICE_RAG_MAX_CONTEXT_CHARS = max(400, _env_first_int("VOICE_RAG_MAX_CONTEXT_CHARS", default=3500))
+
+# SharePoint → Chroma: background sync (see _sharepoint_live_loop)
+SHAREPOINT_LIVE_SYNC = os.environ.get("SHAREPOINT_LIVE_SYNC", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+SHAREPOINT_SYNC_INTERVAL_SEC = max(30, _env_first_int("SHAREPOINT_SYNC_INTERVAL_SEC", default=90))
+
+# Google Drive → Chroma (service account + shared folder)
+GOOGLE_DRIVE_LIVE_SYNC = os.environ.get("GOOGLE_DRIVE_LIVE_SYNC", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+GOOGLE_DRIVE_SYNC_INTERVAL_SEC = max(30, _env_first_int("GOOGLE_DRIVE_SYNC_INTERVAL_SEC", default=90))
+
+# Dropbox → Chroma (Dropbox API: access token or refresh token + app key/secret)
+DROPBOX_LIVE_SYNC = os.environ.get("DROPBOX_LIVE_SYNC", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+DROPBOX_SYNC_INTERVAL_SEC = max(30, _env_first_int("DROPBOX_SYNC_INTERVAL_SEC", default=90))
+
+# Amazon S3 → Chroma
+S3_LIVE_SYNC = os.environ.get("S3_LIVE_SYNC", "1").strip().lower() in ("1", "true", "yes")
+S3_SYNC_INTERVAL_SEC = max(30, _env_first_int("S3_SYNC_INTERVAL_SEC", default=90))
+
+# Azure Blob → Chroma
+AZURE_BLOB_LIVE_SYNC = os.environ.get("AZURE_BLOB_LIVE_SYNC", "1").strip().lower() in ("1", "true", "yes")
+AZURE_BLOB_SYNC_INTERVAL_SEC = max(30, _env_first_int("AZURE_BLOB_SYNC_INTERVAL_SEC", default=90))
+
+# Google Cloud Storage → Chroma
+GCS_LIVE_SYNC = os.environ.get("GCS_LIVE_SYNC", "1").strip().lower() in ("1", "true", "yes")
+GCS_SYNC_INTERVAL_SEC = max(30, _env_first_int("GCS_SYNC_INTERVAL_SEC", default=90))
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="Lip-Sync Agent")
 
+_sharepoint_sync_lock = asyncio.Lock()
+_google_drive_sync_lock = asyncio.Lock()
+_dropbox_sync_lock = asyncio.Lock()
+_s3_sync_lock = asyncio.Lock()
+_azure_blob_sync_lock = asyncio.Lock()
+_gcs_sync_lock = asyncio.Lock()
+_background_tasks: list[asyncio.Task] = []
+
+
+async def _sharepoint_sync_execute() -> dict[str, Any]:
+    """Microsoft Graph → Chroma; updates SharePoint live-sync status markers."""
+    live_sync_mark_start()
+    try:
+        out = await asyncio.to_thread(
+            sharepoint_sync_to_chroma,
+            chunk_size=RAG_CHUNK_SIZE,
+            chunk_overlap=RAG_CHUNK_OVERLAP,
+        )
+        live_sync_mark_done(out, None)
+        return out
+    except Exception as e:
+        live_sync_mark_done(None, str(e))
+        raise
+
+
+async def _sharepoint_live_loop() -> None:
+    """Background: re-sync SharePoint documents into Chroma on an interval."""
+    await asyncio.sleep(2.0)
+    log = logging.getLogger("lipsync")
+    while True:
+        try:
+            if not SHAREPOINT_LIVE_SYNC:
+                await asyncio.sleep(15.0)
+                continue
+            if not sharepoint_is_configured():
+                await asyncio.sleep(60.0)
+                continue
+            try:
+                async with _sharepoint_sync_lock:
+                    await _sharepoint_sync_execute()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning("SharePoint live sync failed: %s", e)
+            await asyncio.sleep(float(SHAREPOINT_SYNC_INTERVAL_SEC))
+        except asyncio.CancelledError:
+            break
+
+
+async def _google_drive_sync_execute() -> dict[str, Any]:
+    """Google Drive → Chroma; updates live-sync status markers."""
+    gdrive_live_sync_mark_start()
+    try:
+        out = await asyncio.to_thread(
+            gdrive_sync_to_chroma,
+            chunk_size=RAG_CHUNK_SIZE,
+            chunk_overlap=RAG_CHUNK_OVERLAP,
+        )
+        gdrive_live_sync_mark_done(out, None)
+        return out
+    except Exception as e:
+        gdrive_live_sync_mark_done(None, str(e))
+        raise
+
+
+async def _google_drive_live_loop() -> None:
+    """Background: re-sync Google Drive folder into Chroma on an interval."""
+    await asyncio.sleep(3.5)
+    log = logging.getLogger("lipsync")
+    while True:
+        try:
+            if not GOOGLE_DRIVE_LIVE_SYNC:
+                await asyncio.sleep(15.0)
+                continue
+            if not gdrive_is_configured():
+                await asyncio.sleep(60.0)
+                continue
+            try:
+                async with _google_drive_sync_lock:
+                    await _google_drive_sync_execute()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning("Google Drive live sync failed: %s", e)
+            await asyncio.sleep(float(GOOGLE_DRIVE_SYNC_INTERVAL_SEC))
+        except asyncio.CancelledError:
+            break
+
+
+async def _dropbox_sync_execute() -> dict[str, Any]:
+    """Dropbox → Chroma; updates live-sync status markers."""
+    dropbox_live_sync_mark_start()
+    try:
+        out = await asyncio.to_thread(
+            dropbox_sync_to_chroma,
+            chunk_size=RAG_CHUNK_SIZE,
+            chunk_overlap=RAG_CHUNK_OVERLAP,
+        )
+        dropbox_live_sync_mark_done(out, None)
+        return out
+    except Exception as e:
+        dropbox_live_sync_mark_done(None, str(e))
+        raise
+
+
+async def _dropbox_live_loop() -> None:
+    """Background: re-sync Dropbox folder into Chroma on an interval."""
+    await asyncio.sleep(4.0)
+    log = logging.getLogger("lipsync")
+    while True:
+        try:
+            if not DROPBOX_LIVE_SYNC:
+                await asyncio.sleep(15.0)
+                continue
+            if not dropbox_is_configured():
+                await asyncio.sleep(60.0)
+                continue
+            try:
+                async with _dropbox_sync_lock:
+                    await _dropbox_sync_execute()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning("Dropbox live sync failed: %s", e)
+            await asyncio.sleep(float(DROPBOX_SYNC_INTERVAL_SEC))
+        except asyncio.CancelledError:
+            break
+
+
+async def _s3_sync_execute() -> dict[str, Any]:
+    s3_live_sync_mark_start()
+    try:
+        out = await asyncio.to_thread(
+            s3_sync_to_chroma,
+            chunk_size=RAG_CHUNK_SIZE,
+            chunk_overlap=RAG_CHUNK_OVERLAP,
+        )
+        s3_live_sync_mark_done(out, None)
+        return out
+    except Exception as e:
+        s3_live_sync_mark_done(None, str(e))
+        raise
+
+
+async def _s3_live_loop() -> None:
+    await asyncio.sleep(4.5)
+    log = logging.getLogger("lipsync")
+    while True:
+        try:
+            if not S3_LIVE_SYNC:
+                await asyncio.sleep(15.0)
+                continue
+            if not s3_is_configured():
+                await asyncio.sleep(60.0)
+                continue
+            try:
+                async with _s3_sync_lock:
+                    await _s3_sync_execute()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning("S3 live sync failed: %s", e)
+            await asyncio.sleep(float(S3_SYNC_INTERVAL_SEC))
+        except asyncio.CancelledError:
+            break
+
+
+async def _azure_blob_sync_execute() -> dict[str, Any]:
+    azure_blob_live_sync_mark_start()
+    try:
+        out = await asyncio.to_thread(
+            azure_blob_sync_to_chroma,
+            chunk_size=RAG_CHUNK_SIZE,
+            chunk_overlap=RAG_CHUNK_OVERLAP,
+        )
+        azure_blob_live_sync_mark_done(out, None)
+        return out
+    except Exception as e:
+        azure_blob_live_sync_mark_done(None, str(e))
+        raise
+
+
+async def _azure_blob_live_loop() -> None:
+    await asyncio.sleep(5.0)
+    log = logging.getLogger("lipsync")
+    while True:
+        try:
+            if not AZURE_BLOB_LIVE_SYNC:
+                await asyncio.sleep(15.0)
+                continue
+            if not azure_blob_is_configured():
+                await asyncio.sleep(60.0)
+                continue
+            try:
+                async with _azure_blob_sync_lock:
+                    await _azure_blob_sync_execute()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning("Azure Blob live sync failed: %s", e)
+            await asyncio.sleep(float(AZURE_BLOB_SYNC_INTERVAL_SEC))
+        except asyncio.CancelledError:
+            break
+
+
+async def _gcs_sync_execute() -> dict[str, Any]:
+    gcs_live_sync_mark_start()
+    try:
+        out = await asyncio.to_thread(
+            gcs_sync_to_chroma,
+            chunk_size=RAG_CHUNK_SIZE,
+            chunk_overlap=RAG_CHUNK_OVERLAP,
+        )
+        gcs_live_sync_mark_done(out, None)
+        return out
+    except Exception as e:
+        gcs_live_sync_mark_done(None, str(e))
+        raise
+
+
+async def _gcs_live_loop() -> None:
+    await asyncio.sleep(5.5)
+    log = logging.getLogger("lipsync")
+    while True:
+        try:
+            if not GCS_LIVE_SYNC:
+                await asyncio.sleep(15.0)
+                continue
+            if not gcs_is_configured():
+                await asyncio.sleep(60.0)
+                continue
+            try:
+                async with _gcs_sync_lock:
+                    await _gcs_sync_execute()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning("GCS live sync failed: %s", e)
+            await asyncio.sleep(float(GCS_SYNC_INTERVAL_SEC))
+        except asyncio.CancelledError:
+            break
+
 
 @app.on_event("startup")
-def _analytics_startup() -> None:
+async def _on_startup() -> None:
     init_db()
+    global _background_tasks
+    _background_tasks = []
+    if SHAREPOINT_LIVE_SYNC:
+        _background_tasks.append(asyncio.create_task(_sharepoint_live_loop()))
+    if GOOGLE_DRIVE_LIVE_SYNC:
+        _background_tasks.append(asyncio.create_task(_google_drive_live_loop()))
+    if DROPBOX_LIVE_SYNC:
+        _background_tasks.append(asyncio.create_task(_dropbox_live_loop()))
+    if S3_LIVE_SYNC:
+        _background_tasks.append(asyncio.create_task(_s3_live_loop()))
+    if AZURE_BLOB_LIVE_SYNC:
+        _background_tasks.append(asyncio.create_task(_azure_blob_live_loop()))
+    if GCS_LIVE_SYNC:
+        _background_tasks.append(asyncio.create_task(_gcs_live_loop()))
+
+
+@app.on_event("shutdown")
+async def _on_shutdown() -> None:
+    global _background_tasks
+    for t in _background_tasks:
+        t.cancel()
+    for t in _background_tasks:
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+    _background_tasks = []
 
 
 app.add_middleware(
@@ -170,6 +569,54 @@ async def _publish_analytics_snapshot() -> None:
                 stale.append(q)
     for q in stale:
         _analytics_subscribers.discard(q)
+
+
+def _avatar_predict(api_name: str, **kwargs: Any) -> Any:
+    client = Client(AVATAR_API_BASE)
+    return client.predict(api_name=api_name, **kwargs)
+
+
+def _result_items(result: Any) -> list[Any]:
+    if isinstance(result, (list, tuple)):
+        return list(result)
+    return [result]
+
+
+def _result_status(items: list[Any]) -> str:
+    if len(items) >= 2 and items[1] is not None:
+        return str(items[1])
+    return "OK"
+
+
+async def _store_gradio_file(candidate: Any, *, prefix: str, fallback_ext: str) -> str:
+    path: str | None = None
+    if isinstance(candidate, dict):
+        path = candidate.get("path") or candidate.get("name") or candidate.get("url")
+    elif isinstance(candidate, str):
+        path = candidate
+    if not path:
+        raise HTTPException(status_code=502, detail="Gradio returned no file path.")
+
+    suffix = Path(urlparse(path).path).suffix or fallback_ext
+    out_name = f"{prefix}_{uuid.uuid4().hex}{suffix}"
+    out_path = OUTPUT_DIR / out_name
+
+    if path.startswith("http://") or path.startswith("https://"):
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
+            r = await client.get(path)
+            if r.status_code >= 400:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Unable to fetch gradio output file: {r.status_code}",
+                )
+            out_path.write_bytes(r.content)
+    else:
+        src = Path(path)
+        if not src.is_file():
+            raise HTTPException(status_code=502, detail=f"Output file not found: {path}")
+        shutil.copy2(src, out_path)
+
+    return f"/outputs/{out_name}"
 
 
 async def _forward_webrtc_post(subpath: str, request: Request) -> Response:
@@ -234,23 +681,34 @@ def _timing_payload(
 
 
 def _is_openai_compatible_style() -> bool:
-    if MODEL_API_STYLE in ("openai", "v1", "chat"):
+    style = _model_api_style()
+    if style in ("openai", "v1", "chat"):
         return True
-    if MODEL_API_STYLE in ("ollama", "native"):
+    if style in ("ollama", "native"):
         return False
     # auto mode: bases that already point to /v1 are treated as OpenAI-compatible.
-    return OLLAMA_BASE.endswith("/v1")
+    return _ollama_base().endswith("/v1")
 
 
-async def _stream_openai_compatible(
+def _chat_completions_url(api_base: str) -> str:
+    b = api_base.rstrip("/")
+    if b.endswith("/v1"):
+        return f"{b}/chat/completions"
+    return f"{b}/v1/chat/completions"
+
+
+async def _stream_chat_completions(
+    *,
+    api_base: str,
+    model: str,
     prompt: str,
     metrics: dict[str, Any] | None = None,
-    *,
     max_tokens: int | None = None,
+    extra_headers: dict[str, str] | None = None,
 ) -> AsyncIterator[str]:
-    base = OLLAMA_BASE[:-3] if OLLAMA_BASE.endswith("/v1") else OLLAMA_BASE
-    payload = {
-        "model": OLLAMA_MODEL,
+    url = _chat_completions_url(api_base)
+    payload: dict[str, Any] = {
+        "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.7,
         "stream": True,
@@ -258,13 +716,9 @@ async def _stream_openai_compatible(
     }
     if max_tokens is not None:
         payload["max_tokens"] = int(max_tokens)
+    headers = {"Accept": "text/event-stream", **(extra_headers or {})}
     async with httpx.AsyncClient(timeout=300.0) as client:
-        async with client.stream(
-            "POST",
-            f"{base}/v1/chat/completions",
-            json=payload,
-            headers={"Accept": "text/event-stream"},
-        ) as response:
+        async with client.stream("POST", url, json=payload, headers=headers) as response:
             if response.status_code >= 400:
                 body = await response.aread()
                 raise HTTPException(
@@ -296,6 +750,199 @@ async def _stream_openai_compatible(
                         yield piece
 
 
+async def _stream_openai_compatible(
+    prompt: str,
+    metrics: dict[str, Any] | None = None,
+    *,
+    max_tokens: int | None = None,
+) -> AsyncIterator[str]:
+    async for piece in _stream_chat_completions(
+        api_base=_ollama_base(),
+        model=_ollama_model(),
+        prompt=prompt,
+        metrics=metrics,
+        max_tokens=max_tokens,
+        extra_headers=None,
+    ):
+        yield piece
+
+
+async def _stream_remote_openai(
+    prompt: str,
+    metrics: dict[str, Any] | None = None,
+    *,
+    max_tokens: int | None = None,
+) -> AsyncIterator[str]:
+    key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not key:
+        raise HTTPException(status_code=503, detail="OPENAI_API_KEY is not set.")
+    base = os.environ.get("OPENAI_BASE_URL", "").strip() or "https://api.openai.com"
+    model = os.environ.get("OPENAI_MODEL", "").strip() or "gpt-4o-mini"
+    async for piece in _stream_chat_completions(
+        api_base=base,
+        model=model,
+        prompt=prompt,
+        metrics=metrics,
+        max_tokens=max_tokens,
+        extra_headers={"Authorization": f"Bearer {key}"},
+    ):
+        yield piece
+
+
+async def _stream_remote_anthropic(
+    prompt: str,
+    metrics: dict[str, Any] | None = None,
+    *,
+    max_tokens: int | None = None,
+) -> AsyncIterator[str]:
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not key:
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY is not set.")
+    base = os.environ.get("ANTHROPIC_BASE_URL", "").strip() or "https://api.anthropic.com"
+    base = base.rstrip("/")
+    url = f"{base}/v1/messages"
+    model = os.environ.get("ANTHROPIC_MODEL", "").strip() or "claude-3-5-haiku-20241022"
+    mt = max_tokens if max_tokens is not None else VOICE_MAX_TOKENS
+    mt = max(256, min(int(mt), 8192))
+    body: dict[str, Any] = {
+        "model": model,
+        "max_tokens": mt,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": True,
+    }
+    headers = {
+        "x-api-key": key,
+        "anthropic-version": "2023-06-01",
+        "Accept": "text/event-stream",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        async with client.stream("POST", url, json=body, headers=headers) as response:
+            if response.status_code >= 400:
+                err_body = await response.aread()
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Anthropic API error {response.status_code}: {err_body.decode()[:500]}",
+                )
+            async for raw in response.aiter_lines():
+                line = raw.strip()
+                if not line:
+                    continue
+                chunk = line[5:].strip() if line.startswith("data:") else line
+                if not chunk or chunk == "[DONE]":
+                    continue
+                if chunk.startswith(":"):
+                    continue
+                try:
+                    data = json.loads(chunk)
+                except json.JSONDecodeError:
+                    continue
+                if data.get("type") == "error":
+                    raise HTTPException(status_code=502, detail=str(data.get("error") or data))
+                if data.get("type") == "content_block_delta":
+                    d = data.get("delta") or {}
+                    if d.get("type") == "text_delta":
+                        piece = d.get("text") or ""
+                        if piece:
+                            yield piece
+                if data.get("type") == "message_delta" and metrics is not None:
+                    u = data.get("usage") or {}
+                    if u.get("input_tokens") is not None:
+                        metrics["prompt_eval_count"] = u.get("input_tokens")
+                    if u.get("output_tokens") is not None:
+                        metrics["eval_count"] = u.get("output_tokens")
+
+
+def _gemini_stream_text_piece(obj: dict[str, Any]) -> str:
+    parts_out: list[str] = []
+    for c in obj.get("candidates") or []:
+        content = c.get("content") or {}
+        for p in content.get("parts") or []:
+            t = p.get("text")
+            if isinstance(t, str) and t:
+                parts_out.append(t)
+    return "".join(parts_out)
+
+
+async def _stream_remote_google_gemini(
+    prompt: str,
+    metrics: dict[str, Any] | None = None,
+    *,
+    max_tokens: int | None = None,
+) -> AsyncIterator[str]:
+    key = _google_gemini_api_key()
+    if not key:
+        raise HTTPException(
+            status_code=503,
+            detail="GOOGLE_API_KEY (or GEMINI_API_KEY) is not set.",
+        )
+    base = os.environ.get("GOOGLE_GEMINI_BASE_URL", "").strip() or "https://generativelanguage.googleapis.com"
+    base = base.rstrip("/")
+    mid_raw = os.environ.get("GOOGLE_GEMINI_MODEL", "").strip() or "gemini-2.0-flash"
+    _gem_allowed = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._")
+    if mid_raw.startswith("models/"):
+        suffix = "".join(c for c in mid_raw[9:] if c in _gem_allowed) or "gemini-2.0-flash"
+        model_path = f"models/{suffix}"
+    else:
+        slug = "".join(c for c in mid_raw if c in _gem_allowed) or "gemini-2.0-flash"
+        model_path = f"models/{slug}"
+    url = f"{base}/v1beta/{model_path}:streamGenerateContent?alt=sse"
+    mt = max_tokens if max_tokens is not None else VOICE_MAX_TOKENS
+    mt = max(16, min(int(mt), 8192))
+    body: dict[str, Any] = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"maxOutputTokens": mt, "temperature": 0.7},
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": key,
+    }
+    cumulative = ""
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        async with client.stream("POST", url, json=body, headers=headers) as response:
+            if response.status_code >= 400:
+                err_body = await response.aread()
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Google Gemini API error {response.status_code}: {err_body.decode()[:600]}",
+                )
+            async for raw in response.aiter_lines():
+                line = raw.strip()
+                if not line:
+                    continue
+                chunk = line[5:].strip() if line.startswith("data:") else line
+                if not chunk or chunk == "[DONE]":
+                    continue
+                if chunk.startswith(":"):
+                    continue
+                try:
+                    data = json.loads(chunk)
+                except json.JSONDecodeError:
+                    continue
+                err = data.get("error")
+                if isinstance(err, dict):
+                    raise HTTPException(status_code=502, detail=str(err.get("message") or err)[:500])
+                if err:
+                    raise HTTPException(status_code=502, detail=str(err)[:500])
+                piece = _gemini_stream_text_piece(data)
+                if not piece:
+                    um = data.get("usageMetadata")
+                    if isinstance(um, dict) and metrics is not None:
+                        if um.get("promptTokenCount") is not None:
+                            metrics["prompt_eval_count"] = um.get("promptTokenCount")
+                        if um.get("candidatesTokenCount") is not None:
+                            metrics["eval_count"] = um.get("candidatesTokenCount")
+                    continue
+                if piece.startswith(cumulative):
+                    delta = piece[len(cumulative) :]
+                    cumulative = piece
+                else:
+                    delta = piece
+                    cumulative += piece
+                if delta:
+                    yield delta
+
+
 async def _stream_ollama_native(
     prompt: str,
     metrics: dict[str, Any] | None = None,
@@ -303,7 +950,7 @@ async def _stream_ollama_native(
     max_tokens: int | None = None,
 ) -> AsyncIterator[str]:
     payload = {
-        "model": OLLAMA_MODEL,
+        "model": _ollama_model(),
         "prompt": prompt,
         "stream": True,
         "options": {"temperature": 0.7},
@@ -313,7 +960,7 @@ async def _stream_ollama_native(
     async with httpx.AsyncClient(timeout=300.0) as client:
         async with client.stream(
             "POST",
-            f"{OLLAMA_BASE}/api/generate",
+            f"{_ollama_base()}/api/generate",
             json=payload,
         ) as response:
             if response.status_code >= 400:
@@ -355,7 +1002,20 @@ async def ollama_stream_tokens(
     *,
     max_tokens: int | None = None,
 ) -> AsyncIterator[str]:
-    """Yields incremental text tokens from configured model server stream API."""
+    """Yields incremental text tokens from configured LLM (local, OpenAI, Anthropic, or Google Gemini)."""
+    prov = _llm_provider()
+    if prov == "openai":
+        async for tok in _stream_remote_openai(prompt, metrics, max_tokens=max_tokens):
+            yield tok
+        return
+    if prov == "anthropic":
+        async for tok in _stream_remote_anthropic(prompt, metrics, max_tokens=max_tokens):
+            yield tok
+        return
+    if prov == "google":
+        async for tok in _stream_remote_google_gemini(prompt, metrics, max_tokens=max_tokens):
+            yield tok
+        return
     if _is_openai_compatible_style():
         async for tok in _stream_openai_compatible(prompt, metrics, max_tokens=max_tokens):
             yield tok
@@ -375,7 +1035,7 @@ async def ollama_generate(
         parts.append(t)
     text = "".join(parts).strip()
     if not text:
-        raise HTTPException(status_code=502, detail="Ollama returned an empty response.")
+        raise HTTPException(status_code=502, detail="The model returned an empty response.")
     return text
 
 
@@ -592,13 +1252,75 @@ def resolve_output_video(result: Any) -> str:
     return path
 
 
+def _active_llm_model_label() -> str:
+    p = _llm_provider()
+    if p == "openai":
+        return os.environ.get("OPENAI_MODEL", "").strip() or "gpt-4o-mini"
+    if p == "anthropic":
+        return os.environ.get("ANTHROPIC_MODEL", "").strip() or "claude-3-5-haiku-20241022"
+    if p == "google":
+        return os.environ.get("GOOGLE_GEMINI_MODEL", "").strip() or "gemini-2.0-flash"
+    return _ollama_model()
+
+
+def _llm_public_config() -> dict[str, Any]:
+    """Non-secret LLM / provider status for Studio and health (reads os.environ each call)."""
+    ob = _ollama_base()
+    om = _ollama_model()
+    oa_url = os.environ.get("OPENAI_BASE_URL", "").strip() or "https://api.openai.com"
+    oa_model = os.environ.get("OPENAI_MODEL", "").strip() or "gpt-4o-mini"
+    an_url = os.environ.get("ANTHROPIC_BASE_URL", "").strip() or "https://api.anthropic.com"
+    an_model = os.environ.get("ANTHROPIC_MODEL", "").strip() or "claude-3-5-haiku-20241022"
+    gg_url = os.environ.get("GOOGLE_GEMINI_BASE_URL", "").strip() or "https://generativelanguage.googleapis.com"
+    gg_model = os.environ.get("GOOGLE_GEMINI_MODEL", "").strip() or "gemini-2.0-flash"
+    return {
+        "provider": _llm_provider(),
+        "local": {
+            "ollama_base": ob,
+            "ollama_model": om,
+            "model_api_style": _model_api_style(),
+            "openai_compatible": _is_openai_compatible_style(),
+        },
+        "openai": {
+            "configured": bool(os.environ.get("OPENAI_API_KEY", "").strip()),
+            "base_url": oa_url,
+            "model": oa_model,
+        },
+        "anthropic": {
+            "configured": bool(os.environ.get("ANTHROPIC_API_KEY", "").strip()),
+            "base_url": an_url,
+            "model": an_model,
+        },
+        "google": {
+            "configured": bool(_google_gemini_api_key()),
+            "base_url": gg_url,
+            "model": gg_model,
+        },
+    }
+
+
 @app.get("/api/health")
 async def health():
+    rag_info: dict[str, Any] = {
+        "chunk_size": RAG_CHUNK_SIZE,
+        "chunk_overlap": RAG_CHUNK_OVERLAP,
+        "max_upload_mb": RAG_MAX_UPLOAD_BYTES // (1024 * 1024),
+        "allowed_suffixes": sorted(RAG_ALLOWED_SUFFIXES),
+        "voice_rag_enabled": VOICE_RAG_ENABLED,
+        "voice_rag_n_results": VOICE_RAG_N_RESULTS,
+        "voice_rag_max_context_chars": VOICE_RAG_MAX_CONTEXT_CHARS,
+    }
+    try:
+        rag_info.update(rag_get_status())
+    except Exception as e:
+        rag_info["error"] = str(e)
     return {
         "ok": True,
-        "ollama": OLLAMA_BASE,
-        "model": OLLAMA_MODEL,
-        "model_api_style": MODEL_API_STYLE,
+        "ollama": _ollama_base(),
+        "model": _ollama_model(),
+        "model_api_style": _model_api_style(),
+        "llm_provider": _llm_provider(),
+        "llm": _llm_public_config(),
         "voice_max_tokens": VOICE_MAX_TOKENS,
         "lipsync_file_api": LIPSYNC_FILE_API_URL,
         "checkpoint_path": LIPSYNC_CHECKPOINT_PATH,
@@ -615,6 +1337,26 @@ async def health():
         "rt_target_sec": LIPSYNC_RT_TARGET_SEC,
         "rt_min_chars": LIPSYNC_RT_MIN_CHARS,
         "webrtc_signaling_proxy": bool(WEBRTC_SIGNALING_BASE),
+        "avatar_api_base": AVATAR_API_BASE,
+        "rag": rag_info,
+        "sharepoint": {
+            **sharepoint_public_config(),
+        },
+        "google_drive": {
+            **gdrive_public_config(),
+        },
+        "dropbox": {
+            **dropbox_public_config(),
+        },
+        "s3": {
+            **s3_public_config(),
+        },
+        "azure_blob": {
+            **azure_blob_public_config(),
+        },
+        "gcs": {
+            **gcs_public_config(),
+        },
     }
 
 
@@ -624,6 +1366,70 @@ async def webrtc_proxy_status():
     return {"signaling_proxy_configured": bool(WEBRTC_SIGNALING_BASE)}
 
 
+def _build_voice_llm_prompt(user_text: str) -> tuple[str, dict[str, Any]]:
+    """
+    Build Ollama prompt for the hologram voice turn. Optionally prepends ChromaDB retrieval
+    when VOICE_RAG_ENABLED and the knowledge base has chunks.
+    """
+    rag_meta: dict[str, Any] = {
+        "enabled": VOICE_RAG_ENABLED,
+        "used": False,
+        "chunks": 0,
+    }
+    user_block = (
+        f"User said:\n{user_text}\n\n"
+        "Assistant (spoken reply only, no markdown):"
+    )
+    if not VOICE_RAG_ENABLED:
+        return f"{VOICE_OLLAMA_INSTRUCTION}\n\n{user_block}", rag_meta
+
+    try:
+        st = rag_get_status()
+        if int(st.get("chunk_count") or 0) == 0:
+            return f"{VOICE_OLLAMA_INSTRUCTION}\n\n{user_block}", rag_meta
+    except Exception as e:
+        logger.warning("RAG status unavailable for voice-turn: %s", e)
+        rag_meta["error"] = "status_unavailable"
+        return f"{VOICE_OLLAMA_INSTRUCTION}\n\n{user_block}", rag_meta
+
+    try:
+        retrieved = query_documents(user_text, VOICE_RAG_N_RESULTS)
+        results = retrieved.get("results") or []
+    except Exception as e:
+        logger.warning("RAG query failed for voice-turn: %s", e)
+        rag_meta["error"] = str(e)
+        return f"{VOICE_OLLAMA_INSTRUCTION}\n\n{user_block}", rag_meta
+
+    if not results:
+        return f"{VOICE_OLLAMA_INSTRUCTION}\n\n{user_block}", rag_meta
+
+    parts: list[str] = []
+    for i, hit in enumerate(results, 1):
+        chunk_text = (hit.get("text") or "").strip()
+        if not chunk_text:
+            continue
+        fn = (hit.get("metadata") or {}).get("filename", "document")
+        parts.append(f"[{i}] ({fn})\n{chunk_text}")
+
+    if not parts:
+        return f"{VOICE_OLLAMA_INSTRUCTION}\n\n{user_block}", rag_meta
+
+    context = "\n\n".join(parts)
+    if len(context) > VOICE_RAG_MAX_CONTEXT_CHARS:
+        context = context[: VOICE_RAG_MAX_CONTEXT_CHARS] + "…"
+
+    rag_meta["used"] = True
+    rag_meta["chunks"] = len(parts)
+    prompt = (
+        f"{VOICE_OLLAMA_INSTRUCTION}\n\n"
+        "Relevant passages from uploaded documents "
+        "(use when they help answer the user; if they do not apply, answer normally):\n"
+        f"{context}\n\n"
+        f"{user_block}"
+    )
+    return prompt, rag_meta
+
+
 class VoiceTurnBody(BaseModel):
     text: str = Field(..., min_length=1, max_length=8000)
 
@@ -631,15 +1437,12 @@ class VoiceTurnBody(BaseModel):
 @app.post("/api/voice-turn")
 async def voice_turn(body: VoiceTurnBody):
     """
-    Browser STT text → Ollama (short avatar-friendly reply) → client sends answer to LiveTalking /human.
+    Browser STT text → optional ChromaDB RAG → Ollama (short avatar-friendly reply) → client sends answer to LiveTalking /human.
     """
     user_text = body.text.strip()
     if not user_text:
         raise HTTPException(status_code=400, detail="text is empty.")
-    prompt = (
-        f"{VOICE_OLLAMA_INSTRUCTION}\n\nUser said:\n{user_text}\n\n"
-        "Assistant (spoken reply only, no markdown):"
-    )
+    prompt, rag_meta = await asyncio.to_thread(_build_voice_llm_prompt, user_text)
     t0 = time.perf_counter()
     ollama_metrics: dict[str, Any] = {}
     answer = await ollama_generate(prompt, ollama_metrics, max_tokens=VOICE_MAX_TOKENS)
@@ -660,7 +1463,7 @@ async def voice_turn(body: VoiceTurnBody):
             ollama_load_duration_ns=ollama_metrics.get("load_duration_ns"),
         )
         await _publish_analytics_snapshot()
-    return {"answer": answer, "heard": user_text}
+    return {"answer": answer, "heard": user_text, "rag": rag_meta}
 
 
 @app.get("/api/analytics/summary")
@@ -715,6 +1518,686 @@ async def analytics_reset(body: AnalyticsResetBody):
     n = clear_all()
     await _publish_analytics_snapshot()
     return {"cleared": n}
+
+
+class RagQueryBody(BaseModel):
+    query: str = Field(..., min_length=1, max_length=4000)
+    n_results: int = Field(6, ge=1, le=30)
+
+
+@app.get("/api/rag/status")
+async def rag_status():
+    """ChromaDB persistent store: chunk counts and indexed sources."""
+    try:
+        base = rag_get_status()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"RAG store unavailable: {e}") from e
+    try:
+        base["sources"] = rag_list_sources()
+    except Exception:
+        base["sources"] = []
+    return base
+
+
+@app.post("/api/rag/ingest")
+async def rag_ingest(files: list[UploadFile] = File(...)):
+    """Upload PDF, DOCX, or TXT — text is chunked and embedded into ChromaDB (on-disk)."""
+    if not files:
+        raise HTTPException(status_code=400, detail="No files uploaded.")
+    results: list[dict[str, Any]] = []
+    for uf in files:
+        name = uf.filename or "document"
+        suffix = Path(name).suffix.lower()
+        if suffix not in RAG_ALLOWED_SUFFIXES:
+            results.append(
+                {
+                    "filename": name,
+                    "ok": False,
+                    "error": f"Allowed types: {', '.join(sorted(RAG_ALLOWED_SUFFIXES))}",
+                }
+            )
+            continue
+        try:
+            data = await uf.read()
+            if len(data) > RAG_MAX_UPLOAD_BYTES:
+                raise ValueError(f"File too large (max {RAG_MAX_UPLOAD_BYTES // (1024 * 1024)} MB).")
+            info = await asyncio.to_thread(
+                ingest_file,
+                filename=name,
+                data=data,
+                chunk_size=RAG_CHUNK_SIZE,
+                chunk_overlap=RAG_CHUNK_OVERLAP,
+            )
+            results.append({"filename": name, "ok": True, **info})
+        except Exception as e:
+            results.append({"filename": name, "ok": False, "error": str(e)})
+    return {"results": results}
+
+
+@app.post("/api/rag/query")
+async def rag_query(body: RagQueryBody):
+    """Semantic search over ingested documents (for RAG prompts or debugging)."""
+    try:
+        return query_documents(body.query.strip(), body.n_results)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"RAG query failed: {e}") from e
+
+
+@app.delete("/api/rag/sources/{source_id}")
+async def rag_delete_source(source_id: str):
+    if not source_id.strip() or len(source_id) > 64:
+        raise HTTPException(status_code=400, detail="Invalid source_id.")
+    try:
+        n = delete_source(source_id.strip())
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    return {"deleted_chunks": n}
+
+
+class RagResetBody(BaseModel):
+    secret: str = Field(..., min_length=1, max_length=256)
+
+
+class StudioSharePointConnect(BaseModel):
+    azure_tenant_id: str = Field("", max_length=512)
+    azure_client_id: str = Field("", max_length=512)
+    azure_client_secret: str = Field("", max_length=512)
+    sharepoint_site_url: str = Field("", max_length=2048)
+    sharepoint_folder_path: str = Field("", max_length=1024)
+
+
+class StudioDropboxConnect(BaseModel):
+    dropbox_access_token: str = Field("", max_length=8192)
+    dropbox_refresh_token: str = Field("", max_length=8192)
+    dropbox_app_key: str = Field("", max_length=512)
+    dropbox_app_secret: str = Field("", max_length=512)
+    dropbox_folder_path: str = Field("", max_length=2048)
+
+
+class StudioS3Connect(BaseModel):
+    s3_bucket: str = Field("", max_length=256)
+    s3_prefix: str = Field("", max_length=2048)
+    aws_region: str = Field("", max_length=64)
+    aws_access_key_id: str = Field("", max_length=256)
+    aws_secret_access_key: str = Field("", max_length=256)
+    aws_session_token: str = Field("", max_length=4096)
+    s3_use_default_credential_chain: str = Field("", max_length=8)
+
+
+class StudioAzureBlobConnect(BaseModel):
+    azure_storage_connection_string: str = Field("", max_length=4096)
+    azure_storage_account_name: str = Field("", max_length=256)
+    azure_storage_account_key: str = Field("", max_length=512)
+    azure_blob_container: str = Field("", max_length=256)
+    azure_blob_prefix: str = Field("", max_length=2048)
+
+
+class StudioLLMConnect(BaseModel):
+    llm_provider: str = Field("", max_length=32)
+    ollama_base: str = Field("", max_length=2048)
+    ollama_model: str = Field("", max_length=512)
+    model_api_style: str = Field("", max_length=32)
+    openai_api_key: str = Field("", max_length=512)
+    openai_base_url: str = Field("", max_length=2048)
+    openai_model: str = Field("", max_length=256)
+    anthropic_api_key: str = Field("", max_length=512)
+    anthropic_base_url: str = Field("", max_length=2048)
+    anthropic_model: str = Field("", max_length=256)
+    google_api_key: str = Field("", max_length=512)
+    google_gemini_base_url: str = Field("", max_length=2048)
+    google_gemini_model: str = Field("", max_length=256)
+
+
+@app.post("/api/rag/reset")
+async def rag_reset(body: RagResetBody):
+    """Wipes the Chroma collection when ``RAG_RESET_SECRET`` matches."""
+    expected = os.environ.get("RAG_RESET_SECRET", "").strip()
+    if not expected or body.secret != expected:
+        raise HTTPException(status_code=403, detail="Invalid or unset RAG_RESET_SECRET.")
+    try:
+        await asyncio.to_thread(rag_reset_collection)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    return {"ok": True}
+
+
+@app.get("/api/sharepoint/config")
+async def sharepoint_config():
+    """Whether Azure / SharePoint env is set (no secrets returned)."""
+    return sharepoint_public_config()
+
+
+@app.post("/api/sharepoint/sync")
+async def sharepoint_sync():
+    """
+    On-demand sync (same pipeline as live sync). Uses a lock so concurrent runs with the
+    background loop do not overlap.
+    """
+    if not sharepoint_is_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="SharePoint is not configured. Set AZURE_TENANT_ID, AZURE_CLIENT_ID, "
+            "AZURE_CLIENT_SECRET, and SHAREPOINT_SITE_URL.",
+        )
+    async with _sharepoint_sync_lock:
+        try:
+            return await _sharepoint_sync_execute()
+        except RuntimeError as e:
+            raise HTTPException(status_code=502, detail=str(e)) from e
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"SharePoint sync failed: {e}") from e
+
+
+@app.get("/api/google-drive/config")
+async def google_drive_config():
+    """Whether Google Drive env is set (no secrets returned)."""
+    return gdrive_public_config()
+
+
+@app.post("/api/google-drive/sync")
+async def google_drive_sync():
+    """On-demand Google Drive → Chroma sync (same pipeline as live; lock prevents overlap)."""
+    if not gdrive_is_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Google Drive is not configured. Set GOOGLE_DRIVE_CREDENTIALS_PATH and "
+            "GOOGLE_DRIVE_FOLDER_ID (share the folder with the service account email).",
+        )
+    async with _google_drive_sync_lock:
+        try:
+            return await _google_drive_sync_execute()
+        except RuntimeError as e:
+            raise HTTPException(status_code=502, detail=str(e)) from e
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Google Drive sync failed: {e}") from e
+
+
+@app.get("/api/dropbox/config")
+async def dropbox_config():
+    """Whether Dropbox env is set (no secrets returned)."""
+    return dropbox_public_config()
+
+
+@app.post("/api/dropbox/sync")
+async def dropbox_sync():
+    """On-demand Dropbox → Chroma sync (same pipeline as live; lock prevents overlap)."""
+    if not dropbox_is_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Dropbox is not configured. Set DROPBOX_ACCESS_TOKEN, or "
+            "DROPBOX_REFRESH_TOKEN with DROPBOX_APP_KEY and DROPBOX_APP_SECRET. "
+            "Optional: DROPBOX_FOLDER_PATH (default root).",
+        )
+    async with _dropbox_sync_lock:
+        try:
+            return await _dropbox_sync_execute()
+        except RuntimeError as e:
+            raise HTTPException(status_code=502, detail=str(e)) from e
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Dropbox sync failed: {e}") from e
+
+
+@app.get("/api/s3/config")
+async def s3_config():
+    return s3_public_config()
+
+
+@app.post("/api/s3/sync")
+async def s3_sync():
+    if not s3_is_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="S3 is not configured. Set S3_BUCKET and AWS keys, or S3_USE_DEFAULT_CREDENTIAL_CHAIN=1.",
+        )
+    async with _s3_sync_lock:
+        try:
+            return await _s3_sync_execute()
+        except RuntimeError as e:
+            raise HTTPException(status_code=502, detail=str(e)) from e
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"S3 sync failed: {e}") from e
+
+
+@app.get("/api/azure-blob/config")
+async def azure_blob_config():
+    return azure_blob_public_config()
+
+
+@app.post("/api/azure-blob/sync")
+async def azure_blob_sync():
+    if not azure_blob_is_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Azure Blob is not configured. Set AZURE_STORAGE_CONNECTION_STRING or "
+            "AZURE_STORAGE_ACCOUNT_NAME + AZURE_STORAGE_ACCOUNT_KEY, and AZURE_BLOB_CONTAINER.",
+        )
+    async with _azure_blob_sync_lock:
+        try:
+            return await _azure_blob_sync_execute()
+        except RuntimeError as e:
+            raise HTTPException(status_code=502, detail=str(e)) from e
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Azure Blob sync failed: {e}") from e
+
+
+@app.get("/api/gcs/config")
+async def gcs_config():
+    return gcs_public_config()
+
+
+@app.post("/api/gcs/sync")
+async def gcs_sync():
+    if not gcs_is_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="GCS is not configured. Set GCS_BUCKET and GCS_CREDENTIALS_PATH (or "
+            "GOOGLE_APPLICATION_CREDENTIALS), or GCS_USE_ADC=1.",
+        )
+    async with _gcs_sync_lock:
+        try:
+            return await _gcs_sync_execute()
+        except RuntimeError as e:
+            raise HTTPException(status_code=502, detail=str(e)) from e
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"GCS sync failed: {e}") from e
+
+
+@app.get("/api/llm/config")
+async def llm_config():
+    """Active LLM provider and non-secret connection hints (OpenAI / Anthropic keys never returned)."""
+    return _llm_public_config()
+
+
+@app.get("/api/studio/integrations")
+async def studio_integrations_status():
+    """Which connector settings are saved locally (no secret values)."""
+    return studio_integrations_summary()
+
+
+@app.post("/api/studio/integrations/sharepoint")
+async def studio_integrations_connect_sharepoint(body: StudioSharePointConnect):
+    """Save SharePoint / Azure app credentials to studio_integrations.json and apply env."""
+    studio_save_section(
+        "sharepoint",
+        {
+            "AZURE_TENANT_ID": body.azure_tenant_id,
+            "AZURE_CLIENT_ID": body.azure_client_id,
+            "AZURE_CLIENT_SECRET": body.azure_client_secret,
+            "SHAREPOINT_SITE_URL": body.sharepoint_site_url,
+            "SHAREPOINT_FOLDER_PATH": body.sharepoint_folder_path,
+        },
+    )
+    return {
+        "ok": True,
+        "summary": studio_integrations_summary(),
+        "config": sharepoint_public_config(),
+    }
+
+
+@app.post("/api/studio/integrations/dropbox")
+async def studio_integrations_connect_dropbox(body: StudioDropboxConnect):
+    """Save Dropbox tokens / app keys to studio_integrations.json and apply env."""
+    studio_save_section(
+        "dropbox",
+        {
+            "DROPBOX_ACCESS_TOKEN": body.dropbox_access_token,
+            "DROPBOX_REFRESH_TOKEN": body.dropbox_refresh_token,
+            "DROPBOX_APP_KEY": body.dropbox_app_key,
+            "DROPBOX_APP_SECRET": body.dropbox_app_secret,
+            "DROPBOX_FOLDER_PATH": body.dropbox_folder_path,
+        },
+    )
+    return {
+        "ok": True,
+        "summary": studio_integrations_summary(),
+        "config": dropbox_public_config(),
+    }
+
+
+@app.post("/api/studio/integrations/s3")
+async def studio_integrations_connect_s3(body: StudioS3Connect):
+    studio_save_section(
+        "s3",
+        {
+            "S3_BUCKET": body.s3_bucket,
+            "S3_PREFIX": body.s3_prefix,
+            "AWS_REGION": body.aws_region,
+            "AWS_DEFAULT_REGION": body.aws_region,
+            "AWS_ACCESS_KEY_ID": body.aws_access_key_id,
+            "AWS_SECRET_ACCESS_KEY": body.aws_secret_access_key,
+            "AWS_SESSION_TOKEN": body.aws_session_token,
+            "S3_USE_DEFAULT_CREDENTIAL_CHAIN": body.s3_use_default_credential_chain,
+        },
+    )
+    return {"ok": True, "summary": studio_integrations_summary(), "config": s3_public_config()}
+
+
+@app.post("/api/studio/integrations/azure-blob")
+async def studio_integrations_connect_azure_blob(body: StudioAzureBlobConnect):
+    studio_save_section(
+        "azure_blob",
+        {
+            "AZURE_STORAGE_CONNECTION_STRING": body.azure_storage_connection_string,
+            "AZURE_STORAGE_ACCOUNT_NAME": body.azure_storage_account_name,
+            "AZURE_STORAGE_ACCOUNT_KEY": body.azure_storage_account_key,
+            "AZURE_BLOB_CONTAINER": body.azure_blob_container,
+            "AZURE_BLOB_PREFIX": body.azure_blob_prefix,
+        },
+    )
+    return {"ok": True, "summary": studio_integrations_summary(), "config": azure_blob_public_config()}
+
+
+@app.post("/api/studio/integrations/gcs")
+async def studio_integrations_connect_gcs(
+    bucket: str = Form(""),
+    prefix: str = Form(""),
+    credentials_path: str = Form(""),
+    gcs_use_adc: str = Form(""),
+    credentials: UploadFile | None = File(None),
+):
+    vals: dict[str, str | None] = {}
+    if bucket.strip():
+        vals["GCS_BUCKET"] = bucket.strip()
+    if prefix.strip():
+        vals["GCS_PREFIX"] = prefix.strip()
+    if gcs_use_adc.strip().lower() in ("1", "true", "yes"):
+        vals["GCS_USE_ADC"] = "1"
+    path_val = ""
+    if credentials is not None and (credentials.filename or "").strip():
+        raw = await credentials.read()
+        if len(raw) > 2_000_000:
+            raise HTTPException(status_code=400, detail="Credentials JSON is too large (max 2 MB).")
+        STUDIO_GCS_CREDENTIALS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        STUDIO_GCS_CREDENTIALS_PATH.write_bytes(raw)
+        path_val = str(STUDIO_GCS_CREDENTIALS_PATH.resolve())
+    elif credentials_path.strip():
+        path_val = credentials_path.strip()
+    if path_val:
+        vals["GCS_CREDENTIALS_PATH"] = path_val
+    if not vals:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide bucket name, GCS_USE_ADC, and/or credentials JSON or path.",
+        )
+    studio_save_section("gcs", vals)
+    return {"ok": True, "summary": studio_integrations_summary(), "config": gcs_public_config()}
+
+
+@app.post("/api/studio/integrations/llm")
+async def studio_integrations_connect_llm(body: StudioLLMConnect):
+    """Save LLM provider (local / OpenAI / Anthropic / Google Gemini) and related settings; applies immediately."""
+    prov = body.llm_provider.strip().lower()
+    if prov not in ("local", "openai", "anthropic", "google"):
+        raise HTTPException(
+            status_code=400,
+            detail="llm_provider must be local, openai, anthropic, or google.",
+        )
+    prev = studio_read_section_strings("llm")
+
+    def set_or_clear(key: str, raw: str) -> str | None:
+        s = raw.strip()
+        return s if s else ""
+
+    vals: dict[str, str | None] = {"LLM_PROVIDER": prov}
+    vals["OLLAMA_BASE"] = set_or_clear("OLLAMA_BASE", body.ollama_base)
+    vals["OLLAMA_MODEL"] = set_or_clear("OLLAMA_MODEL", body.ollama_model)
+    vals["MODEL_API_STYLE"] = set_or_clear("MODEL_API_STYLE", body.model_api_style)
+    vals["OPENAI_BASE_URL"] = set_or_clear("OPENAI_BASE_URL", body.openai_base_url)
+    vals["OPENAI_MODEL"] = set_or_clear("OPENAI_MODEL", body.openai_model)
+    vals["ANTHROPIC_BASE_URL"] = set_or_clear("ANTHROPIC_BASE_URL", body.anthropic_base_url)
+    vals["ANTHROPIC_MODEL"] = set_or_clear("ANTHROPIC_MODEL", body.anthropic_model)
+    vals["GOOGLE_GEMINI_BASE_URL"] = set_or_clear("GOOGLE_GEMINI_BASE_URL", body.google_gemini_base_url)
+    vals["GOOGLE_GEMINI_MODEL"] = set_or_clear("GOOGLE_GEMINI_MODEL", body.google_gemini_model)
+    if body.openai_api_key.strip():
+        vals["OPENAI_API_KEY"] = body.openai_api_key.strip()
+    if body.anthropic_api_key.strip():
+        vals["ANTHROPIC_API_KEY"] = body.anthropic_api_key.strip()
+    if body.google_api_key.strip():
+        vals["GOOGLE_API_KEY"] = body.google_api_key.strip()
+
+    openai_key = (
+        body.openai_api_key.strip()
+        or prev.get("OPENAI_API_KEY", "")
+        or os.environ.get("OPENAI_API_KEY", "").strip()
+    )
+    anth_key = (
+        body.anthropic_api_key.strip()
+        or prev.get("ANTHROPIC_API_KEY", "")
+        or os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    )
+    google_key = (
+        body.google_api_key.strip()
+        or prev.get("GOOGLE_API_KEY", "")
+        or _google_gemini_api_key()
+    )
+    if prov == "openai" and not openai_key:
+        raise HTTPException(
+            status_code=400,
+            detail="OpenAI provider requires an API key (paste a key or keep one already saved in Studio).",
+        )
+    if prov == "anthropic" and not anth_key:
+        raise HTTPException(
+            status_code=400,
+            detail="Anthropic provider requires an API key (paste a key or keep one already saved in Studio).",
+        )
+    if prov == "google" and not google_key:
+        raise HTTPException(
+            status_code=400,
+            detail="Google Gemini requires GOOGLE_API_KEY (paste a key or keep one already saved in Studio).",
+        )
+    studio_save_section("llm", vals)
+    return {"ok": True, "summary": studio_integrations_summary(), "config": _llm_public_config()}
+
+
+@app.post("/api/studio/integrations/google-drive")
+async def studio_integrations_connect_google_drive(
+    folder_id: str = Form(""),
+    credentials_path: str = Form(""),
+    credentials: UploadFile | None = File(None),
+):
+    """Save Google Drive folder ID and optional service-account JSON (upload or server path)."""
+    vals: dict[str, str | None] = {}
+    if folder_id.strip():
+        vals["GOOGLE_DRIVE_FOLDER_ID"] = folder_id.strip()
+    path_val = ""
+    if credentials is not None and (credentials.filename or "").strip():
+        raw = await credentials.read()
+        if len(raw) > 2_000_000:
+            raise HTTPException(status_code=400, detail="Credentials JSON is too large (max 2 MB).")
+        STUDIO_GDRIVE_CREDENTIALS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        STUDIO_GDRIVE_CREDENTIALS_PATH.write_bytes(raw)
+        path_val = str(STUDIO_GDRIVE_CREDENTIALS_PATH.resolve())
+    elif credentials_path.strip():
+        path_val = credentials_path.strip()
+    if path_val:
+        vals["GOOGLE_DRIVE_CREDENTIALS_PATH"] = path_val
+    if not vals:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide a folder ID, upload a service account JSON, and/or a credentials file path.",
+        )
+    studio_save_section("google_drive", vals)
+    return {
+        "ok": True,
+        "summary": studio_integrations_summary(),
+        "config": gdrive_public_config(),
+    }
+
+
+@app.delete("/api/studio/integrations/{section}")
+async def studio_integrations_clear(section: str):
+    """Remove saved settings for a connector section."""
+    if section not in (
+        "sharepoint",
+        "google_drive",
+        "dropbox",
+        "s3",
+        "azure_blob",
+        "gcs",
+        "llm",
+    ):
+        raise HTTPException(status_code=404, detail="Unknown section.")
+    studio_delete_section(section)
+    return {"ok": True, "summary": studio_integrations_summary()}
+
+
+@app.post("/api/avatar/save-voice")
+async def avatar_save_voice(
+    ref_aud: UploadFile = File(...),
+    ref_txt: str = Form(...),
+    use_xvec: bool = Form(False),
+    voice_name: str = Form("avatar_voice"),
+):
+    if not ref_txt.strip():
+        raise HTTPException(status_code=400, detail="ref_txt is required.")
+    work = Path(tempfile.mkdtemp(prefix="avatar_save_"))
+    try:
+        ext = Path(ref_aud.filename or "ref.wav").suffix or ".wav"
+        ref_path = work / f"ref{ext}"
+        with ref_path.open("wb") as f:
+            shutil.copyfileobj(ref_aud.file, f)
+
+        result = await asyncio.to_thread(
+            _avatar_predict,
+            "/save_prompt",
+            ref_aud=handle_file(str(ref_path)),
+            ref_txt=ref_txt.strip(),
+            use_xvec=bool(use_xvec),
+        )
+        items = _result_items(result)
+        safe = "".join(ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in voice_name.strip())
+        safe = (safe or "avatar_voice")[:40]
+        voice_file_url = await _store_gradio_file(
+            items[0] if items else None,
+            prefix=f"voice_prompt_{safe}",
+            fallback_ext=".pt",
+        )
+        return {"voice_file_url": voice_file_url, "status": _result_status(items)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Avatar save_prompt failed: {e}") from e
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@app.post("/api/avatar/load-and-generate")
+async def avatar_load_and_generate(
+    file_obj: UploadFile = File(...),
+    text: str = Form(...),
+    lang_disp: str = Form("Auto"),
+):
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="text is required.")
+    work = Path(tempfile.mkdtemp(prefix="avatar_load_"))
+    try:
+        ext = Path(file_obj.filename or "voice_prompt.pt").suffix or ".pt"
+        prompt_path = work / f"prompt{ext}"
+        with prompt_path.open("wb") as f:
+            shutil.copyfileobj(file_obj.file, f)
+
+        result = await asyncio.to_thread(
+            _avatar_predict,
+            "/load_prompt_and_gen",
+            file_obj=handle_file(str(prompt_path)),
+            text=text.strip(),
+            lang_disp=(lang_disp or "Auto"),
+        )
+        items = _result_items(result)
+        audio_url = await _store_gradio_file(
+            items[0] if items else None,
+            prefix="avatar_tts",
+            fallback_ext=".wav",
+        )
+        return {"audio_url": audio_url, "status": _result_status(items)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Avatar load_prompt_and_gen failed: {e}") from e
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@app.post("/api/avatar/run-voice-clone")
+async def avatar_run_voice_clone(
+    ref_aud: UploadFile = File(...),
+    ref_txt: str = Form(...),
+    use_xvec: bool = Form(False),
+    text: str = Form(...),
+    lang_disp: str = Form("Auto"),
+):
+    if not ref_txt.strip():
+        raise HTTPException(status_code=400, detail="ref_txt is required.")
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="text is required.")
+    work = Path(tempfile.mkdtemp(prefix="avatar_clone_"))
+    try:
+        ext = Path(ref_aud.filename or "ref.wav").suffix or ".wav"
+        ref_path = work / f"ref{ext}"
+        with ref_path.open("wb") as f:
+            shutil.copyfileobj(ref_aud.file, f)
+
+        result = await asyncio.to_thread(
+            _avatar_predict,
+            "/run_voice_clone",
+            ref_aud=handle_file(str(ref_path)),
+            ref_txt=ref_txt.strip(),
+            use_xvec=bool(use_xvec),
+            text=text.strip(),
+            lang_disp=(lang_disp or "Auto"),
+        )
+        items = _result_items(result)
+        audio_url = await _store_gradio_file(
+            items[0] if items else None,
+            prefix="avatar_clone",
+            fallback_ext=".wav",
+        )
+        return {"audio_url": audio_url, "status": _result_status(items)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Avatar run_voice_clone failed: {e}") from e
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@app.get("/api/avatar/config")
+async def avatar_config():
+    return {"sample_text": AVATAR_SAMPLE_TEXT}
+
+
+@app.get("/api/avatar/voices")
+async def avatar_voices():
+    items: list[dict[str, str]] = []
+    for p in sorted(OUTPUT_DIR.glob("*.pt"), key=lambda x: x.stat().st_mtime, reverse=True):
+        stem = p.stem
+        display = stem
+        if stem.startswith("voice_prompt_"):
+            rest = stem[len("voice_prompt_") :]
+            parts = rest.rsplit("_", 1)
+            display = parts[0] if len(parts) == 2 else rest
+        display = display.replace("_", " ").strip() or "Avatar Voice"
+        items.append({"name": display, "url": f"/outputs/{p.name}"})
+    return {"items": items}
+
+
+@app.post("/api/avatar/save-customer-recording")
+async def avatar_save_customer_recording(
+    audio: UploadFile = File(...),
+    customer_name: str = Form("customer"),
+    prompt_text: str = Form(""),
+):
+    ext = Path(audio.filename or "recording.webm").suffix or ".webm"
+    safe = "".join(ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in customer_name.strip())
+    safe = (safe or "customer")[:40]
+    out_name = f"customer_recording_{safe}_{uuid.uuid4().hex}{ext}"
+    out_path = OUTPUT_DIR / out_name
+    with out_path.open("wb") as f:
+        shutil.copyfileobj(audio.file, f)
+    status = "Recording saved."
+    if prompt_text.strip():
+        status = "Recording saved with prompt text."
+    return {"audio_url": f"/outputs/{out_name}", "status": status}
 
 
 @app.post("/api/lipsync")
@@ -823,7 +2306,8 @@ async def lipsync_qa_stream(
             yield sse_event(
                 {
                     "type": "start",
-                    "model": OLLAMA_MODEL,
+                    "model": _active_llm_model_label(),
+                    "llm_provider": _llm_provider(),
                     "realtime": LIPSYNC_REALTIME,
                     "rt_target_sec": LIPSYNC_RT_TARGET_SEC,
                 }
