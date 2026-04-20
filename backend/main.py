@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -74,6 +75,7 @@ from studio_integrations import (
 )
 from studio_integrations import GDRIVE_CREDENTIALS_SAVED as STUDIO_GDRIVE_CREDENTIALS_PATH
 from studio_integrations import GCS_CREDENTIALS_SAVED as STUDIO_GCS_CREDENTIALS_PATH
+from studio_live_sync import is_master_enabled, set_master_enabled
 
 _BACKEND_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _BACKEND_DIR.parent
@@ -215,6 +217,11 @@ VOICE_RAG_ENABLED = os.environ.get("VOICE_RAG_ENABLED", "1").strip().lower() in 
 VOICE_RAG_N_RESULTS = max(1, min(20, _env_first_int("VOICE_RAG_N_RESULTS", default=6)))
 VOICE_RAG_MAX_CONTEXT_CHARS = max(400, _env_first_int("VOICE_RAG_MAX_CONTEXT_CHARS", default=3500))
 
+# RAG Studio (POST /api/rag/query): optional answer from external POST …/api/generate/stream
+RAG_GENERATE_STREAM_URL = os.environ.get("RAG_GENERATE_STREAM_URL", "").strip()
+RAG_GENERATE_STREAM_TIMEOUT_SEC = max(5.0, float(_env_first_int("RAG_GENERATE_STREAM_TIMEOUT_SEC", default=120)))
+RAG_GENERATE_STREAM_MAX_CHARS = max(2000, _env_first_int("RAG_GENERATE_STREAM_MAX_CHARS", default=400_000))
+
 # SharePoint → Chroma: background sync (see _sharepoint_live_loop)
 SHAREPOINT_LIVE_SYNC = os.environ.get("SHAREPOINT_LIVE_SYNC", "1").strip().lower() in (
     "1",
@@ -287,7 +294,7 @@ async def _sharepoint_live_loop() -> None:
     log = logging.getLogger("lipsync")
     while True:
         try:
-            if not SHAREPOINT_LIVE_SYNC:
+            if not (SHAREPOINT_LIVE_SYNC and is_master_enabled()):
                 await asyncio.sleep(15.0)
                 continue
             if not sharepoint_is_configured():
@@ -327,7 +334,7 @@ async def _google_drive_live_loop() -> None:
     log = logging.getLogger("lipsync")
     while True:
         try:
-            if not GOOGLE_DRIVE_LIVE_SYNC:
+            if not (GOOGLE_DRIVE_LIVE_SYNC and is_master_enabled()):
                 await asyncio.sleep(15.0)
                 continue
             if not gdrive_is_configured():
@@ -367,7 +374,7 @@ async def _dropbox_live_loop() -> None:
     log = logging.getLogger("lipsync")
     while True:
         try:
-            if not DROPBOX_LIVE_SYNC:
+            if not (DROPBOX_LIVE_SYNC and is_master_enabled()):
                 await asyncio.sleep(15.0)
                 continue
             if not dropbox_is_configured():
@@ -405,7 +412,7 @@ async def _s3_live_loop() -> None:
     log = logging.getLogger("lipsync")
     while True:
         try:
-            if not S3_LIVE_SYNC:
+            if not (S3_LIVE_SYNC and is_master_enabled()):
                 await asyncio.sleep(15.0)
                 continue
             if not s3_is_configured():
@@ -443,7 +450,7 @@ async def _azure_blob_live_loop() -> None:
     log = logging.getLogger("lipsync")
     while True:
         try:
-            if not AZURE_BLOB_LIVE_SYNC:
+            if not (AZURE_BLOB_LIVE_SYNC and is_master_enabled()):
                 await asyncio.sleep(15.0)
                 continue
             if not azure_blob_is_configured():
@@ -481,7 +488,7 @@ async def _gcs_live_loop() -> None:
     log = logging.getLogger("lipsync")
     while True:
         try:
-            if not GCS_LIVE_SYNC:
+            if not (GCS_LIVE_SYNC and is_master_enabled()):
                 await asyncio.sleep(15.0)
                 continue
             if not gcs_is_configured():
@@ -504,18 +511,13 @@ async def _on_startup() -> None:
     init_db()
     global _background_tasks
     _background_tasks = []
-    if SHAREPOINT_LIVE_SYNC:
-        _background_tasks.append(asyncio.create_task(_sharepoint_live_loop()))
-    if GOOGLE_DRIVE_LIVE_SYNC:
-        _background_tasks.append(asyncio.create_task(_google_drive_live_loop()))
-    if DROPBOX_LIVE_SYNC:
-        _background_tasks.append(asyncio.create_task(_dropbox_live_loop()))
-    if S3_LIVE_SYNC:
-        _background_tasks.append(asyncio.create_task(_s3_live_loop()))
-    if AZURE_BLOB_LIVE_SYNC:
-        _background_tasks.append(asyncio.create_task(_azure_blob_live_loop()))
-    if GCS_LIVE_SYNC:
-        _background_tasks.append(asyncio.create_task(_gcs_live_loop()))
+    # Always run idle loops so Studio can toggle live sync without restarting the API.
+    _background_tasks.append(asyncio.create_task(_sharepoint_live_loop()))
+    _background_tasks.append(asyncio.create_task(_google_drive_live_loop()))
+    _background_tasks.append(asyncio.create_task(_dropbox_live_loop()))
+    _background_tasks.append(asyncio.create_task(_s3_live_loop()))
+    _background_tasks.append(asyncio.create_task(_azure_blob_live_loop()))
+    _background_tasks.append(asyncio.create_task(_gcs_live_loop()))
 
 
 @app.on_event("shutdown")
@@ -1309,6 +1311,9 @@ async def health():
         "voice_rag_enabled": VOICE_RAG_ENABLED,
         "voice_rag_n_results": VOICE_RAG_N_RESULTS,
         "voice_rag_max_context_chars": VOICE_RAG_MAX_CONTEXT_CHARS,
+        "rag_generate_stream_configured": bool(
+            RAG_GENERATE_STREAM_URL and _rag_generate_stream_url_valid(RAG_GENERATE_STREAM_URL)
+        ),
     }
     try:
         rag_info.update(rag_get_status())
@@ -1366,45 +1371,49 @@ async def webrtc_proxy_status():
     return {"signaling_proxy_configured": bool(WEBRTC_SIGNALING_BASE)}
 
 
-def _build_voice_llm_prompt(user_text: str) -> tuple[str, dict[str, Any]]:
+def _build_voice_llm_prompt(user_text: str) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
     """
     Build Ollama prompt for the hologram voice turn. Optionally prepends ChromaDB retrieval
     when VOICE_RAG_ENABLED and the knowledge base has chunks.
+
+    Third return value is raw Chroma hit dicts (same order as query) for RAG_GENERATE_STREAM_URL
+    conversation building; may be empty.
     """
     rag_meta: dict[str, Any] = {
         "enabled": VOICE_RAG_ENABLED,
         "used": False,
         "chunks": 0,
     }
+    chroma_results: list[dict[str, Any]] = []
     user_block = (
         f"User said:\n{user_text}\n\n"
         "Assistant (spoken reply only, no markdown):"
     )
     if not VOICE_RAG_ENABLED:
-        return f"{VOICE_OLLAMA_INSTRUCTION}\n\n{user_block}", rag_meta
+        return f"{VOICE_OLLAMA_INSTRUCTION}\n\n{user_block}", rag_meta, chroma_results
 
     try:
         st = rag_get_status()
         if int(st.get("chunk_count") or 0) == 0:
-            return f"{VOICE_OLLAMA_INSTRUCTION}\n\n{user_block}", rag_meta
+            return f"{VOICE_OLLAMA_INSTRUCTION}\n\n{user_block}", rag_meta, chroma_results
     except Exception as e:
         logger.warning("RAG status unavailable for voice-turn: %s", e)
         rag_meta["error"] = "status_unavailable"
-        return f"{VOICE_OLLAMA_INSTRUCTION}\n\n{user_block}", rag_meta
+        return f"{VOICE_OLLAMA_INSTRUCTION}\n\n{user_block}", rag_meta, chroma_results
 
     try:
         retrieved = query_documents(user_text, VOICE_RAG_N_RESULTS)
-        results = retrieved.get("results") or []
+        chroma_results = retrieved.get("results") or []
     except Exception as e:
         logger.warning("RAG query failed for voice-turn: %s", e)
         rag_meta["error"] = str(e)
-        return f"{VOICE_OLLAMA_INSTRUCTION}\n\n{user_block}", rag_meta
+        return f"{VOICE_OLLAMA_INSTRUCTION}\n\n{user_block}", rag_meta, chroma_results
 
-    if not results:
-        return f"{VOICE_OLLAMA_INSTRUCTION}\n\n{user_block}", rag_meta
+    if not chroma_results:
+        return f"{VOICE_OLLAMA_INSTRUCTION}\n\n{user_block}", rag_meta, chroma_results
 
     parts: list[str] = []
-    for i, hit in enumerate(results, 1):
+    for i, hit in enumerate(chroma_results, 1):
         chunk_text = (hit.get("text") or "").strip()
         if not chunk_text:
             continue
@@ -1412,7 +1421,7 @@ def _build_voice_llm_prompt(user_text: str) -> tuple[str, dict[str, Any]]:
         parts.append(f"[{i}] ({fn})\n{chunk_text}")
 
     if not parts:
-        return f"{VOICE_OLLAMA_INSTRUCTION}\n\n{user_block}", rag_meta
+        return f"{VOICE_OLLAMA_INSTRUCTION}\n\n{user_block}", rag_meta, chroma_results
 
     context = "\n\n".join(parts)
     if len(context) > VOICE_RAG_MAX_CONTEXT_CHARS:
@@ -1427,25 +1436,115 @@ def _build_voice_llm_prompt(user_text: str) -> tuple[str, dict[str, Any]]:
         f"{context}\n\n"
         f"{user_block}"
     )
-    return prompt, rag_meta
+    return prompt, rag_meta, chroma_results
+
+
+def _build_voice_rag_stream_conversation(user_text: str, chroma_results: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Messages for POST RAG_GENERATE_STREAM_URL (Chroma excerpts + user utterance)."""
+    parts: list[str] = []
+    for r in chroma_results:
+        t = (r.get("text") or "").strip()
+        if t:
+            parts.append(t)
+    context = "\n\n---\n\n".join(parts)
+    if len(context) > VOICE_RAG_MAX_CONTEXT_CHARS:
+        context = context[: VOICE_RAG_MAX_CONTEXT_CHARS] + "…"
+    system_blocks = [
+        VOICE_OLLAMA_INSTRUCTION.strip(),
+        "Reply in a short spoken style suitable for text-to-speech. No markdown.",
+    ]
+    if context.strip():
+        system_blocks.append(
+            "Retrieved document excerpts (use when relevant; otherwise answer normally):\n\n" + context
+        )
+    return [
+        {"role": "system", "content": "\n\n".join(system_blocks)},
+        {"role": "user", "content": user_text.strip()},
+    ]
 
 
 class VoiceTurnBody(BaseModel):
     text: str = Field(..., min_length=1, max_length=8000)
 
 
+_RECEIPT_BLOCK_RE = re.compile(r"<receipt>\s*([\s\S]*?)\s*</receipt>", re.IGNORECASE)
+_ORDERDONE_BLOCK_RE = re.compile(r"<orderdone>\s*(.*?)\s*</orderdone>", re.IGNORECASE | re.DOTALL)
+
+
+def _parse_order_done_number(inner: str) -> int:
+    """Empty <orderdone></orderdone> defaults to 42; otherwise first run of digits in inner text."""
+    s = (inner or "").strip()
+    if not s:
+        return 42
+    digits = re.sub(r"\D+", "", s)
+    if digits:
+        n = int(digits)
+        return n if n > 0 else 42
+    return 42
+
+
+def split_voice_answer_receipt(raw: str) -> tuple[str, dict[str, Any] | None, int | None]:
+    """
+    RAG / LLM may append <receipt>{...json...}</receipt> and/or <orderdone></orderdone> (order placed).
+    Returns (speak_text, receipt_dict_or_none, order_done_number_or_none).
+    Tags are stripped from speak_text. Invalid receipt JSON is ignored.
+    """
+    if not raw or not isinstance(raw, str):
+        return "", None, None
+    text = raw.strip()
+    merged_items: list[Any] = []
+    for m in _RECEIPT_BLOCK_RE.finditer(text):
+        inner = (m.group(1) or "").strip()
+        if not inner:
+            continue
+        try:
+            obj = json.loads(inner)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            items = obj.get("items")
+            if isinstance(items, list):
+                merged_items.extend(items)
+    order_done: int | None = None
+    for m in _ORDERDONE_BLOCK_RE.finditer(text):
+        order_done = _parse_order_done_number(m.group(1) or "")
+    speak = _RECEIPT_BLOCK_RE.sub("", text)
+    speak = _ORDERDONE_BLOCK_RE.sub("", speak).strip()
+    receipt: dict[str, Any] | None = {"items": merged_items} if merged_items else None
+    return speak, receipt, order_done
+
+
 @app.post("/api/voice-turn")
 async def voice_turn(body: VoiceTurnBody):
     """
-    Browser STT text → optional ChromaDB RAG → Ollama (short avatar-friendly reply) → client sends answer to LiveTalking /human.
+    Browser STT text → optional ChromaDB RAG → reply from RAG_GENERATE_STREAM_URL when set, else Ollama
+    → client sends speak_text to LiveTalking /human.
     """
     user_text = body.text.strip()
     if not user_text:
         raise HTTPException(status_code=400, detail="text is empty.")
-    prompt, rag_meta = await asyncio.to_thread(_build_voice_llm_prompt, user_text)
+    prompt, rag_meta, chroma_hits = await asyncio.to_thread(_build_voice_llm_prompt, user_text)
     t0 = time.perf_counter()
     ollama_metrics: dict[str, Any] = {}
-    answer = await ollama_generate(prompt, ollama_metrics, max_tokens=VOICE_MAX_TOKENS)
+    use_rag_stream = bool(RAG_GENERATE_STREAM_URL) and _rag_generate_stream_url_valid(RAG_GENERATE_STREAM_URL)
+    if use_rag_stream:
+        rag_meta["llm"] = "rag_generate_stream"
+        conversation = _build_voice_rag_stream_conversation(user_text, chroma_hits)
+        try:
+            answer = await _collect_rag_generate_stream(RAG_GENERATE_STREAM_URL, conversation)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning("RAG generate stream (voice-turn) failed: %s", e)
+            raise HTTPException(status_code=502, detail=f"RAG generate stream failed: {e}") from e
+    else:
+        rag_meta["llm"] = "ollama"
+        answer = await ollama_generate(prompt, ollama_metrics, max_tokens=VOICE_MAX_TOKENS)
+    if not (answer or "").strip():
+        raise HTTPException(status_code=502, detail="Model returned an empty reply.")
+    speak_text, receipt, order_done_num = split_voice_answer_receipt(answer)
+    if not speak_text.strip() and not (receipt and receipt.get("items")) and order_done_num is None:
+        raise HTTPException(status_code=502, detail="Model returned an empty reply.")
     total_ms = (time.perf_counter() - t0) * 1000.0
     if os.environ.get("ANALYTICS_DISABLE", "").strip().lower() not in (
         "1",
@@ -1454,7 +1553,7 @@ async def voice_turn(body: VoiceTurnBody):
     ):
         record_voice_turn(
             heard_chars=len(user_text),
-            answer_chars=len(answer),
+            answer_chars=len(speak_text),
             total_request_ms=total_ms,
             ollama_wall_ms=total_ms,
             prompt_tokens=ollama_metrics.get("prompt_eval_count"),
@@ -1463,7 +1562,14 @@ async def voice_turn(body: VoiceTurnBody):
             ollama_load_duration_ns=ollama_metrics.get("load_duration_ns"),
         )
         await _publish_analytics_snapshot()
-    return {"answer": answer, "heard": user_text, "rag": rag_meta}
+    return {
+        "answer": answer,
+        "speak_text": speak_text,
+        "receipt": receipt,
+        "order_done": ({"number": int(order_done_num)} if order_done_num is not None else None),
+        "heard": user_text,
+        "rag": rag_meta,
+    }
 
 
 @app.get("/api/analytics/summary")
@@ -1525,6 +1631,147 @@ class RagQueryBody(BaseModel):
     n_results: int = Field(6, ge=1, le=30)
 
 
+def _rag_generate_stream_url_valid(url: str) -> bool:
+    try:
+        p = urlparse(url.strip())
+    except Exception:
+        return False
+    if p.scheme not in ("http", "https"):
+        return False
+    return bool(p.netloc)
+
+
+def _rag_stream_json_text_piece(data: dict[str, Any]) -> str:
+    """Best-effort token/text extraction from streamed JSON objects (SSE or NDJSON)."""
+    if not isinstance(data, dict):
+        return ""
+    for key in ("content", "text", "message", "token", "answer", "response"):
+        v = data.get(key)
+        if isinstance(v, str) and v:
+            return v
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices:
+        c0 = choices[0] if isinstance(choices[0], dict) else {}
+        delta = c0.get("delta") if isinstance(c0.get("delta"), dict) else {}
+        if isinstance(delta.get("content"), str) and delta["content"]:
+            return delta["content"]
+        msg = c0.get("message")
+        if isinstance(msg, dict) and isinstance(msg.get("content"), str) and msg["content"]:
+            return msg["content"]
+    for key in ("response", "data", "result", "delta"):
+        inner = data.get(key)
+        if isinstance(inner, dict):
+            t = _rag_stream_json_text_piece(inner)
+            if t:
+                return t
+        if isinstance(inner, str) and inner:
+            return inner
+    return ""
+
+
+def _build_rag_generate_conversation(query: str, results: list[dict[str, Any]]) -> list[dict[str, str]]:
+    parts: list[str] = []
+    for r in results:
+        t = (r.get("text") or "").strip()
+        if t:
+            parts.append(t)
+    context = "\n\n---\n\n".join(parts)
+    if len(context) > VOICE_RAG_MAX_CONTEXT_CHARS:
+        context = context[: VOICE_RAG_MAX_CONTEXT_CHARS] + "…"
+    conv: list[dict[str, str]] = []
+    if context.strip():
+        conv.append(
+            {
+                "role": "system",
+                "content": (
+                    "Answer the user using the following retrieved context when it is relevant. "
+                    "If the context does not contain the answer, say so briefly.\n\n"
+                    + context
+                ),
+            }
+        )
+    conv.append({"role": "user", "content": query.strip()})
+    return conv
+
+
+async def _collect_rag_generate_stream(url: str, conversation: list[dict[str, str]]) -> str:
+    payload = {"conversation": conversation}
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream, application/json, text/plain, */*",
+    }
+    timeout = httpx.Timeout(RAG_GENERATE_STREAM_TIMEOUT_SEC, connect=15.0)
+    pieces: list[str] = []
+    total = 0
+
+    async def _append(s: str) -> bool:
+        nonlocal total
+        if not s:
+            return True
+        total += len(s)
+        if total > RAG_GENERATE_STREAM_MAX_CHARS:
+            return False
+        pieces.append(s)
+        return True
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async with client.stream("POST", url, json=payload, headers=headers) as response:
+            if response.status_code >= 400:
+                body = await response.aread()
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"RAG generate stream HTTP {response.status_code}: {body.decode('utf-8', errors='replace')[:800]}",
+                )
+            ctype = (response.headers.get("content-type") or "").lower()
+            if "application/json" in ctype and "stream" not in ctype and "ndjson" not in ctype:
+                raw = await response.aread()
+                try:
+                    obj = json.loads(raw.decode("utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                    raise HTTPException(status_code=502, detail=f"RAG generate: invalid JSON body: {e}") from e
+                if isinstance(obj, dict):
+                    t = _rag_stream_json_text_piece(obj)
+                    if t:
+                        await _append(t)
+                    elif isinstance(obj.get("conversation"), list):
+                        # Unlikely echo; ignore
+                        pass
+                elif isinstance(obj, str):
+                    await _append(obj)
+                return "".join(pieces).strip()
+
+            async for raw in response.aiter_lines():
+                if total > RAG_GENERATE_STREAM_MAX_CHARS:
+                    break
+                line = raw.strip()
+                if not line:
+                    continue
+                if line.startswith(":"):
+                    continue
+                chunk = line[5:].strip() if line.startswith("data:") else line
+                if not chunk or chunk == "[DONE]":
+                    continue
+                try:
+                    data = json.loads(chunk)
+                except json.JSONDecodeError:
+                    if not line.startswith("data:") and await _append(line):
+                        continue
+                    continue
+                if isinstance(data, str):
+                    if not await _append(data):
+                        break
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                if data.get("error"):
+                    raise HTTPException(status_code=502, detail=str(data.get("error")))
+                piece = _rag_stream_json_text_piece(data)
+                if piece and not await _append(piece):
+                    break
+
+    return "".join(pieces).strip()
+
+
 @app.get("/api/rag/status")
 async def rag_status():
     """ChromaDB persistent store: chunk counts and indexed sources."""
@@ -1536,6 +1783,9 @@ async def rag_status():
         base["sources"] = rag_list_sources()
     except Exception:
         base["sources"] = []
+    base["rag_generate_stream_configured"] = bool(
+        RAG_GENERATE_STREAM_URL and _rag_generate_stream_url_valid(RAG_GENERATE_STREAM_URL)
+    )
     return base
 
 
@@ -1576,11 +1826,29 @@ async def rag_ingest(files: list[UploadFile] = File(...)):
 
 @app.post("/api/rag/query")
 async def rag_query(body: RagQueryBody):
-    """Semantic search over ingested documents (for RAG prompts or debugging)."""
+    """Semantic search over ingested documents; optionally calls RAG_GENERATE_STREAM_URL for an answer."""
     try:
-        return query_documents(body.query.strip(), body.n_results)
+        out = query_documents(body.query.strip(), body.n_results)
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"RAG query failed: {e}") from e
+    out = dict(out)
+    out["answer"] = None
+    out["generate_error"] = None
+    if not RAG_GENERATE_STREAM_URL:
+        return out
+    if not _rag_generate_stream_url_valid(RAG_GENERATE_STREAM_URL):
+        out["generate_error"] = "Invalid RAG_GENERATE_STREAM_URL (use http/https with a host)."
+        return out
+    results = out.get("results") if isinstance(out.get("results"), list) else []
+    conversation = _build_rag_generate_conversation(body.query.strip(), results)
+    try:
+        out["answer"] = await _collect_rag_generate_stream(RAG_GENERATE_STREAM_URL, conversation)
+    except HTTPException as e:
+        out["generate_error"] = str(e.detail) if isinstance(e.detail, str) else json.dumps(e.detail)
+    except Exception as e:
+        logger.warning("RAG generate stream failed: %s", e)
+        out["generate_error"] = str(e)
+    return out
 
 
 @app.delete("/api/rag/sources/{source_id}")
@@ -1849,6 +2117,26 @@ async def llm_config():
 async def studio_integrations_status():
     """Which connector settings are saved locally (no secret values)."""
     return studio_integrations_summary()
+
+
+class StudioLiveSyncBody(BaseModel):
+    master_enabled: bool
+
+
+@app.get("/api/studio/live-sync")
+async def studio_live_sync_get():
+    """Global master switch: when false, all cloud → Chroma background loops pause."""
+    return {"master_enabled": is_master_enabled()}
+
+
+@app.post("/api/studio/live-sync")
+async def studio_live_sync_set(body: StudioLiveSyncBody):
+    set_master_enabled(body.master_enabled)
+    return {
+        "ok": True,
+        "master_enabled": body.master_enabled,
+        "summary": studio_integrations_summary(),
+    }
 
 
 @app.post("/api/studio/integrations/sharepoint")

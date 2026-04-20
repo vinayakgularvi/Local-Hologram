@@ -91,6 +91,12 @@ def public_config() -> dict[str, Any]:
     b = os.environ.get("GCS_BUCKET", "").strip()
     hint = b[:10] + "…" if len(b) > 12 else (b or "—")
     live_env = os.environ.get("GCS_LIVE_SYNC", "1").strip().lower() in ("1", "true", "yes")
+    try:
+        from studio_live_sync import live_sync_flags_for_connector
+
+        ls = live_sync_flags_for_connector(live_env)
+    except Exception:
+        ls = {"live_sync_env_enabled": live_env, "live_sync_master_enabled": True, "live_sync_enabled": live_env}
     interval = max(30, _env_int("GCS_SYNC_INTERVAL_SEC", 90))
     auth = "adc" if os.environ.get("GCS_USE_ADC", "").strip().lower() in ("1", "true", "yes") else (
         "service_account" if _resolved_credentials_path() else "none"
@@ -102,7 +108,7 @@ def public_config() -> dict[str, Any]:
         "max_files": _env_int("GCS_MAX_FILES", 80),
         "max_depth": _env_int("GCS_MAX_DEPTH", 8),
         "max_bytes_per_file": _env_int("GCS_MAX_BYTES", 25 * 1024 * 1024),
-        "live_sync_enabled": live_env,
+        **ls,
         "sync_interval_sec": interval,
         "auth_mode": auth if is_configured() else "none",
         "live": dict(_live),

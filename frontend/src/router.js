@@ -2,7 +2,6 @@ import { createRouter, createWebHistory } from "vue-router";
 import WebRtcLive from "./WebRtcLive.vue";
 import AnalyticsDashboard from "./AnalyticsDashboard.vue";
 import AvatarDashboard from "./AvatarDashboard.vue";
-
 export default createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
   routes: [
