@@ -533,9 +533,39 @@ async def _on_shutdown() -> None:
     _background_tasks = []
 
 
+def _cors_allow_origins() -> list[str]:
+    raw = os.environ.get(
+        "CORS_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173,"
+        "https://localhost:5173,https://127.0.0.1:5173,"
+        "http://localhost:5174,http://127.0.0.1:5174,https://localhost:5174,https://127.0.0.1:5174,"
+        "http://localhost:5175,http://127.0.0.1:5175,https://localhost:5175,https://127.0.0.1:5175",
+    )
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+# When CORS_ORIGIN_REGEX is unset: allow browser calls from typical LAN / kiosk hosts (RFC1918 + localhost, any port).
+_DEFAULT_CORS_LAN_REGEX = (
+    r"^https?://("
+    r"localhost|127\.0\.0\.1|"
+    r"192\.168\.\d{1,3}\.\d{1,3}|"
+    r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
+    r"172\.(1[6-9]|2[0-9]|3[0-1])\.\d{1,3}\.\d{1,3}"
+    r")(:\d+)?$"
+)
+
+
+def _cors_allow_origin_regex() -> str | None:
+    if "CORS_ORIGIN_REGEX" not in os.environ:
+        return _DEFAULT_CORS_LAN_REGEX
+    val = os.environ.get("CORS_ORIGIN_REGEX", "").strip()
+    return val or None
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.environ.get("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(","),
+    allow_origins=_cors_allow_origins(),
+    allow_origin_regex=_cors_allow_origin_regex(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
