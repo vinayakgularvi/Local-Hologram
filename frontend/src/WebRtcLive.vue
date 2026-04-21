@@ -60,7 +60,7 @@ function apiOrigin() {
     const port = window.location.port;
     const host = window.location.hostname;
     if (port === "5173" || port === "4173") {
-      return `http://${host}:8000`;
+      return `http://${host}:8080`;
     }
   }
   return "";

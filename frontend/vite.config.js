@@ -1,6 +1,9 @@
 import { defineConfig } from "vite";
 import vue from "@vitejs/plugin-vue";
 
+const backendPort = process.env.PORT || "8080";
+const backendOrigin = `http://127.0.0.1:${backendPort}`;
+
 export default defineConfig({
   plugins: [
     vue(),
@@ -27,11 +30,11 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      "/api": { target: "http://127.0.0.1:8000", changeOrigin: true },
-      "/outputs": { target: "http://127.0.0.1:8000", changeOrigin: true },
-      "/offer": { target: "http://127.0.0.1:8000", changeOrigin: true },
-      "/human": { target: "http://127.0.0.1:8000", changeOrigin: true },
-      "/record": { target: "http://127.0.0.1:8000", changeOrigin: true },
+      "/api": { target: backendOrigin, changeOrigin: true },
+      "/outputs": { target: backendOrigin, changeOrigin: true },
+      "/offer": { target: backendOrigin, changeOrigin: true },
+      "/human": { target: backendOrigin, changeOrigin: true },
+      "/record": { target: backendOrigin, changeOrigin: true },
     },
   },
 });

@@ -1,5 +1,5 @@
 .DS_Store
-.env
+#.env
 .env.local
 backend/.venv/
 backend/__pycache__/

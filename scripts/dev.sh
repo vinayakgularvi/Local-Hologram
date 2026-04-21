@@ -5,7 +5,7 @@
 #   npm run dev:bash     — same, via this shell script
 #   ./scripts/dev.sh     — direct
 #
-# Backend:  http://127.0.0.1:${PORT:-8000}
+# Backend:  http://127.0.0.1:${PORT:-8080}
 # Frontend: http://127.0.0.1:5173  (proxies /api, /outputs, WebRTC paths to the backend)
 
 set -euo pipefail
@@ -13,7 +13,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-PORT="${PORT:-8000}"
+PORT="${PORT:-8080}"
 export PORT
 
 echo "Local Hologram — dev"

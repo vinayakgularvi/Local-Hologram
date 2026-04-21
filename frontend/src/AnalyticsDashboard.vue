@@ -19,7 +19,7 @@ function apiUrl(path) {
     const port = window.location.port;
     const host = window.location.hostname;
     if (port === "5173" || port === "4173") {
-      return `http://${host}:8000${p}`;
+      return `http://${host}:8080${p}`;
     }
   }
   return p;
