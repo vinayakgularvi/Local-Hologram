@@ -1,11 +1,13 @@
 import { defineConfig } from "vite";
 import vue from "@vitejs/plugin-vue";
+import basicSsl from '@vitejs/plugin-basic-ssl'
 
 const backendPort = process.env.PORT || "8080";
 const backendOrigin = `http://127.0.0.1:${backendPort}`;
 
 export default defineConfig({
   plugins: [
+    basicSsl(),
     vue(),
     {
       name: "spa-fallback-analytics",
@@ -28,6 +30,8 @@ export default defineConfig({
     },
   ],
   server: {
+    host: '0.0.0.0',
+    https: true,
     port: 5173,
     proxy: {
       "/api": { target: backendOrigin, changeOrigin: true },
