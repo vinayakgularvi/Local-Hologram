@@ -19,6 +19,60 @@ let recInstance = null;
 
 const micListening = ref(false);
 const voiceThinking = ref(false);
+const mediaVisible = ref(false);
+const ENV_MIC_LANG_RAW = String(import.meta.env.VITE_VOICE_DEFAULT_LANG || "en-US").trim();
+/** BCP 47–ish tag from env, or "auto" for navigator.language. */
+const DEFAULT_MIC_LANG = (() => {
+  const r = ENV_MIC_LANG_RAW;
+  if (!r) return "en-US";
+  if (r.toLowerCase() === "auto") return "auto";
+  if (/^[a-z]{2,3}(-[a-zA-Z0-9]+)*$/i.test(r)) return r;
+  return "en-US";
+})();
+const micLangOptions = [
+  { value: "auto", label: "Auto (browser default)" },
+  // Chinese (Mandarin + dialects)
+  { value: "zh-CN", label: "Chinese Mandarin (Mainland)" },
+  { value: "zh-TW", label: "Chinese Mandarin (Taiwan)" },
+  { value: "zh-HK", label: "Chinese (Hong Kong)" },
+  { value: "yue-HK", label: "Chinese Cantonese (Hong Kong)" },
+  { value: "wuu-CN", label: "Chinese Wu / Shanghainese" },
+  { value: "nan-TW", label: "Chinese Min Nan (Taiwanese)" },
+  // English (multiple accents)
+  { value: "en-US", label: "English (US)" },
+  { value: "en-GB", label: "English (UK)" },
+  { value: "en-AU", label: "English (Australia)" },
+  { value: "en-IN", label: "English (India)" },
+  { value: "en-CA", label: "English (Canada)" },
+  { value: "en-NZ", label: "English (New Zealand)" },
+  // Japanese / Korean / Russian / Italian
+  { value: "ja-JP", label: "Japanese" },
+  { value: "ko-KR", label: "Korean" },
+  { value: "ru-RU", label: "Russian" },
+  { value: "it-IT", label: "Italian" },
+  // German (6 variants)
+  { value: "de-DE", label: "German (Germany)" },
+  { value: "de-AT", label: "German (Austria)" },
+  { value: "de-CH", label: "German (Switzerland)" },
+  { value: "de-BE", label: "German (Belgium)" },
+  { value: "de-LU", label: "German (Luxembourg)" },
+  { value: "de-LI", label: "German (Liechtenstein)" },
+  // French
+  { value: "fr-FR", label: "French (France)" },
+  { value: "fr-CA", label: "French (Canada)" },
+  { value: "fr-CH", label: "French (Switzerland)" },
+  { value: "fr-BE", label: "French (Belgium)" },
+  // Portuguese
+  { value: "pt-PT", label: "Portuguese (Portugal)" },
+  { value: "pt-BR", label: "Portuguese (Brazil)" },
+  // Spanish
+  { value: "es-ES", label: "Spanish (Spain)" },
+  { value: "es-MX", label: "Spanish (Mexico)" },
+  { value: "es-US", label: "Spanish (US)" },
+];
+const selectedMicLang = ref(
+  micLangOptions.some((o) => o.value === DEFAULT_MIC_LANG) ? DEFAULT_MIC_LANG : "en-US"
+);
 /** Parsed <receipt> JSON from last voice turn — shown as live bill on the stage. */
 const liveBill = ref(null);
 /** Shown at top of stage when <orderdone> is present; live bill is cleared. */
@@ -52,6 +106,17 @@ const speechRecCtor = computed(() => {
 });
 
 const micAvailable = computed(() => !!speechRecCtor.value);
+
+function resolveMicLang() {
+  if (selectedMicLang.value !== "auto") return selectedMicLang.value;
+  if (typeof navigator === "undefined") return "en-US";
+  const preferred = Array.isArray(navigator.languages) ? navigator.languages[0] : null;
+  return preferred || navigator.language || "en-US";
+}
+
+function showMedia() {
+  mediaVisible.value = true;
+}
 
 function apiOrigin() {
   const fromEnv = import.meta.env.VITE_API_BASE;
@@ -417,7 +482,7 @@ function toggleMic() {
   voiceSessionCancelled = false;
   const SR = speechRecCtor.value;
   recInstance = new SR();
-  recInstance.lang = (typeof navigator !== "undefined" && navigator.language) || "en-US";
+  recInstance.lang = resolveMicLang();
   // Single utterance mode returns final results faster than long continuous mode.
   recInstance.continuous = false;
   recInstance.interimResults = true;
@@ -579,6 +644,14 @@ onUnmounted(() => {
       <router-link class="panel-nav__link" to="/avatar">Studio</router-link>
       <router-link class="panel-nav__link" to="/analytics">Analytics</router-link>
     </nav>
+    <div v-if="!mediaVisible" class="lang-picker">
+      <label class="lang-picker__label" for="top-lang-select">Language</label>
+      <select id="top-lang-select" class="lang-picker__select" v-model="selectedMicLang">
+        <option v-for="opt in micLangOptions" :key="opt.value" :value="opt.value">
+          {{ opt.label }}
+        </option>
+      </select>
+    </div>
     <div class="media-stack">
       <div class="video-wrap">
         <div
@@ -588,10 +661,42 @@ onUnmounted(() => {
           aria-live="polite"
           aria-busy="true"
         >
+          <img
+            class="video-loading__logo"
+            src="/favicon.svg"
+            alt="Loading logo"
+            width="56"
+            height="56"
+          />
           <div class="video-loading__track" aria-hidden="true">
             <div class="video-loading__fill" />
           </div>
           <span class="video-loading__label">{{ busy ? "Connecting…" : "Loading video…" }}</span>
+        </div>
+
+        <div
+          v-if="!mediaVisible"
+          class="start-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Start media"
+        >
+          <div class="start-overlay__card">
+            <img
+              class="start-overlay__logo"
+              src="/favicon.svg"
+              alt="App logo"
+              width="56"
+              height="56"
+            />
+            <h2 class="start-overlay__title">Ready to view media</h2>
+            <p class="start-overlay__sub">
+              Connection starts in the background automatically. Tap Start to view media.
+            </p>
+            <button type="button" class="start-overlay__btn" @click="showMedia">
+              {{ started ? "Start" : "Start (stream is connecting…)" }}
+            </button>
+          </div>
         </div>
 
         <video ref="videoEl" class="video" autoplay playsinline />
@@ -766,6 +871,37 @@ onUnmounted(() => {
 .panel-nav__link.router-link-active {
   border-color: rgba(0, 200, 200, 0.45);
   color: #0d9488;
+}
+
+.lang-picker {
+  position: absolute;
+  top: 3rem;
+  right: 0.65rem;
+  z-index: 7;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  min-width: min(18rem, 42vw);
+  padding: 0.35rem 0.45rem;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid rgba(15, 23, 42, 0.12);
+  box-shadow: 0 2px 9px rgba(0, 0, 0, 0.08);
+}
+
+.lang-picker__label {
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: #334155;
+}
+
+.lang-picker__select {
+  border: 1px solid rgba(148, 163, 184, 0.72);
+  border-radius: 8px;
+  background: #fff;
+  color: #0f172a;
+  font-size: 0.78rem;
+  padding: 0.3rem 0.38rem;
 }
 
 .media-stack {
@@ -1142,6 +1278,12 @@ onUnmounted(() => {
   color: #333;
 }
 
+.video-loading__logo {
+  width: clamp(2rem, 3.6cqw, 3.5rem);
+  height: clamp(2rem, 3.6cqw, 3.5rem);
+  animation: spin-logo 1.1s linear infinite;
+}
+
 .video-loading__track {
   width: min(58cqw, 92%);
   height: max(4px, 0.22cqw);
@@ -1173,6 +1315,73 @@ onUnmounted(() => {
   100% {
     transform: translateX(310%);
   }
+}
+
+@keyframes spin-logo {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.start-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 7;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: clamp(1rem, 2.4cqw, 1.8rem);
+  background: rgba(8, 10, 18, 0.96);
+  backdrop-filter: blur(8px);
+}
+
+.start-overlay__card {
+  width: min(92%, 28rem);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.65rem;
+  border-radius: 18px;
+  padding: clamp(0.9rem, 2.1cqw, 1.4rem);
+  background: rgba(255, 255, 255, 0.95);
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  box-shadow: 0 14px 35px rgba(0, 0, 0, 0.22);
+}
+
+.start-overlay__logo {
+  width: 3rem;
+  height: 3rem;
+  animation: spin-logo 1.35s linear infinite;
+}
+
+.start-overlay__title {
+  margin: 0.1rem 0 0;
+  font-size: clamp(1rem, 2.2cqw, 1.4rem);
+  font-weight: 800;
+  color: #0f172a;
+}
+
+.start-overlay__sub {
+  margin: 0;
+  text-align: center;
+  color: #475569;
+  font-size: clamp(0.75rem, 1.4cqw, 0.9rem);
+}
+
+.start-overlay__btn {
+  width: 100%;
+  border: none;
+  border-radius: 999px;
+  padding: 0.62rem 0.95rem;
+  margin-top: 0.2rem;
+  font-size: 0.92rem;
+  font-weight: 700;
+  color: #fff;
+  background: linear-gradient(120deg, #0d9488, #2563eb);
+  cursor: pointer;
 }
 
 .caption {

@@ -22,6 +22,9 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.requests import Request as StarletteRequest
 from fastapi.staticfiles import StaticFiles
 from gradio_client import Client, handle_file
 from pydantic import BaseModel, Field
@@ -262,6 +265,122 @@ OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="Lip-Sync Agent")
+
+
+def _is_production() -> bool:
+    e = os.environ.get("ENVIRONMENT", "").strip().lower()
+    if e in ("production", "prod"):
+        return True
+    return os.environ.get("PRODUCTION", "").strip().lower() in ("1", "true", "yes")
+
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
+
+
+def _trusted_hosts() -> list[str] | None:
+    raw = os.environ.get("TRUSTED_HOSTS", "").strip()
+    if not raw:
+        return None
+    hosts = [h.strip() for h in raw.split(",") if h.strip()]
+    return hosts or None
+
+
+def _security_headers_enabled() -> bool:
+    if _is_production():
+        return True
+    return _env_truthy("SECURITY_HEADERS")
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: StarletteRequest, call_next):  # type: ignore[override]
+        response = await call_next(request)
+        if _security_headers_enabled():
+            h = response.headers
+            h.setdefault("X-Content-Type-Options", "nosniff")
+            h.setdefault("X-Frame-Options", "DENY")
+            h.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+            h.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+        return response
+
+
+# When CORS_ORIGIN_REGEX is unset (non-production): allow LAN / kiosk hosts (RFC1918 + localhost, any port).
+_DEFAULT_CORS_LAN_REGEX = (
+    r"^https?://("
+    r"localhost|127\.0\.0\.1|"
+    r"192\.168\.\d{1,3}\.\d{1,3}|"
+    r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
+    r"172\.(1[6-9]|2[0-9]|3[0-1])\.\d{1,3}\.\d{1,3}"
+    r")(:\d+)?$"
+)
+
+
+def _cors_allow_origins() -> list[str]:
+    dev_defaults = (
+        "http://localhost:5173,http://127.0.0.1:5173,"
+        "https://localhost:5173,https://127.0.0.1:5173,"
+        "http://localhost:5174,http://127.0.0.1:5174,https://localhost:5174,https://127.0.0.1:5174,"
+        "http://localhost:5175,http://127.0.0.1:5175,https://localhost:5175,https://127.0.0.1:5175"
+    )
+    raw_val = os.environ.get("CORS_ORIGINS")
+    if _is_production():
+        if raw_val is None:
+            return []
+        return [x.strip() for x in raw_val.split(",") if x.strip()]
+    if raw_val is None:
+        raw_val = dev_defaults
+    return [x.strip() for x in raw_val.split(",") if x.strip()]
+
+
+def _cors_allow_origin_regex() -> str | None:
+    if _is_production():
+        if _env_truthy("CORS_ALLOW_PRIVATE_NETWORK"):
+            v = os.environ.get("CORS_ORIGIN_REGEX", "").strip()
+            return v or _DEFAULT_CORS_LAN_REGEX
+        if "CORS_ORIGIN_REGEX" in os.environ:
+            v = os.environ.get("CORS_ORIGIN_REGEX", "").strip()
+            return v or None
+        return None
+    if "CORS_ORIGIN_REGEX" not in os.environ:
+        return _DEFAULT_CORS_LAN_REGEX
+    val = os.environ.get("CORS_ORIGIN_REGEX", "").strip()
+    return val or None
+
+
+_th = _trusted_hosts()
+if _th:
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=_th)
+
+app.add_middleware(SecurityHeadersMiddleware)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_allow_origins(),
+    allow_origin_regex=_cors_allow_origin_regex(),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+if _env_truthy("TRUST_FORWARDED") or _env_truthy("TRUST_PROXY_HEADERS"):
+    try:
+        from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+        _ph = os.environ.get("PROXY_TRUSTED_HOSTS", "").strip()
+        if _ph:
+            app.add_middleware(
+                ProxyHeadersMiddleware,
+                trusted_hosts=[x.strip() for x in _ph.split(",") if x.strip()],
+            )
+        else:
+            app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
+    except Exception:
+        logging.getLogger("lipsync").warning("ProxyHeadersMiddleware could not be enabled", exc_info=True)
+
+
+app.mount("/outputs", StaticFiles(directory=str(OUTPUT_DIR)), name="outputs")
+_analytics_subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
+
 
 _sharepoint_sync_lock = asyncio.Lock()
 _google_drive_sync_lock = asyncio.Lock()
@@ -508,6 +627,13 @@ async def _gcs_live_loop() -> None:
 
 @app.on_event("startup")
 async def _on_startup() -> None:
+    log = logging.getLogger("lipsync")
+    if _is_production() and not _cors_allow_origins() and _cors_allow_origin_regex() is None:
+        log.warning(
+            "Production mode: CORS_ORIGINS is unset and no CORS regex is active; "
+            "cross-origin browser calls may fail. Set CORS_ORIGINS and/or CORS_ORIGIN_REGEX, "
+            "or set CORS_ALLOW_PRIVATE_NETWORK=1 for the dev-style LAN regex."
+        )
     init_db()
     global _background_tasks
     _background_tasks = []
@@ -531,48 +657,6 @@ async def _on_shutdown() -> None:
         except asyncio.CancelledError:
             pass
     _background_tasks = []
-
-
-def _cors_allow_origins() -> list[str]:
-    raw = os.environ.get(
-        "CORS_ORIGINS",
-        "http://localhost:5173,http://127.0.0.1:5173,"
-        "https://localhost:5173,https://127.0.0.1:5173,"
-        "http://localhost:5174,http://127.0.0.1:5174,https://localhost:5174,https://127.0.0.1:5174,"
-        "http://localhost:5175,http://127.0.0.1:5175,https://localhost:5175,https://127.0.0.1:5175",
-    )
-    return [x.strip() for x in raw.split(",") if x.strip()]
-
-
-# When CORS_ORIGIN_REGEX is unset: allow browser calls from typical LAN / kiosk hosts (RFC1918 + localhost, any port).
-_DEFAULT_CORS_LAN_REGEX = (
-    r"^https?://("
-    r"localhost|127\.0\.0\.1|"
-    r"192\.168\.\d{1,3}\.\d{1,3}|"
-    r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
-    r"172\.(1[6-9]|2[0-9]|3[0-1])\.\d{1,3}\.\d{1,3}"
-    r")(:\d+)?$"
-)
-
-
-def _cors_allow_origin_regex() -> str | None:
-    if "CORS_ORIGIN_REGEX" not in os.environ:
-        return _DEFAULT_CORS_LAN_REGEX
-    val = os.environ.get("CORS_ORIGIN_REGEX", "").strip()
-    return val or None
-
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_cors_allow_origins(),
-    allow_origin_regex=_cors_allow_origin_regex(),
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-app.mount("/outputs", StaticFiles(directory=str(OUTPUT_DIR)), name="outputs")
-_analytics_subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
 
 
 def _analytics_snapshot(limit: int = 40) -> dict[str, Any]:

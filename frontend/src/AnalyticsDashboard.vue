@@ -194,7 +194,7 @@ async function submitReset() {
       <div class="dash__head-main">
         <h1 class="dash__title">Analytics</h1>
         <nav class="dash__nav" aria-label="App sections">
-          <router-link class="dash-link dash-link--ghost" to="/">Live hologram</router-link>
+          <router-link class="dash-link dash-link--ghost" to="/hologram">Live hologram</router-link>
           <router-link class="dash-link dash-link--ghost" to="/avatar">Avatar Studio</router-link>
         </nav>
       </div>

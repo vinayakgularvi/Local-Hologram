@@ -1265,7 +1265,7 @@ function formatIso(iso) {
     <section class="studio">
       <header class="hero">
         <nav class="hero__nav">
-          <router-link class="pill pill--ghost" to="/">Live hologram</router-link>
+          <router-link class="pill pill--ghost" to="/hologram">Live hologram</router-link>
           <router-link class="pill pill--ghost" to="/analytics">Analytics</router-link>
         </nav>
         <div class="hero__title-row">

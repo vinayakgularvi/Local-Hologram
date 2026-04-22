@@ -1,0 +1,34 @@
+# Local-Hologram: API + built-in Vue SPA (served from /dist via FastAPI static).
+# Use a TLS-terminating reverse proxy in production; set CORS_ORIGINS to your public origin(s).
+#
+# docker compose up --build -d
+# docker compose logs -f
+
+services:
+  hologram:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: local-hologram:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-8080}:8080"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      ENVIRONMENT: production
+      PORT: "8080"
+    volumes:
+      - hologram_data:/app/backend/data
+      - hologram_outputs:/app/backend/outputs
+    tmpfs:
+      - /tmp:mode=1777,size=256M
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  hologram_data:
+  hologram_outputs:

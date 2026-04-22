@@ -15,6 +15,14 @@ node_modules
 frontend/dist
 backend/static/dist
 backend/outputs
-*.md
+backend/data
+*.db
+.github
 .cursor
 .vscode
+.idea
+*.md
+terminals
+agent-transcripts
+scripts
+**/.DS_Store

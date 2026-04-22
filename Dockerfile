@@ -19,7 +19,7 @@ ENV PYTHONUNBUFFERED=1 \
     PORT=8080
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg \
+    && apt-get install -y --no-install-recommends ffmpeg curl gosu \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 10001 appuser
 
@@ -29,11 +29,19 @@ RUN pip install --no-cache-dir -r /app/backend/requirements.txt
 COPY backend/ /app/backend/
 COPY --from=frontend /app/dist /app/backend/static/dist
 
-RUN mkdir -p /app/backend/outputs && chown -R appuser:appuser /app/backend
+COPY docker/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh \
+    && mkdir -p /app/backend/data /app/backend/outputs \
+    && chown -R appuser:appuser /app/backend
 
-USER appuser
 WORKDIR /app/backend
 
 EXPOSE 8080
 
+# Single worker recommended: startup registers Chroma live-sync loops once per process.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
+    CMD curl -fsS "http://127.0.0.1:8080/api/health" >/dev/null || exit 1
+
+USER root
+ENTRYPOINT ["/entrypoint.sh"]
 CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port \"${PORT:-8080}\""]
