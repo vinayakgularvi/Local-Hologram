@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import os
 import re
 import threading
 from datetime import datetime, timezone
@@ -14,6 +15,7 @@ _CHROMA_PATH = Path(__file__).resolve().parent / "data" / "chroma"
 _lock = threading.Lock()
 _client: Any = None
 _collection: Any = None
+_embed_sig: tuple[str, str] | None = None
 
 # Tunables via env in main or here
 DEFAULT_CHUNK_SIZE = 900
@@ -25,19 +27,44 @@ def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _get_collection():
-    global _client, _collection
-    with _lock:
-        if _collection is not None:
-            return _collection
-        import chromadb
+def ollama_embed_base() -> str:
+    """Ollama root URL for RAG embeddings only (POST /api/embed). Defaults to local Ollama."""
+    v = os.environ.get("OLLAMA_EMBED_BASE", "").strip()
+    return (v or "http://127.0.0.1:11434").rstrip("/")
 
+
+def ollama_embed_model() -> str:
+    """Model name on the embed Ollama host (see `ollama list`)."""
+    v = os.environ.get("OLLAMA_EMBED_MODEL", "").strip()
+    return v or "nomic-embed-text:latest"
+
+
+def rag_embedding_config() -> dict[str, str]:
+    return {"ollama_embed_base": ollama_embed_base(), "ollama_embed_model": ollama_embed_model()}
+
+
+def _get_collection():
+    global _client, _collection, _embed_sig
+    import chromadb
+    from chromadb.utils.embedding_functions import OllamaEmbeddingFunction
+
+    sig = (ollama_embed_base(), ollama_embed_model())
+    with _lock:
+        if _collection is not None and _embed_sig == sig:
+            return _collection
         _CHROMA_PATH.mkdir(parents=True, exist_ok=True)
         _client = chromadb.PersistentClient(path=str(_CHROMA_PATH))
+        ef = OllamaEmbeddingFunction(url=sig[0], model_name=sig[1])
         _collection = _client.get_or_create_collection(
             name="avatar_knowledge",
-            metadata={"description": "Avatar Studio RAG corpus"},
+            metadata={
+                "description": "Avatar Studio RAG corpus",
+                "ollama_embed_base": sig[0],
+                "ollama_embed_model": sig[1],
+            },
+            embedding_function=ef,
         )
+        _embed_sig = sig
         return _collection
 
 
@@ -174,11 +201,13 @@ def get_status() -> dict[str, Any]:
         n = col.count()
     except Exception:
         n = 0
-    return {
+    out = {
         "chroma_path": str(_CHROMA_PATH.resolve()),
         "collection": "avatar_knowledge",
         "chunk_count": n,
     }
+    out.update(rag_embedding_config())
+    return out
 
 
 def list_sources() -> list[dict[str, Any]]:
@@ -230,17 +259,28 @@ def delete_source(source_id: str) -> int:
 
 def reset_collection() -> None:
     """Delete all vectors (dev / admin only — protect in API)."""
-    global _collection, _client
+    global _collection, _client, _embed_sig
     import chromadb
+    from chromadb.utils.embedding_functions import OllamaEmbeddingFunction
 
     with _lock:
+        _embed_sig = None
+        _collection = None
         _CHROMA_PATH.mkdir(parents=True, exist_ok=True)
         _client = chromadb.PersistentClient(path=str(_CHROMA_PATH))
         try:
             _client.delete_collection("avatar_knowledge")
         except Exception:
             pass
+        sig = (ollama_embed_base(), ollama_embed_model())
+        ef = OllamaEmbeddingFunction(url=sig[0], model_name=sig[1])
         _collection = _client.get_or_create_collection(
             name="avatar_knowledge",
-            metadata={"description": "Avatar Studio RAG corpus"},
+            metadata={
+                "description": "Avatar Studio RAG corpus",
+                "ollama_embed_base": sig[0],
+                "ollama_embed_model": sig[1],
+            },
+            embedding_function=ef,
         )
+        _embed_sig = sig

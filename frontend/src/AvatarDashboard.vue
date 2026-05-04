@@ -127,8 +127,10 @@ const gcsConnectStatus = ref("");
 const activeLlmSource = ref(null);
 const llmConfig = ref(null);
 const llmForm = ref({
-  ollama_base: "",
-  ollama_model: "",
+  llm_base: "",
+  llm_model: "",
+  ollama_embed_base: "",
+  ollama_embed_model: "",
   model_api_style: "auto",
   openai_api_key: "",
   openai_base_url: "",
@@ -427,8 +429,10 @@ async function loadLlmConfig() {
     const data = await res.json();
     llmConfig.value = data;
     if (data.local) {
-      llmForm.value.ollama_base = String(data.local.ollama_base || "");
-      llmForm.value.ollama_model = String(data.local.ollama_model || "");
+      llmForm.value.llm_base = String(data.local.llm_base || "");
+      llmForm.value.llm_model = String(data.local.llm_model || "");
+      llmForm.value.ollama_embed_base = String(data.local.ollama_embed_base || "");
+      llmForm.value.ollama_embed_model = String(data.local.ollama_embed_model || "");
       llmForm.value.model_api_style = String(data.local.model_api_style || "auto");
     }
     if (data.openai) {
@@ -457,8 +461,10 @@ async function connectLlmStudio(provider) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         llm_provider: provider,
-        ollama_base: llmForm.value.ollama_base,
-        ollama_model: llmForm.value.ollama_model,
+        llm_base: llmForm.value.llm_base,
+        llm_model: llmForm.value.llm_model,
+        ollama_embed_base: llmForm.value.ollama_embed_base,
+        ollama_embed_model: llmForm.value.ollama_embed_model,
         model_api_style: llmForm.value.model_api_style,
         openai_api_key: llmForm.value.openai_api_key,
         openai_base_url: llmForm.value.openai_base_url,
@@ -2817,17 +2823,37 @@ function formatIso(iso) {
             <div v-show="activeLlmSource === 'llm_local'" class="kb-detail__panel">
               <h4 class="kb-detail__h">Local server</h4>
               <p class="status status--muted kb-detail__fine">
-                Same as <code>OLLAMA_BASE</code> + <code>OLLAMA_MODEL</code>. Use <code>MODEL_API_STYLE=openai</code> for
-                <code>/v1/chat/completions</code> gateways.
+                <code>LLM_BASE</code> + <code>LLM_MODEL</code> drive voice / chat / lip-sync (legacy
+                <code>OLLAMA_*</code> still read if unset). Use <code>MODEL_API_STYLE=openai</code> for
+                <code>/v1/chat/completions</code> gateways. RAG embeddings use <code>OLLAMA_EMBED_*</code> (native Ollama
+                <code>/api/embed</code>).
               </p>
               <div class="studio-form-grid">
                 <label class="field studio-form-grid__full">
-                  <span>Ollama / API base URL</span>
-                  <input v-model="llmForm.ollama_base" type="text" placeholder="http://127.0.0.1:11434" autocomplete="off" />
+                  <span>Chat / voice LLM — API base URL</span>
+                  <input v-model="llmForm.llm_base" type="text" placeholder="http://127.0.0.1:11434" autocomplete="off" />
                 </label>
                 <label class="field studio-form-grid__full">
-                  <span>Model name</span>
-                  <input v-model="llmForm.ollama_model" type="text" placeholder="llama3.2" autocomplete="off" />
+                  <span>Chat / voice — model name</span>
+                  <input v-model="llmForm.llm_model" type="text" placeholder="llama3.2" autocomplete="off" />
+                </label>
+                <label class="field studio-form-grid__full">
+                  <span>RAG embeddings — Ollama base URL</span>
+                  <input
+                    v-model="llmForm.ollama_embed_base"
+                    type="text"
+                    placeholder="http://127.0.0.1:11434"
+                    autocomplete="off"
+                  />
+                </label>
+                <label class="field studio-form-grid__full">
+                  <span>RAG embeddings — model name</span>
+                  <input
+                    v-model="llmForm.ollama_embed_model"
+                    type="text"
+                    placeholder="nomic-embed-text:latest"
+                    autocomplete="off"
+                  />
                 </label>
                 <label class="field studio-form-grid__full">
                   <span>API style</span>

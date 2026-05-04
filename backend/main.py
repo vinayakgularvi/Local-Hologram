@@ -32,6 +32,7 @@ from rag_store import (
     ingest_file,
     list_sources as rag_list_sources,
     query_documents,
+    rag_embedding_config,
     reset_collection as rag_reset_collection,
 )
 from google_drive_sync import is_configured as gdrive_is_configured
@@ -110,15 +111,15 @@ def _env_first_int(*keys: str, default: int) -> int:
     return default
 
 
-def _ollama_base() -> str:
-    v = os.environ.get("OLLAMA_BASE", "").strip()
-    # Default to native Ollama port (11434), not arbitrary HTTP services on :8000.
+def _llm_local_base() -> str:
+    """Chat / voice / lip-sync LLM API root. Prefer LLM_BASE; fall back to legacy OLLAMA_BASE."""
+    v = os.environ.get("LLM_BASE", "").strip() or os.environ.get("OLLAMA_BASE", "").strip()
     return (v or "http://127.0.0.1:11434").rstrip("/")
 
 
-def _ollama_model() -> str:
-    v = os.environ.get("OLLAMA_MODEL", "").strip()
-    # Must match a name from `ollama list` on that host — not a bare .gguf filename.
+def _llm_local_model() -> str:
+    """Model id for the local LLM host. Prefer LLM_MODEL; fall back to legacy OLLAMA_MODEL."""
+    v = os.environ.get("LLM_MODEL", "").strip() or os.environ.get("OLLAMA_MODEL", "").strip()
     return v or "llama3.2"
 
 
@@ -711,7 +712,7 @@ def _is_openai_compatible_style() -> bool:
     if style in ("ollama", "native"):
         return False
     # auto mode: bases that already point to /v1 are treated as OpenAI-compatible.
-    return _ollama_base().endswith("/v1")
+    return _llm_local_base().endswith("/v1")
 
 
 def _chat_completions_url(api_base: str) -> str:
@@ -781,8 +782,8 @@ async def _stream_openai_compatible(
     max_tokens: int | None = None,
 ) -> AsyncIterator[str]:
     async for piece in _stream_chat_completions(
-        api_base=_ollama_base(),
-        model=_ollama_model(),
+        api_base=_llm_local_base(),
+        model=_llm_local_model(),
         prompt=prompt,
         metrics=metrics,
         max_tokens=max_tokens,
@@ -974,7 +975,7 @@ async def _stream_ollama_native(
     max_tokens: int | None = None,
 ) -> AsyncIterator[str]:
     payload = {
-        "model": _ollama_model(),
+        "model": _llm_local_model(),
         "prompt": prompt,
         "stream": True,
         "options": {"temperature": 0.7},
@@ -984,7 +985,7 @@ async def _stream_ollama_native(
     async with httpx.AsyncClient(timeout=300.0) as client:
         async with client.stream(
             "POST",
-            f"{_ollama_base()}/api/generate",
+            f"{_llm_local_base()}/api/generate",
             json=payload,
         ) as response:
             if response.status_code >= 400:
@@ -993,10 +994,10 @@ async def _stream_ollama_native(
                 hint = ""
                 if response.status_code == 404 or "not_found" in snippet.lower():
                     hint = (
-                        " Hint: OLLAMA_BASE must reach Ollama’s HTTP API (usually port 11434), "
-                        "e.g. http://127.0.0.1:11434 — not your Lipsync or other app port unless it proxies /api/generate. "
-                        "OLLAMA_MODEL must match a name from `ollama list` on that host (not a raw .gguf file name). "
-                        "For OpenAI-style servers, set MODEL_API_STYLE=openai and OLLAMA_BASE ending in /v1."
+                        " Hint: LLM_BASE (or legacy OLLAMA_BASE) must reach a server that implements POST /api/generate "
+                        "(native Ollama, usually port 11434) unless you use OpenAI-style routing. "
+                        "LLM_MODEL (or legacy OLLAMA_MODEL) must be a model id that host accepts. "
+                        "For /v1/chat/completions gateways, set MODEL_API_STYLE=openai and LLM_BASE ending in /v1."
                     )
                 raise HTTPException(
                     status_code=502,
@@ -1293,13 +1294,13 @@ def _active_llm_model_label() -> str:
         return os.environ.get("ANTHROPIC_MODEL", "").strip() or "claude-3-5-haiku-20241022"
     if p == "google":
         return os.environ.get("GOOGLE_GEMINI_MODEL", "").strip() or "gemini-2.0-flash"
-    return _ollama_model()
+    return _llm_local_model()
 
 
 def _llm_public_config() -> dict[str, Any]:
     """Non-secret LLM / provider status for Studio and health (reads os.environ each call)."""
-    ob = _ollama_base()
-    om = _ollama_model()
+    ob = _llm_local_base()
+    om = _llm_local_model()
     oa_url = os.environ.get("OPENAI_BASE_URL", "").strip() or "https://api.openai.com"
     oa_model = os.environ.get("OPENAI_MODEL", "").strip() or "gpt-4o-mini"
     an_url = os.environ.get("ANTHROPIC_BASE_URL", "").strip() or "https://api.anthropic.com"
@@ -1309,10 +1310,11 @@ def _llm_public_config() -> dict[str, Any]:
     return {
         "provider": _llm_provider(),
         "local": {
-            "ollama_base": ob,
-            "ollama_model": om,
+            "llm_base": ob,
+            "llm_model": om,
             "model_api_style": _model_api_style(),
             "openai_compatible": _is_openai_compatible_style(),
+            **rag_embedding_config(),
         },
         "openai": {
             "configured": bool(os.environ.get("OPENAI_API_KEY", "").strip()),
@@ -1349,8 +1351,10 @@ async def health():
         rag_info["error"] = str(e)
     return {
         "ok": True,
-        "ollama": _ollama_base(),
-        "model": _ollama_model(),
+        "llm_base": _llm_local_base(),
+        "llm_model": _llm_local_model(),
+        "ollama": _llm_local_base(),
+        "model": _llm_local_model(),
         "model_api_style": _model_api_style(),
         "llm_provider": _llm_provider(),
         "llm": _llm_public_config(),
@@ -1708,8 +1712,10 @@ class StudioAzureAISearchConnect(BaseModel):
 
 class StudioLLMConnect(BaseModel):
     llm_provider: str = Field("", max_length=32)
-    ollama_base: str = Field("", max_length=2048)
-    ollama_model: str = Field("", max_length=512)
+    llm_base: str = Field("", max_length=2048)
+    llm_model: str = Field("", max_length=512)
+    ollama_embed_base: str = Field("", max_length=2048)
+    ollama_embed_model: str = Field("", max_length=512)
     model_api_style: str = Field("", max_length=32)
     openai_api_key: str = Field("", max_length=512)
     openai_base_url: str = Field("", max_length=2048)
@@ -2029,8 +2035,10 @@ async def studio_integrations_connect_llm(body: StudioLLMConnect):
         return s if s else ""
 
     vals: dict[str, str | None] = {"LLM_PROVIDER": prov}
-    vals["OLLAMA_BASE"] = set_or_clear("OLLAMA_BASE", body.ollama_base)
-    vals["OLLAMA_MODEL"] = set_or_clear("OLLAMA_MODEL", body.ollama_model)
+    vals["LLM_BASE"] = set_or_clear("LLM_BASE", body.llm_base)
+    vals["LLM_MODEL"] = set_or_clear("LLM_MODEL", body.llm_model)
+    vals["OLLAMA_EMBED_BASE"] = set_or_clear("OLLAMA_EMBED_BASE", body.ollama_embed_base)
+    vals["OLLAMA_EMBED_MODEL"] = set_or_clear("OLLAMA_EMBED_MODEL", body.ollama_embed_model)
     vals["MODEL_API_STYLE"] = set_or_clear("MODEL_API_STYLE", body.model_api_style)
     vals["OPENAI_BASE_URL"] = set_or_clear("OPENAI_BASE_URL", body.openai_base_url)
     vals["OPENAI_MODEL"] = set_or_clear("OPENAI_MODEL", body.openai_model)
@@ -2075,6 +2083,9 @@ async def studio_integrations_connect_llm(body: StudioLLMConnect):
             status_code=400,
             detail="Google Gemini requires GOOGLE_API_KEY (paste a key or keep one already saved in Studio).",
         )
+    if prov == "local":
+        vals["OLLAMA_BASE"] = ""
+        vals["OLLAMA_MODEL"] = ""
     studio_save_section("llm", vals)
     return {"ok": True, "summary": studio_integrations_summary(), "config": _llm_public_config()}
 

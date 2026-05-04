@@ -6,7 +6,7 @@
 #
 # Optional: run Ollama in Compose and point the app at it:
 #   docker compose --profile ollama up --build -d
-#   Set in .env (or shell): OLLAMA_BASE=http://ollama:11434  (in-container; host maps 6065→11434)
+#   Set in .env (or shell): LLM_BASE=http://ollama:11434  (in-container; host maps 6065→11434)
 #
 # Env: copy variables you need into a `.env` file next to this file (Compose reads
 # it for variable substitution). `env_file` below passes the same file into the container.
