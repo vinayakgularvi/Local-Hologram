@@ -112,12 +112,14 @@ def _env_first_int(*keys: str, default: int) -> int:
 
 def _ollama_base() -> str:
     v = os.environ.get("OLLAMA_BASE", "").strip()
-    return (v or "http://10.29.145.124:8000").rstrip("/")
+    # Default to native Ollama port (11434), not arbitrary HTTP services on :8000.
+    return (v or "http://127.0.0.1:11434").rstrip("/")
 
 
 def _ollama_model() -> str:
     v = os.environ.get("OLLAMA_MODEL", "").strip()
-    return v or "AFM-4.5B-Q4_K_M.gguf"
+    # Must match a name from `ollama list` on that host — not a bare .gguf filename.
+    return v or "llama3.2"
 
 
 def _model_api_style() -> str:
@@ -987,9 +989,18 @@ async def _stream_ollama_native(
         ) as response:
             if response.status_code >= 400:
                 body = await response.aread()
+                snippet = body.decode(errors="replace")[:500]
+                hint = ""
+                if response.status_code == 404 or "not_found" in snippet.lower():
+                    hint = (
+                        " Hint: OLLAMA_BASE must reach Ollama’s HTTP API (usually port 11434), "
+                        "e.g. http://127.0.0.1:11434 — not your Lipsync or other app port unless it proxies /api/generate. "
+                        "OLLAMA_MODEL must match a name from `ollama list` on that host (not a raw .gguf file name). "
+                        "For OpenAI-style servers, set MODEL_API_STYLE=openai and OLLAMA_BASE ending in /v1."
+                    )
                 raise HTTPException(
                     status_code=502,
-                    detail=f"Ollama error {response.status_code}: {body.decode()[:500]}",
+                    detail=f"Ollama error {response.status_code}: {snippet}{hint}",
                 )
             async for line in response.aiter_lines():
                 line = line.strip()

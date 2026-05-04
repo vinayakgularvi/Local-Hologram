@@ -1,6 +1,6 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
-import { hx, HOLUMINEX_PREFIX } from "./holuminexPaths.js";
+import { hx, HOLUMINEX_PREFIX, resolveApiOrigin } from "./holuminexPaths.js";
 
 const languages = ["Auto", "Chinese", "English", "German", "Italian", "Portuguese", "Spanish", "Japanese", "Korean", "French", "Russian"];
 
@@ -201,8 +201,8 @@ function apiUrl(path) {
   if (!p.startsWith(`${HOLUMINEX_PREFIX}/`) && p !== HOLUMINEX_PREFIX) {
     p = hx(p);
   }
-  const base = import.meta.env.VITE_API_BASE;
-  if (base) return `${String(base).replace(/\/$/, "")}${p}`;
+  const base = resolveApiOrigin(import.meta.env.VITE_API_BASE);
+  if (base) return `${base}${p}`;
   if (typeof window !== "undefined") {
     const port = window.location.port;
     const host = window.location.hostname;

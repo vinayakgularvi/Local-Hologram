@@ -1,6 +1,6 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted } from "vue";
-import { hx } from "./holuminexPaths.js";
+import { hx, resolveApiOrigin } from "./holuminexPaths.js";
 
 const busy = ref(false);
 /** True once the remote video is actually rendering (not only SDP done). */
@@ -50,8 +50,8 @@ const speechRecCtor = computed(() => {
 const micAvailable = computed(() => !!speechRecCtor.value);
 
 function apiOrigin() {
-  const fromEnv = import.meta.env.VITE_API_BASE;
-  if (fromEnv) return String(fromEnv).replace(/\/$/, "");
+  const fromEnv = resolveApiOrigin(import.meta.env.VITE_API_BASE);
+  if (fromEnv) return fromEnv;
   if (typeof window !== "undefined") {
     const port = window.location.port;
     const host = window.location.hostname;
