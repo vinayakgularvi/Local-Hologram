@@ -1,5 +1,6 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
+import { hx, HOLUMINEX_PREFIX } from "./holuminexPaths.js";
 
 const languages = ["Auto", "Chinese", "English", "German", "Italian", "Portuguese", "Spanish", "Japanese", "Korean", "French", "Russian"];
 
@@ -191,13 +192,16 @@ let recordChunks = [];
 const objectUrls = [];
 
 function apiUrl(path) {
-  const p = path.startsWith("/") ? path : `/${path}`;
+  let p = path.startsWith("/") ? path : `/${path}`;
+  if (!p.startsWith(`${HOLUMINEX_PREFIX}/`) && p !== HOLUMINEX_PREFIX) {
+    p = hx(p);
+  }
   const base = import.meta.env.VITE_API_BASE;
   if (base) return `${String(base).replace(/\/$/, "")}${p}`;
   if (typeof window !== "undefined") {
     const port = window.location.port;
     const host = window.location.hostname;
-    if (port === "5173" || port === "4173") return `http://${host}:8000${p}`;
+    if (port === "6066" || port === "6067") return `http://${host}:6064${p}`;
   }
   return p;
 }
@@ -2694,7 +2698,7 @@ function formatIso(iso) {
               <div class="studio-form-grid">
                 <label class="field studio-form-grid__full">
                   <span>Ollama / API base URL</span>
-                  <input v-model="llmForm.ollama_base" type="text" placeholder="http://127.0.0.1:11434" autocomplete="off" />
+                  <input v-model="llmForm.ollama_base" type="text" placeholder="http://127.0.0.1:6065" autocomplete="off" />
                 </label>
                 <label class="field studio-form-grid__full">
                   <span>Model name</span>

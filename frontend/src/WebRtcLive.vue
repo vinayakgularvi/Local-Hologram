@@ -1,5 +1,6 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted } from "vue";
+import { hx } from "./holuminexPaths.js";
 
 const busy = ref(false);
 /** True once the remote video is actually rendering (not only SDP done). */
@@ -54,8 +55,8 @@ function apiOrigin() {
   if (typeof window !== "undefined") {
     const port = window.location.port;
     const host = window.location.hostname;
-    if (port === "5173" || port === "4173") {
-      return `http://${host}:8000`;
+    if (port === "6066" || port === "6067") {
+      return `http://${host}:6064`;
     }
   }
   return "";
@@ -63,8 +64,9 @@ function apiOrigin() {
 
 function signalingUrl(path) {
   const p = path.startsWith("/") ? path : `/${path}`;
+  const prefixed = hx(p);
   const base = apiOrigin();
-  return base ? `${base}${p}` : p;
+  return base ? `${base}${prefixed}` : prefixed;
 }
 
 fetch(signalingUrl("/api/webrtc"))

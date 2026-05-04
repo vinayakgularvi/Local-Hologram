@@ -1,5 +1,6 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref } from "vue";
+import { hx, HOLUMINEX_PREFIX } from "./holuminexPaths.js";
 
 const loading = ref(true);
 const err = ref("");
@@ -12,14 +13,17 @@ const lastUpdatedAt = ref("");
 let es = null;
 
 function apiUrl(path) {
-  const p = path.startsWith("/") ? path : `/${path}`;
+  let p = path.startsWith("/") ? path : `/${path}`;
+  if (!p.startsWith(`${HOLUMINEX_PREFIX}/`) && p !== HOLUMINEX_PREFIX) {
+    p = hx(p);
+  }
   const base = import.meta.env.VITE_API_BASE;
   if (base) return `${String(base).replace(/\/$/, "")}${p}`;
   if (typeof window !== "undefined") {
     const port = window.location.port;
     const host = window.location.hostname;
-    if (port === "5173" || port === "4173") {
-      return `http://${host}:8000${p}`;
+    if (port === "6066" || port === "6067") {
+      return `http://${host}:6064${p}`;
     }
   }
   return p;

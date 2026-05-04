@@ -20,7 +20,7 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from gradio_client import Client, handle_file
 from pydantic import BaseModel, Field
@@ -80,6 +80,17 @@ _REPO_ROOT = _BACKEND_DIR.parent
 load_dotenv(_REPO_ROOT / ".env")
 load_dotenv(_BACKEND_DIR / ".env")
 apply_studio_integrations_to_environ()
+
+# URL prefix for all HTTP routes, static mounts, and browser-facing paths (match Vite `base`).
+_raw_hx = (os.environ.get("HOLUMINEX_PREFIX", "/holuminex") or "/holuminex").strip()
+HOLUMINEX_PREFIX = (_raw_hx if _raw_hx.startswith("/") else f"/{_raw_hx}").rstrip("/") or "/holuminex"
+
+
+def _hx(path: str) -> str:
+    if not path.startswith("/"):
+        path = "/" + path
+    return f"{HOLUMINEX_PREFIX}{path}"
+
 
 
 def _env_first_float(*keys: str, default: float) -> float:
@@ -254,7 +265,12 @@ GCS_SYNC_INTERVAL_SEC = max(30, _env_first_int("GCS_SYNC_INTERVAL_SEC", default=
 OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="Lip-Sync Agent")
+app = FastAPI(
+    title="Lip-Sync Agent",
+    docs_url=_hx("/docs"),
+    openapi_url=_hx("/openapi.json"),
+    redoc_url=_hx("/redoc"),
+)
 
 _sharepoint_sync_lock = asyncio.Lock()
 _google_drive_sync_lock = asyncio.Lock()
@@ -533,13 +549,18 @@ async def _on_shutdown() -> None:
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.environ.get("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(","),
+    allow_origins=os.environ.get(
+        "CORS_ORIGINS",
+        "http://localhost:6064,http://127.0.0.1:6064,"
+        "http://localhost:6066,http://127.0.0.1:6066,"
+        "http://localhost:6067,http://127.0.0.1:6067",
+    ).split(","),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-app.mount("/outputs", StaticFiles(directory=str(OUTPUT_DIR)), name="outputs")
+app.mount(_hx("/outputs"), StaticFiles(directory=str(OUTPUT_DIR)), name="outputs")
 _analytics_subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
 
 
@@ -616,7 +637,7 @@ async def _store_gradio_file(candidate: Any, *, prefix: str, fallback_ext: str) 
             raise HTTPException(status_code=502, detail=f"Output file not found: {path}")
         shutil.copy2(src, out_path)
 
-    return f"/outputs/{out_name}"
+    return _hx(f"/outputs/{out_name}")
 
 
 async def _forward_webrtc_post(subpath: str, request: Request) -> Response:
@@ -646,17 +667,17 @@ async def _forward_webrtc_post(subpath: str, request: Request) -> Response:
     return Response(content=r.content, status_code=r.status_code, headers=out_headers)
 
 
-@app.post("/offer")
+@app.post(f"{HOLUMINEX_PREFIX}/offer")
 async def webrtc_offer_proxy(request: Request) -> Response:
     return await _forward_webrtc_post("/offer", request)
 
 
-@app.post("/human")
+@app.post(f"{HOLUMINEX_PREFIX}/human")
 async def webrtc_human_proxy(request: Request) -> Response:
     return await _forward_webrtc_post("/human", request)
 
 
-@app.post("/record")
+@app.post(f"{HOLUMINEX_PREFIX}/record")
 async def webrtc_record_proxy(request: Request) -> Response:
     return await _forward_webrtc_post("/record", request)
 
@@ -1299,7 +1320,7 @@ def _llm_public_config() -> dict[str, Any]:
     }
 
 
-@app.get("/api/health")
+@app.get(f"{HOLUMINEX_PREFIX}/api/health")
 async def health():
     rag_info: dict[str, Any] = {
         "chunk_size": RAG_CHUNK_SIZE,
@@ -1360,7 +1381,7 @@ async def health():
     }
 
 
-@app.get("/api/webrtc")
+@app.get(f"{HOLUMINEX_PREFIX}/api/webrtc")
 async def webrtc_proxy_status():
     """Whether POST /offer, /human, /record are forwarded to WEBRTC_SIGNALING_BASE."""
     return {"signaling_proxy_configured": bool(WEBRTC_SIGNALING_BASE)}
@@ -1434,7 +1455,7 @@ class VoiceTurnBody(BaseModel):
     text: str = Field(..., min_length=1, max_length=8000)
 
 
-@app.post("/api/voice-turn")
+@app.post(f"{HOLUMINEX_PREFIX}/api/voice-turn")
 async def voice_turn(body: VoiceTurnBody):
     """
     Browser STT text → optional ChromaDB RAG → Ollama (short avatar-friendly reply) → client sends answer to LiveTalking /human.
@@ -1466,19 +1487,19 @@ async def voice_turn(body: VoiceTurnBody):
     return {"answer": answer, "heard": user_text, "rag": rag_meta}
 
 
-@app.get("/api/analytics/summary")
+@app.get(f"{HOLUMINEX_PREFIX}/api/analytics/summary")
 async def analytics_summary():
     """Aggregates for dashboard (voice /mic → Ollama turns)."""
     s = get_summary()
     return {"kind": "voice_turns", **s}
 
 
-@app.get("/api/analytics/voice-turns")
+@app.get(f"{HOLUMINEX_PREFIX}/api/analytics/voice-turns")
 async def analytics_voice_turns(limit: int = 50):
     return {"items": get_recent_voice_turns(limit)}
 
 
-@app.get("/api/analytics/stream")
+@app.get(f"{HOLUMINEX_PREFIX}/api/analytics/stream")
 async def analytics_stream():
     """SSE stream of analytics snapshots (push updates, no client polling)."""
     q: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=1)
@@ -1509,7 +1530,7 @@ class AnalyticsResetBody(BaseModel):
     secret: str = Field(..., min_length=1, max_length=256)
 
 
-@app.post("/api/analytics/reset")
+@app.post(f"{HOLUMINEX_PREFIX}/api/analytics/reset")
 async def analytics_reset(body: AnalyticsResetBody):
     """Clears stored analytics when ``ANALYTICS_RESET_SECRET`` matches (kiosk / admin)."""
     expected = os.environ.get("ANALYTICS_RESET_SECRET", "").strip()
@@ -1525,7 +1546,7 @@ class RagQueryBody(BaseModel):
     n_results: int = Field(6, ge=1, le=30)
 
 
-@app.get("/api/rag/status")
+@app.get(f"{HOLUMINEX_PREFIX}/api/rag/status")
 async def rag_status():
     """ChromaDB persistent store: chunk counts and indexed sources."""
     try:
@@ -1539,7 +1560,7 @@ async def rag_status():
     return base
 
 
-@app.post("/api/rag/ingest")
+@app.post(f"{HOLUMINEX_PREFIX}/api/rag/ingest")
 async def rag_ingest(files: list[UploadFile] = File(...)):
     """Upload PDF, DOCX, or TXT — text is chunked and embedded into ChromaDB (on-disk)."""
     if not files:
@@ -1574,7 +1595,7 @@ async def rag_ingest(files: list[UploadFile] = File(...)):
     return {"results": results}
 
 
-@app.post("/api/rag/query")
+@app.post(f"{HOLUMINEX_PREFIX}/api/rag/query")
 async def rag_query(body: RagQueryBody):
     """Semantic search over ingested documents (for RAG prompts or debugging)."""
     try:
@@ -1583,7 +1604,7 @@ async def rag_query(body: RagQueryBody):
         raise HTTPException(status_code=503, detail=f"RAG query failed: {e}") from e
 
 
-@app.delete("/api/rag/sources/{source_id}")
+@app.delete(f"{HOLUMINEX_PREFIX}/api/rag/sources/{{source_id}}")
 async def rag_delete_source(source_id: str):
     if not source_id.strip() or len(source_id) > 64:
         raise HTTPException(status_code=400, detail="Invalid source_id.")
@@ -1685,7 +1706,7 @@ class StudioLLMConnect(BaseModel):
     google_gemini_model: str = Field("", max_length=256)
 
 
-@app.post("/api/rag/reset")
+@app.post(f"{HOLUMINEX_PREFIX}/api/rag/reset")
 async def rag_reset(body: RagResetBody):
     """Wipes the Chroma collection when ``RAG_RESET_SECRET`` matches."""
     expected = os.environ.get("RAG_RESET_SECRET", "").strip()
@@ -1698,13 +1719,13 @@ async def rag_reset(body: RagResetBody):
     return {"ok": True}
 
 
-@app.get("/api/sharepoint/config")
+@app.get(f"{HOLUMINEX_PREFIX}/api/sharepoint/config")
 async def sharepoint_config():
     """Whether Azure / SharePoint env is set (no secrets returned)."""
     return sharepoint_public_config()
 
 
-@app.post("/api/sharepoint/sync")
+@app.post(f"{HOLUMINEX_PREFIX}/api/sharepoint/sync")
 async def sharepoint_sync():
     """
     On-demand sync (same pipeline as live sync). Uses a lock so concurrent runs with the
@@ -1725,13 +1746,13 @@ async def sharepoint_sync():
             raise HTTPException(status_code=502, detail=f"SharePoint sync failed: {e}") from e
 
 
-@app.get("/api/google-drive/config")
+@app.get(f"{HOLUMINEX_PREFIX}/api/google-drive/config")
 async def google_drive_config():
     """Whether Google Drive env is set (no secrets returned)."""
     return gdrive_public_config()
 
 
-@app.post("/api/google-drive/sync")
+@app.post(f"{HOLUMINEX_PREFIX}/api/google-drive/sync")
 async def google_drive_sync():
     """On-demand Google Drive → Chroma sync (same pipeline as live; lock prevents overlap)."""
     if not gdrive_is_configured():
@@ -1749,13 +1770,13 @@ async def google_drive_sync():
             raise HTTPException(status_code=502, detail=f"Google Drive sync failed: {e}") from e
 
 
-@app.get("/api/dropbox/config")
+@app.get(f"{HOLUMINEX_PREFIX}/api/dropbox/config")
 async def dropbox_config():
     """Whether Dropbox env is set (no secrets returned)."""
     return dropbox_public_config()
 
 
-@app.post("/api/dropbox/sync")
+@app.post(f"{HOLUMINEX_PREFIX}/api/dropbox/sync")
 async def dropbox_sync():
     """On-demand Dropbox → Chroma sync (same pipeline as live; lock prevents overlap)."""
     if not dropbox_is_configured():
@@ -1774,12 +1795,12 @@ async def dropbox_sync():
             raise HTTPException(status_code=502, detail=f"Dropbox sync failed: {e}") from e
 
 
-@app.get("/api/s3/config")
+@app.get(f"{HOLUMINEX_PREFIX}/api/s3/config")
 async def s3_config():
     return s3_public_config()
 
 
-@app.post("/api/s3/sync")
+@app.post(f"{HOLUMINEX_PREFIX}/api/s3/sync")
 async def s3_sync():
     if not s3_is_configured():
         raise HTTPException(
@@ -1795,12 +1816,12 @@ async def s3_sync():
             raise HTTPException(status_code=502, detail=f"S3 sync failed: {e}") from e
 
 
-@app.get("/api/azure-blob/config")
+@app.get(f"{HOLUMINEX_PREFIX}/api/azure-blob/config")
 async def azure_blob_config():
     return azure_blob_public_config()
 
 
-@app.post("/api/azure-blob/sync")
+@app.post(f"{HOLUMINEX_PREFIX}/api/azure-blob/sync")
 async def azure_blob_sync():
     if not azure_blob_is_configured():
         raise HTTPException(
@@ -1817,12 +1838,12 @@ async def azure_blob_sync():
             raise HTTPException(status_code=502, detail=f"Azure Blob sync failed: {e}") from e
 
 
-@app.get("/api/gcs/config")
+@app.get(f"{HOLUMINEX_PREFIX}/api/gcs/config")
 async def gcs_config():
     return gcs_public_config()
 
 
-@app.post("/api/gcs/sync")
+@app.post(f"{HOLUMINEX_PREFIX}/api/gcs/sync")
 async def gcs_sync():
     if not gcs_is_configured():
         raise HTTPException(
@@ -1839,19 +1860,19 @@ async def gcs_sync():
             raise HTTPException(status_code=502, detail=f"GCS sync failed: {e}") from e
 
 
-@app.get("/api/llm/config")
+@app.get(f"{HOLUMINEX_PREFIX}/api/llm/config")
 async def llm_config():
     """Active LLM provider and non-secret connection hints (OpenAI / Anthropic keys never returned)."""
     return _llm_public_config()
 
 
-@app.get("/api/studio/integrations")
+@app.get(f"{HOLUMINEX_PREFIX}/api/studio/integrations")
 async def studio_integrations_status():
     """Which connector settings are saved locally (no secret values)."""
     return studio_integrations_summary()
 
 
-@app.post("/api/studio/integrations/sharepoint")
+@app.post(f"{HOLUMINEX_PREFIX}/api/studio/integrations/sharepoint")
 async def studio_integrations_connect_sharepoint(body: StudioSharePointConnect):
     """Save SharePoint / Azure app credentials to studio_integrations.json and apply env."""
     studio_save_section(
@@ -1871,7 +1892,7 @@ async def studio_integrations_connect_sharepoint(body: StudioSharePointConnect):
     }
 
 
-@app.post("/api/studio/integrations/dropbox")
+@app.post(f"{HOLUMINEX_PREFIX}/api/studio/integrations/dropbox")
 async def studio_integrations_connect_dropbox(body: StudioDropboxConnect):
     """Save Dropbox tokens / app keys to studio_integrations.json and apply env."""
     studio_save_section(
@@ -1891,7 +1912,7 @@ async def studio_integrations_connect_dropbox(body: StudioDropboxConnect):
     }
 
 
-@app.post("/api/studio/integrations/s3")
+@app.post(f"{HOLUMINEX_PREFIX}/api/studio/integrations/s3")
 async def studio_integrations_connect_s3(body: StudioS3Connect):
     studio_save_section(
         "s3",
@@ -1909,7 +1930,7 @@ async def studio_integrations_connect_s3(body: StudioS3Connect):
     return {"ok": True, "summary": studio_integrations_summary(), "config": s3_public_config()}
 
 
-@app.post("/api/studio/integrations/azure-blob")
+@app.post(f"{HOLUMINEX_PREFIX}/api/studio/integrations/azure-blob")
 async def studio_integrations_connect_azure_blob(body: StudioAzureBlobConnect):
     studio_save_section(
         "azure_blob",
@@ -1924,7 +1945,7 @@ async def studio_integrations_connect_azure_blob(body: StudioAzureBlobConnect):
     return {"ok": True, "summary": studio_integrations_summary(), "config": azure_blob_public_config()}
 
 
-@app.post("/api/studio/integrations/gcs")
+@app.post(f"{HOLUMINEX_PREFIX}/api/studio/integrations/gcs")
 async def studio_integrations_connect_gcs(
     bucket: str = Form(""),
     prefix: str = Form(""),
@@ -1960,7 +1981,7 @@ async def studio_integrations_connect_gcs(
     return {"ok": True, "summary": studio_integrations_summary(), "config": gcs_public_config()}
 
 
-@app.post("/api/studio/integrations/llm")
+@app.post(f"{HOLUMINEX_PREFIX}/api/studio/integrations/llm")
 async def studio_integrations_connect_llm(body: StudioLLMConnect):
     """Save LLM provider (local / OpenAI / Anthropic / Google Gemini) and related settings; applies immediately."""
     prov = body.llm_provider.strip().lower()
@@ -2026,7 +2047,7 @@ async def studio_integrations_connect_llm(body: StudioLLMConnect):
     return {"ok": True, "summary": studio_integrations_summary(), "config": _llm_public_config()}
 
 
-@app.post("/api/studio/integrations/pinecone")
+@app.post(f"{HOLUMINEX_PREFIX}/api/studio/integrations/pinecone")
 async def studio_integrations_connect_pinecone(body: StudioPineconeConnect):
     """Save Pinecone API settings to studio_integrations.json (ingest/query wiring is separate)."""
     prev = studio_read_section_strings("pinecone")
@@ -2047,7 +2068,7 @@ async def studio_integrations_connect_pinecone(body: StudioPineconeConnect):
     return {"ok": True, "summary": studio_integrations_summary()}
 
 
-@app.post("/api/studio/integrations/milvus")
+@app.post(f"{HOLUMINEX_PREFIX}/api/studio/integrations/milvus")
 async def studio_integrations_connect_milvus(body: StudioMilvusConnect):
     """Save Milvus / Zilliz connection settings to studio_integrations.json."""
     prev = studio_read_section_strings("milvus")
@@ -2070,7 +2091,7 @@ async def studio_integrations_connect_milvus(body: StudioMilvusConnect):
     return {"ok": True, "summary": studio_integrations_summary()}
 
 
-@app.post("/api/studio/integrations/weaviate")
+@app.post(f"{HOLUMINEX_PREFIX}/api/studio/integrations/weaviate")
 async def studio_integrations_connect_weaviate(body: StudioWeaviateConnect):
     """Save Weaviate connection settings to studio_integrations.json."""
     prev = studio_read_section_strings("weaviate")
@@ -2091,7 +2112,7 @@ async def studio_integrations_connect_weaviate(body: StudioWeaviateConnect):
     return {"ok": True, "summary": studio_integrations_summary()}
 
 
-@app.post("/api/studio/integrations/qdrant")
+@app.post(f"{HOLUMINEX_PREFIX}/api/studio/integrations/qdrant")
 async def studio_integrations_connect_qdrant(body: StudioQdrantConnect):
     """Save Qdrant connection settings to studio_integrations.json."""
     prev = studio_read_section_strings("qdrant")
@@ -2112,7 +2133,7 @@ async def studio_integrations_connect_qdrant(body: StudioQdrantConnect):
     return {"ok": True, "summary": studio_integrations_summary()}
 
 
-@app.post("/api/studio/integrations/elasticsearch")
+@app.post(f"{HOLUMINEX_PREFIX}/api/studio/integrations/elasticsearch")
 async def studio_integrations_connect_elasticsearch(body: StudioElasticsearchConnect):
     """Save Elasticsearch connection settings to studio_integrations.json."""
     prev = studio_read_section_strings("elasticsearch")
@@ -2133,7 +2154,7 @@ async def studio_integrations_connect_elasticsearch(body: StudioElasticsearchCon
     return {"ok": True, "summary": studio_integrations_summary()}
 
 
-@app.post("/api/studio/integrations/azure-ai-search")
+@app.post(f"{HOLUMINEX_PREFIX}/api/studio/integrations/azure-ai-search")
 async def studio_integrations_connect_azure_ai_search(body: StudioAzureAISearchConnect):
     """Save Azure AI Search (formerly Cognitive Search) settings to studio_integrations.json."""
     prev = studio_read_section_strings("azure_ai_search")
@@ -2159,7 +2180,7 @@ async def studio_integrations_connect_azure_ai_search(body: StudioAzureAISearchC
     return {"ok": True, "summary": studio_integrations_summary()}
 
 
-@app.post("/api/studio/integrations/google-drive")
+@app.post(f"{HOLUMINEX_PREFIX}/api/studio/integrations/google-drive")
 async def studio_integrations_connect_google_drive(
     folder_id: str = Form(""),
     credentials_path: str = Form(""),
@@ -2194,7 +2215,7 @@ async def studio_integrations_connect_google_drive(
     }
 
 
-@app.delete("/api/studio/integrations/{section}")
+@app.delete(f"{HOLUMINEX_PREFIX}/api/studio/integrations/{{section}}")
 async def studio_integrations_clear(section: str):
     """Remove saved settings for a connector section."""
     if section not in (
@@ -2217,7 +2238,7 @@ async def studio_integrations_clear(section: str):
     return {"ok": True, "summary": studio_integrations_summary()}
 
 
-@app.post("/api/avatar/save-voice")
+@app.post(f"{HOLUMINEX_PREFIX}/api/avatar/save-voice")
 async def avatar_save_voice(
     ref_aud: UploadFile = File(...),
     ref_txt: str = Form(...),
@@ -2257,7 +2278,7 @@ async def avatar_save_voice(
         shutil.rmtree(work, ignore_errors=True)
 
 
-@app.post("/api/avatar/load-and-generate")
+@app.post(f"{HOLUMINEX_PREFIX}/api/avatar/load-and-generate")
 async def avatar_load_and_generate(
     file_obj: UploadFile = File(...),
     text: str = Form(...),
@@ -2294,7 +2315,7 @@ async def avatar_load_and_generate(
         shutil.rmtree(work, ignore_errors=True)
 
 
-@app.post("/api/avatar/run-voice-clone")
+@app.post(f"{HOLUMINEX_PREFIX}/api/avatar/run-voice-clone")
 async def avatar_run_voice_clone(
     ref_aud: UploadFile = File(...),
     ref_txt: str = Form(...),
@@ -2337,12 +2358,12 @@ async def avatar_run_voice_clone(
         shutil.rmtree(work, ignore_errors=True)
 
 
-@app.get("/api/avatar/config")
+@app.get(f"{HOLUMINEX_PREFIX}/api/avatar/config")
 async def avatar_config():
     return {"sample_text": AVATAR_SAMPLE_TEXT}
 
 
-@app.get("/api/avatar/voices")
+@app.get(f"{HOLUMINEX_PREFIX}/api/avatar/voices")
 async def avatar_voices():
     items: list[dict[str, str]] = []
     for p in sorted(OUTPUT_DIR.glob("*.pt"), key=lambda x: x.stat().st_mtime, reverse=True):
@@ -2353,11 +2374,11 @@ async def avatar_voices():
             parts = rest.rsplit("_", 1)
             display = parts[0] if len(parts) == 2 else rest
         display = display.replace("_", " ").strip() or "Avatar Voice"
-        items.append({"name": display, "url": f"/outputs/{p.name}"})
+        items.append({"name": display, "url": _hx(f"/outputs/{p.name}")})
     return {"items": items}
 
 
-@app.post("/api/avatar/save-customer-recording")
+@app.post(f"{HOLUMINEX_PREFIX}/api/avatar/save-customer-recording")
 async def avatar_save_customer_recording(
     audio: UploadFile = File(...),
     customer_name: str = Form("customer"),
@@ -2373,10 +2394,10 @@ async def avatar_save_customer_recording(
     status = "Recording saved."
     if prompt_text.strip():
         status = "Recording saved with prompt text."
-    return {"audio_url": f"/outputs/{out_name}", "status": status}
+    return {"audio_url": _hx(f"/outputs/{out_name}"), "status": status}
 
 
-@app.post("/api/lipsync")
+@app.post(f"{HOLUMINEX_PREFIX}/api/lipsync")
 async def lipsync_qa(
     video: UploadFile = File(...),
     question: str = Form(...),
@@ -2451,13 +2472,13 @@ async def lipsync_qa(
         )
         return {
             "answer": answer,
-            "video_url": f"/outputs/{out_name}",
+            "video_url": _hx(f"/outputs/{out_name}"),
         }
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
 
-@app.post("/api/lipsync/stream")
+@app.post(f"{HOLUMINEX_PREFIX}/api/lipsync/stream")
 async def lipsync_qa_stream(
     video: UploadFile = File(...),
     question: str = Form(...),
@@ -2641,7 +2662,7 @@ async def lipsync_qa_stream(
                             (
                                 "segment_ready",
                                 idx,
-                                f"/outputs/{pub.name}",
+                                _hx(f"/outputs/{pub.name}"),
                             )
                         )
                     await out_q.put(("lip_done", None))
@@ -2732,7 +2753,7 @@ async def lipsync_qa_stream(
                         {
                             "type": "segment_ready",
                             "index": 0,
-                            "video_url": f"/outputs/{pub.name}",
+                            "video_url": _hx(f"/outputs/{pub.name}"),
                         }
                     )
 
@@ -2756,7 +2777,7 @@ async def lipsync_qa_stream(
                     {
                         "type": "done",
                         "answer": answer,
-                        "video_url": f"/outputs/{out_name}",
+                        "video_url": _hx(f"/outputs/{out_name}"),
                         "realtime": True,
                     }
                 )
@@ -2860,7 +2881,7 @@ async def lipsync_qa_stream(
                 {
                     "type": "done",
                     "answer": answer,
-                    "video_url": f"/outputs/{out_name}",
+                    "video_url": _hx(f"/outputs/{out_name}"),
                 }
             )
             logger.info(
@@ -2885,10 +2906,15 @@ async def lipsync_qa_stream(
 # Built frontend from `frontend` → `backend/static/dist` (e.g. Docker image)
 _spa_dist = _BACKEND_DIR / "static" / "dist"
 if _spa_dist.is_dir():
-    app.mount("/", StaticFiles(directory=str(_spa_dist), html=True), name="spa")
+
+    @app.get("/")
+    async def _redirect_root_to_holuminex() -> RedirectResponse:
+        return RedirectResponse(url=f"{HOLUMINEX_PREFIX}/")
+
+    app.mount(HOLUMINEX_PREFIX, StaticFiles(directory=str(_spa_dist), html=True), name="spa")
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", "6064")), reload=True)

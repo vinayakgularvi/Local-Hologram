@@ -1,23 +1,37 @@
 import { defineConfig } from "vite";
 import vue from "@vitejs/plugin-vue";
 
+const HX = "/holuminex";
+
 export default defineConfig({
+  base: `${HX}/`,
   plugins: [
     vue(),
     {
       name: "spa-fallback-analytics",
       configureServer(server) {
+        server.middlewares.use((req, res, next) => {
+          if (req.method === "GET" && req.url) {
+            const raw = req.url.split("?")[0];
+            if (raw === "/") {
+              res.writeHead(302, { Location: `${HX}/` });
+              res.end();
+              return;
+            }
+          }
+          next();
+        });
         server.middlewares.use((req, _res, next) => {
           if (req.method !== "GET" || !req.url) {
             next();
             return;
           }
           const path = req.url.split("?")[0];
-          if (path === "/favicon.ico") {
-            req.url = "/favicon.svg";
+          if (path === `${HX}/favicon.ico`) {
+            req.url = `${HX}/favicon.svg`;
           }
-          if (path === "/analytics" || path === "/analystics") {
-            req.url = "/";
+          if (path === `${HX}/analytics` || path === `${HX}/analystics`) {
+            req.url = `${HX}/`;
           }
           next();
         });
@@ -25,13 +39,16 @@ export default defineConfig({
     },
   ],
   server: {
-    port: 5173,
+    port: 6066,
     proxy: {
-      "/api": { target: "http://127.0.0.1:8000", changeOrigin: true },
-      "/outputs": { target: "http://127.0.0.1:8000", changeOrigin: true },
-      "/offer": { target: "http://127.0.0.1:8000", changeOrigin: true },
-      "/human": { target: "http://127.0.0.1:8000", changeOrigin: true },
-      "/record": { target: "http://127.0.0.1:8000", changeOrigin: true },
+      [`${HX}/api`]: { target: "http://127.0.0.1:6064", changeOrigin: true },
+      [`${HX}/outputs`]: { target: "http://127.0.0.1:6064", changeOrigin: true },
+      [`${HX}/offer`]: { target: "http://127.0.0.1:6064", changeOrigin: true },
+      [`${HX}/human`]: { target: "http://127.0.0.1:6064", changeOrigin: true },
+      [`${HX}/record`]: { target: "http://127.0.0.1:6064", changeOrigin: true },
     },
+  },
+  preview: {
+    port: 6067,
   },
 });

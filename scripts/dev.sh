@@ -5,20 +5,20 @@
 #   npm run dev:bash     — same, via this shell script
 #   ./scripts/dev.sh     — direct
 #
-# Backend:  http://127.0.0.1:${PORT:-8000}
-# Frontend: http://127.0.0.1:5173  (proxies /api, /outputs, WebRTC paths to the backend)
+# Backend:  http://127.0.0.1:${PORT:-6064}
+# Frontend: http://127.0.0.1:6066  (proxies /api, /outputs, WebRTC paths to the backend)
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-PORT="${PORT:-8000}"
+PORT="${PORT:-6064}"
 export PORT
 
 echo "Local Hologram — dev"
 echo "  Backend:  http://127.0.0.1:${PORT}  (uvicorn --reload)"
-echo "  Frontend: http://127.0.0.1:5173     (Vite; /api → backend)"
+echo "  Frontend: http://127.0.0.1:6066     (Vite; /api → backend)"
 echo ""
 
 cleanup() {

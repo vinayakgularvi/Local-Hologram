@@ -16,7 +16,7 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PORT=8000
+    PORT=6064
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg \
@@ -34,6 +34,6 @@ RUN mkdir -p /app/backend/outputs && chown -R appuser:appuser /app/backend
 USER appuser
 WORKDIR /app/backend
 
-EXPOSE 8000
+EXPOSE 6064
 
-CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port \"${PORT:-8000}\""]
+CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port \"${PORT:-6064}\""]

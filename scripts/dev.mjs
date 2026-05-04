@@ -8,7 +8,7 @@
  *   node scripts/dev.mjs
  *
  * Environment:
- *   PORT   Backend port (default 8000). Frontend still uses Vite (5173); proxy /api to backend.
+ *   PORT   Backend port (default 6064). Frontend uses Vite (6066); proxy /api to backend.
  *
  * Shell alternative: npm run dev:bash
  */
@@ -20,7 +20,7 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "..");
-const port = String(process.env.PORT || "8000");
+const port = String(process.env.PORT || "6064");
 
 const isWin = process.platform === "win32";
 const python = process.env.PYTHON || (isWin ? "python" : "python3");
@@ -41,7 +41,7 @@ function spawnLogged(cmd, args, cwd) {
 
 console.log("Local Hologram — dev");
 console.log(`  Backend:  http://127.0.0.1:${port}  (uvicorn --reload)`);
-console.log("  Frontend: http://127.0.0.1:5173     (Vite; /api → backend)");
+console.log("  Frontend: http://127.0.0.1:6066     (Vite; /api → backend)");
 console.log("");
 
 const backend = spawnLogged(
