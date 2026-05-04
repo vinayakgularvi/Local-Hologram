@@ -74,6 +74,7 @@ from studio_integrations import (
 )
 from studio_integrations import GDRIVE_CREDENTIALS_SAVED as STUDIO_GDRIVE_CREDENTIALS_PATH
 from studio_integrations import GCS_CREDENTIALS_SAVED as STUDIO_GCS_CREDENTIALS_PATH
+from studio_live_sync import is_master_enabled, set_master_enabled
 
 _BACKEND_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _BACKEND_DIR.parent
@@ -303,7 +304,7 @@ async def _sharepoint_live_loop() -> None:
     log = logging.getLogger("lipsync")
     while True:
         try:
-            if not SHAREPOINT_LIVE_SYNC:
+            if not (SHAREPOINT_LIVE_SYNC and is_master_enabled()):
                 await asyncio.sleep(15.0)
                 continue
             if not sharepoint_is_configured():
@@ -343,7 +344,7 @@ async def _google_drive_live_loop() -> None:
     log = logging.getLogger("lipsync")
     while True:
         try:
-            if not GOOGLE_DRIVE_LIVE_SYNC:
+            if not (GOOGLE_DRIVE_LIVE_SYNC and is_master_enabled()):
                 await asyncio.sleep(15.0)
                 continue
             if not gdrive_is_configured():
@@ -383,7 +384,7 @@ async def _dropbox_live_loop() -> None:
     log = logging.getLogger("lipsync")
     while True:
         try:
-            if not DROPBOX_LIVE_SYNC:
+            if not (DROPBOX_LIVE_SYNC and is_master_enabled()):
                 await asyncio.sleep(15.0)
                 continue
             if not dropbox_is_configured():
@@ -421,7 +422,7 @@ async def _s3_live_loop() -> None:
     log = logging.getLogger("lipsync")
     while True:
         try:
-            if not S3_LIVE_SYNC:
+            if not (S3_LIVE_SYNC and is_master_enabled()):
                 await asyncio.sleep(15.0)
                 continue
             if not s3_is_configured():
@@ -459,7 +460,7 @@ async def _azure_blob_live_loop() -> None:
     log = logging.getLogger("lipsync")
     while True:
         try:
-            if not AZURE_BLOB_LIVE_SYNC:
+            if not (AZURE_BLOB_LIVE_SYNC and is_master_enabled()):
                 await asyncio.sleep(15.0)
                 continue
             if not azure_blob_is_configured():
@@ -497,7 +498,7 @@ async def _gcs_live_loop() -> None:
     log = logging.getLogger("lipsync")
     while True:
         try:
-            if not GCS_LIVE_SYNC:
+            if not (GCS_LIVE_SYNC and is_master_enabled()):
                 await asyncio.sleep(15.0)
                 continue
             if not gcs_is_configured():
@@ -1619,6 +1620,10 @@ class RagResetBody(BaseModel):
     secret: str = Field(..., min_length=1, max_length=256)
 
 
+class StudioLiveSyncBody(BaseModel):
+    master_enabled: bool
+
+
 class StudioSharePointConnect(BaseModel):
     azure_tenant_id: str = Field("", max_length=512)
     azure_client_id: str = Field("", max_length=512)
@@ -1870,6 +1875,22 @@ async def llm_config():
 async def studio_integrations_status():
     """Which connector settings are saved locally (no secret values)."""
     return studio_integrations_summary()
+
+
+@app.get(f"{HOLUMINEX_PREFIX}/api/studio/live-sync")
+async def studio_live_sync_get():
+    """Global master switch: when false, all cloud → Chroma background loops pause."""
+    return {"master_enabled": is_master_enabled()}
+
+
+@app.post(f"{HOLUMINEX_PREFIX}/api/studio/live-sync")
+async def studio_live_sync_set(body: StudioLiveSyncBody):
+    set_master_enabled(body.master_enabled)
+    return {
+        "ok": True,
+        "master_enabled": body.master_enabled,
+        "summary": studio_integrations_summary(),
+    }
 
 
 @app.post(f"{HOLUMINEX_PREFIX}/api/studio/integrations/sharepoint")

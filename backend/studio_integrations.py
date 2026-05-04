@@ -228,8 +228,16 @@ def public_summary() -> dict[str, Any]:
             "saved_keys": saved,
             "masked": {k: "set" for k in saved},
         }
+    master = True
+    try:
+        from studio_live_sync import is_master_enabled
+
+        master = is_master_enabled()
+    except Exception:
+        pass
     return {
         "integrations_file": str(INTEGRATIONS_PATH.name),
         "file_exists": INTEGRATIONS_PATH.is_file(),
         "sections": sections,
+        "live_sync_master_enabled": master,
     }

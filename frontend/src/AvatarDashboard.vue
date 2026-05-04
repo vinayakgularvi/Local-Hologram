@@ -40,6 +40,9 @@ const ragPanelMsg = ref("");
 const ragQueryText = ref("");
 const ragQueryBusy = ref(false);
 const ragQueryHits = ref([]);
+const ragQueryAnswer = ref("");
+const ragQueryGenerateError = ref("");
+const ragGenerateStreamConfigured = ref(false);
 
 const spConfig = ref(null);
 const spSyncBusy = ref(false);
@@ -59,6 +62,8 @@ const openVoiceStudioStep = ref(null);
 /** Knowledge hub: grid + detail panel */
 const activeKbSource = ref(null);
 const studioSummary = ref(null);
+const liveSyncMasterBusy = ref(false);
+const liveSyncMasterMsg = ref("");
 const spForm = ref({
   azure_tenant_id: "",
   azure_client_id: "",
@@ -371,6 +376,44 @@ async function loadStudioSummary() {
     studioSummary.value = await res.json();
   } catch {
     studioSummary.value = null;
+  }
+}
+
+const liveSyncMasterOn = computed(() => studioSummary.value?.live_sync_master_enabled !== false);
+
+async function reloadAllCloudConnectorConfigs() {
+  await Promise.all([
+    loadSharepointConfig(),
+    loadGoogleDriveConfig(),
+    loadDropboxConfig(),
+    loadS3Config(),
+    loadAzureBlobConfig(),
+    loadGcsConfig(),
+  ]);
+}
+
+async function toggleLiveSyncMaster() {
+  if (liveSyncMasterBusy.value) return;
+  liveSyncMasterBusy.value = true;
+  liveSyncMasterMsg.value = "";
+  try {
+    const next = !liveSyncMasterOn.value;
+    const res = await fetch(apiUrl("/api/studio/live-sync"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ master_enabled: next }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const d = data.detail;
+      throw new Error(typeof d === "string" ? d : JSON.stringify(d));
+    }
+    await loadStudioSummary();
+    await reloadAllCloudConnectorConfigs();
+  } catch (e) {
+    liveSyncMasterMsg.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    liveSyncMasterBusy.value = false;
   }
 }
 
@@ -944,10 +987,12 @@ async function loadRagStatus() {
     ragChunkCount.value = typeof data.chunk_count === "number" ? data.chunk_count : null;
     ragChromaPath.value = String(data.chroma_path || "");
     ragSources.value = Array.isArray(data.sources) ? data.sources : [];
+    ragGenerateStreamConfigured.value = data.rag_generate_stream_configured === true;
   } catch {
     ragChunkCount.value = null;
     ragChromaPath.value = "";
     ragSources.value = [];
+    ragGenerateStreamConfigured.value = false;
   }
 }
 
@@ -1012,6 +1057,8 @@ async function runRagQuery() {
   if (!q) return;
   ragQueryBusy.value = true;
   ragQueryHits.value = [];
+  ragQueryAnswer.value = "";
+  ragQueryGenerateError.value = "";
   try {
     const res = await fetch(apiUrl("/api/rag/query"), {
       method: "POST",
@@ -1024,8 +1071,20 @@ async function runRagQuery() {
       throw new Error(typeof d === "string" ? d : JSON.stringify(d));
     }
     ragQueryHits.value = Array.isArray(data.results) ? data.results : [];
+    if (typeof data.answer === "string" && data.answer.trim()) {
+      ragQueryAnswer.value = data.answer.trim();
+    }
+    if (data.generate_error != null && String(data.generate_error).trim()) {
+      ragQueryGenerateError.value = String(data.generate_error).trim();
+    }
     if (!ragQueryHits.value.length) {
-      ragPanelMsg.value = "No matching chunks (ingest documents first).";
+      if (!ragQueryAnswer.value && !ragQueryGenerateError.value) {
+        ragPanelMsg.value = "No matching chunks (ingest documents first).";
+      } else {
+        ragPanelMsg.value = "";
+      }
+    } else if (ragGenerateStreamConfigured.value && !ragQueryAnswer.value && !ragQueryGenerateError.value) {
+      ragPanelMsg.value = "No answer text returned from generate stream.";
     }
   } catch (e) {
     ragPanelMsg.value = e instanceof Error ? e.message : String(e);
@@ -1210,7 +1269,7 @@ function formatIso(iso) {
     <section class="studio">
       <header class="hero">
         <nav class="hero__nav">
-          <router-link class="pill pill--ghost" to="/">Live hologram</router-link>
+          <router-link class="pill pill--ghost" to="/hologram">Live hologram</router-link>
           <router-link class="pill pill--ghost" to="/analytics">Analytics</router-link>
         </nav>
         <div class="hero__title-row">
@@ -1644,6 +1703,31 @@ function formatIso(iso) {
             </button>
           </div>
 
+          <div class="kb-live-sync-toolbar">
+            <div class="kb-live-sync-toolbar__row">
+              <span class="kb-live-sync-toolbar__label">Live sync (all cloud sources)</span>
+              <button
+                type="button"
+                class="kb-live-sync-toggle"
+                :class="{ 'kb-live-sync-toggle--on': liveSyncMasterOn }"
+                role="switch"
+                :aria-checked="liveSyncMasterOn"
+                :disabled="liveSyncMasterBusy || !studioSummary"
+                :title="liveSyncMasterOn ? 'Background sync on — click to pause' : 'Background sync paused — click to resume'"
+                @click="toggleLiveSyncMaster"
+              >
+                <span class="kb-live-sync-toggle__track" aria-hidden="true">
+                  <span class="kb-live-sync-toggle__thumb" />
+                </span>
+                <span class="kb-live-sync-toggle__text">{{ liveSyncMasterOn ? "On" : "Off" }}</span>
+              </button>
+            </div>
+            <p class="status status--muted kb-live-sync-toolbar__hint">
+              Pauses automatic SharePoint, Drive, Dropbox, S3, Azure Blob, and GCS re-ingest. Manual “Sync now” still works.
+            </p>
+            <p v-if="liveSyncMasterMsg" class="status status--warn kb-live-sync-toolbar__err">{{ liveSyncMasterMsg }}</p>
+          </div>
+
           <p v-if="!activeKbSource" class="kb-hint status status--muted">Select a source above to connect or upload.</p>
 
           <div v-else class="kb-detail">
@@ -1694,8 +1778,13 @@ function formatIso(iso) {
                 </label>
                 <div class="actions">
                   <button type="button" class="btn btn--secondary" :disabled="ragQueryBusy || !ragQueryText.trim()" @click="runRagQuery">
-                    {{ ragQueryBusy ? "Searching…" : "Search index" }}
+                    {{ ragQueryBusy ? "Searching…" : ragGenerateStreamConfigured ? "Search & answer" : "Search index" }}
                   </button>
+                </div>
+                <p v-if="ragQueryGenerateError" class="status status--warn rag-answer-error">{{ ragQueryGenerateError }}</p>
+                <div v-if="ragQueryAnswer" class="rag-answer">
+                  <span class="rag-answer__label">Generated answer</span>
+                  <p class="rag-answer__text">{{ ragQueryAnswer }}</p>
                 </div>
                 <ul v-if="ragQueryHits.length" class="rag-hits">
                   <li v-for="(hit, idx) in ragQueryHits" :key="idx" class="rag-hit">
@@ -1763,6 +1852,12 @@ function formatIso(iso) {
                     <span v-else-if="spConfig.live?.last_ok === false && spConfig.live?.last_error" class="sp-live-line__err">
                       · {{ spConfig.live.last_error }}
                     </span>
+                  </p>
+                  <p
+                    v-else-if="spConfig.live_sync_env_enabled && spConfig.live_sync_master_enabled === false"
+                    class="sp-meta sp-meta--small"
+                  >
+                    Background live sync paused — turn on <strong>Live sync (all cloud sources)</strong> above.
                   </p>
                   <p v-else class="sp-meta sp-meta--small">Live sync is off (<code>SHAREPOINT_LIVE_SYNC=0</code>). Sync manually below.</p>
                   <p class="sp-meta">
@@ -1832,6 +1927,12 @@ function formatIso(iso) {
                     <span v-else-if="gdriveConfig.live?.last_ok === false && gdriveConfig.live?.last_error" class="sp-live-line__err">
                       · {{ gdriveConfig.live.last_error }}
                     </span>
+                  </p>
+                  <p
+                    v-else-if="gdriveConfig.live_sync_env_enabled && gdriveConfig.live_sync_master_enabled === false"
+                    class="sp-meta sp-meta--small"
+                  >
+                    Background live sync paused — turn on <strong>Live sync (all cloud sources)</strong> above.
                   </p>
                   <p v-else class="sp-meta sp-meta--small">Live sync is off (<code>GOOGLE_DRIVE_LIVE_SYNC=0</code>).</p>
                   <p class="sp-meta">
@@ -1911,6 +2012,12 @@ function formatIso(iso) {
                     <span v-else-if="dropboxConfig.live?.last_ok === false && dropboxConfig.live?.last_error" class="sp-live-line__err">
                       · {{ dropboxConfig.live.last_error }}
                     </span>
+                  </p>
+                  <p
+                    v-else-if="dropboxConfig.live_sync_env_enabled && dropboxConfig.live_sync_master_enabled === false"
+                    class="sp-meta sp-meta--small"
+                  >
+                    Background live sync paused — turn on <strong>Live sync (all cloud sources)</strong> above.
                   </p>
                   <p v-else class="sp-meta sp-meta--small">Live sync is off (<code>DROPBOX_LIVE_SYNC=0</code>).</p>
                   <p class="sp-meta">
@@ -2002,6 +2109,12 @@ function formatIso(iso) {
                       · {{ s3Config.live.last_error }}
                     </span>
                   </p>
+                  <p
+                    v-else-if="s3Config.live_sync_env_enabled && s3Config.live_sync_master_enabled === false"
+                    class="sp-meta sp-meta--small"
+                  >
+                    Background live sync paused — turn on <strong>Live sync (all cloud sources)</strong> above.
+                  </p>
                   <p v-else class="sp-meta sp-meta--small">Live sync is off (<code>S3_LIVE_SYNC=0</code>).</p>
                   <p class="sp-meta">
                     <span class="sp-meta__k">Bucket</span> {{ s3Config.bucket_hint || "—" }}
@@ -2075,6 +2188,12 @@ function formatIso(iso) {
                     <span v-else-if="azureBlobConfig.live?.last_ok === false && azureBlobConfig.live?.last_error" class="sp-live-line__err">
                       · {{ azureBlobConfig.live.last_error }}
                     </span>
+                  </p>
+                  <p
+                    v-else-if="azureBlobConfig.live_sync_env_enabled && azureBlobConfig.live_sync_master_enabled === false"
+                    class="sp-meta sp-meta--small"
+                  >
+                    Background live sync paused — turn on <strong>Live sync (all cloud sources)</strong> above.
                   </p>
                   <p v-else class="sp-meta sp-meta--small">Live sync is off (<code>AZURE_BLOB_LIVE_SYNC=0</code>).</p>
                   <p class="sp-meta">
@@ -2154,6 +2273,12 @@ function formatIso(iso) {
                     <span v-else-if="gcsConfig.live?.last_ok === false && gcsConfig.live?.last_error" class="sp-live-line__err">
                       · {{ gcsConfig.live.last_error }}
                     </span>
+                  </p>
+                  <p
+                    v-else-if="gcsConfig.live_sync_env_enabled && gcsConfig.live_sync_master_enabled === false"
+                    class="sp-meta sp-meta--small"
+                  >
+                    Background live sync paused — turn on <strong>Live sync (all cloud sources)</strong> above.
                   </p>
                   <p v-else class="sp-meta sp-meta--small">Live sync is off (<code>GCS_LIVE_SYNC=0</code>).</p>
                   <p class="sp-meta">
@@ -2698,7 +2823,7 @@ function formatIso(iso) {
               <div class="studio-form-grid">
                 <label class="field studio-form-grid__full">
                   <span>Ollama / API base URL</span>
-                  <input v-model="llmForm.ollama_base" type="text" placeholder="http://127.0.0.1:6065" autocomplete="off" />
+                  <input v-model="llmForm.ollama_base" type="text" placeholder="http://127.0.0.1:11434" autocomplete="off" />
                 </label>
                 <label class="field studio-form-grid__full">
                   <span>Model name</span>
@@ -3267,6 +3392,10 @@ input[type="password"]:focus {
   font-style: italic;
 }
 
+.status--warn {
+  color: #b45309;
+}
+
 .mini-check {
   list-style: none;
   margin: 0.85rem 0 0;
@@ -3540,6 +3669,32 @@ input[type="password"]:focus {
   font-size: 0.86rem;
   line-height: 1.45;
   color: #334155;
+}
+
+.rag-answer {
+  margin: 0.65rem 0 0;
+  padding: 0.65rem 0.75rem;
+  border-radius: 12px;
+  background: linear-gradient(135deg, rgba(14, 165, 233, 0.08), rgba(99, 102, 241, 0.08));
+  border: 1px solid rgba(99, 102, 241, 0.28);
+}
+
+.rag-answer__label {
+  display: block;
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #6366f1;
+  margin-bottom: 0.35rem;
+}
+
+.rag-answer__text {
+  margin: 0;
+  font-size: 0.88rem;
+  line-height: 1.5;
+  color: #1e293b;
+  white-space: pre-wrap;
 }
 
 .flow-card--sp {
@@ -3942,6 +4097,112 @@ input[type="password"]:focus {
   border-radius: 6px;
   background: rgba(16, 185, 129, 0.2);
   color: #047857;
+}
+
+.kb-live-sync-toolbar {
+  margin-top: 0.75rem;
+  padding: 0.65rem 0.85rem;
+  border-radius: 14px;
+  background: linear-gradient(135deg, rgba(13, 148, 136, 0.08), rgba(99, 102, 241, 0.06));
+  border: 1px solid rgba(13, 148, 136, 0.22);
+}
+
+.kb-live-sync-toolbar__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.kb-live-sync-toolbar__label {
+  font-size: 0.88rem;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.kb-live-sync-toolbar__hint {
+  margin: 0.45rem 0 0 !important;
+  font-size: 0.78rem !important;
+}
+
+.kb-live-sync-toolbar__err {
+  margin: 0.4rem 0 0 !important;
+  font-size: 0.8rem !important;
+}
+
+.kb-live-sync-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.25rem 0.45rem 0.25rem 0.35rem;
+  border: none;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.75);
+  cursor: pointer;
+  font: inherit;
+  color: #334155;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+  transition:
+    background 0.2s ease,
+    box-shadow 0.2s ease,
+    opacity 0.2s ease;
+}
+
+.kb-live-sync-toggle:hover:not(:disabled) {
+  background: #fff;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
+.kb-live-sync-toggle:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.kb-live-sync-toggle__track {
+  position: relative;
+  width: 2.35rem;
+  height: 1.28rem;
+  border-radius: 999px;
+  background: #cbd5e1;
+  flex-shrink: 0;
+  transition: background 0.22s ease;
+}
+
+.kb-live-sync-toggle--on .kb-live-sync-toggle__track {
+  background: linear-gradient(120deg, #0d9488, #14b8a6);
+}
+
+.kb-live-sync-toggle__thumb {
+  position: absolute;
+  top: 0.14rem;
+  left: 0.14rem;
+  width: 1rem;
+  height: 1rem;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
+  transition:
+    transform 0.22s ease,
+    box-shadow 0.2s ease;
+}
+
+.kb-live-sync-toggle--on .kb-live-sync-toggle__thumb {
+  transform: translateX(1.05rem);
+  box-shadow: 0 1px 6px rgba(13, 148, 136, 0.45);
+}
+
+.kb-live-sync-toggle__text {
+  font-size: 0.78rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  min-width: 1.75rem;
+  color: #64748b;
+}
+
+.kb-live-sync-toggle--on .kb-live-sync-toggle__text {
+  color: #0d9488;
 }
 
 .kb-hint {

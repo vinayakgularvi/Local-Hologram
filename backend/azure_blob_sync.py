@@ -85,6 +85,12 @@ def public_config() -> dict[str, Any]:
     ctr = os.environ.get("AZURE_BLOB_CONTAINER", "").strip()
     hint = ctr[:10] + "…" if len(ctr) > 12 else (ctr or "—")
     live_env = os.environ.get("AZURE_BLOB_LIVE_SYNC", "1").strip().lower() in ("1", "true", "yes")
+    try:
+        from studio_live_sync import live_sync_flags_for_connector
+
+        ls = live_sync_flags_for_connector(live_env)
+    except Exception:
+        ls = {"live_sync_env_enabled": live_env, "live_sync_master_enabled": True, "live_sync_enabled": live_env}
     interval = max(30, _env_int("AZURE_BLOB_SYNC_INTERVAL_SEC", 90))
     auth = "connection_string" if os.environ.get("AZURE_STORAGE_CONNECTION_STRING", "").strip() else (
         "account_key" if is_configured() else "none"
@@ -96,7 +102,7 @@ def public_config() -> dict[str, Any]:
         "max_files": _env_int("AZURE_BLOB_MAX_FILES", 80),
         "max_depth": _env_int("AZURE_BLOB_MAX_DEPTH", 8),
         "max_bytes_per_file": _env_int("AZURE_BLOB_MAX_BYTES", 25 * 1024 * 1024),
-        "live_sync_enabled": live_env,
+        **ls,
         "sync_interval_sec": interval,
         "auth_mode": auth if is_configured() else "none",
         "live": dict(_live),

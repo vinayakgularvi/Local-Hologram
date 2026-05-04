@@ -87,6 +87,12 @@ def public_config() -> dict[str, Any]:
         "true",
         "yes",
     )
+    try:
+        from studio_live_sync import live_sync_flags_for_connector
+
+        ls = live_sync_flags_for_connector(live_env)
+    except Exception:
+        ls = {"live_sync_env_enabled": live_env, "live_sync_master_enabled": True, "live_sync_enabled": live_env}
     interval = max(30, _env_int("SHAREPOINT_SYNC_INTERVAL_SEC", 90))
     return {
         "configured": is_configured(),
@@ -95,7 +101,7 @@ def public_config() -> dict[str, Any]:
         "max_files": _env_int("SHAREPOINT_MAX_FILES", 80),
         "max_depth": _env_int("SHAREPOINT_MAX_DEPTH", 6),
         "max_bytes_per_file": _env_int("SHAREPOINT_MAX_BYTES", 25 * 1024 * 1024),
-        "live_sync_enabled": live_env,
+        **ls,
         "sync_interval_sec": interval,
         "live": dict(_live),
     }
