@@ -30,7 +30,7 @@ All browser-facing routes and the HTTP API share a configurable path prefix (def
    ```bash
    cd backend
    python3 -m venv .venv
-   source .venv/bin/activate
+   source .venv/bin/activate   # Windows: .venv\Scripts\activate
    pip install -r requirements.txt
    cd ..
    ```
