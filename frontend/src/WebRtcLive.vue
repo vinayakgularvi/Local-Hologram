@@ -54,9 +54,9 @@ function apiOrigin() {
   if (fromEnv) return fromEnv;
   if (typeof window !== "undefined") {
     const port = window.location.port;
-    const host = window.location.hostname;
+    // Vite dev/preview: use same origin so /holuminex/* hits the dev proxy (avoids hardcoded :6064 when PORT differs).
     if (port === "6066" || port === "6067") {
-      return `http://${host}:6064`;
+      return "";
     }
   }
   return "";

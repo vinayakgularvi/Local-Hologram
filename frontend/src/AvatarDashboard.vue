@@ -207,8 +207,7 @@ function apiUrl(path) {
   if (base) return `${base}${p}`;
   if (typeof window !== "undefined") {
     const port = window.location.port;
-    const host = window.location.hostname;
-    if (port === "6066" || port === "6067") return `http://${host}:6064${p}`;
+    if (port === "6066" || port === "6067") return p;
   }
   return p;
 }

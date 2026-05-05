@@ -81,6 +81,8 @@ _BACKEND_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _BACKEND_DIR.parent
 load_dotenv(_REPO_ROOT / ".env")
 load_dotenv(_BACKEND_DIR / ".env")
+
+_webrtc_proxy_log = logging.getLogger("local_hologram.webrtc_proxy")
 apply_studio_integrations_to_environ()
 
 # URL prefix for all HTTP routes, static mounts, and browser-facing paths (match Vite `base`).
@@ -644,6 +646,11 @@ async def _store_gradio_file(candidate: Any, *, prefix: str, fallback_ext: str) 
     return _hx(f"/outputs/{out_name}")
 
 
+def _webrtc_signaling_verify_tls() -> bool:
+    v = os.environ.get("WEBRTC_SIGNALING_VERIFY_TLS", "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
 async def _forward_webrtc_post(subpath: str, request: Request) -> Response:
     """Forward JSON POST body to LiveTalking (or compatible) signaling server."""
     if not WEBRTC_SIGNALING_BASE:
@@ -657,14 +664,37 @@ async def _forward_webrtc_post(subpath: str, request: Request) -> Response:
     url = f"{WEBRTC_SIGNALING_BASE}{subpath}"
     body = await request.body()
     ct = request.headers.get("content-type") or "application/json"
+    verify = _webrtc_signaling_verify_tls()
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=30.0)) as client:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(300.0, connect=30.0),
+            verify=verify,
+        ) as client:
             r = await client.post(url, content=body, headers={"Content-Type": ct})
     except httpx.HTTPError as e:
+        _webrtc_proxy_log.warning("WebRTC proxy transport error POST %s: %s", url, e)
         raise HTTPException(
             status_code=502,
             detail=f"Upstream WebRTC signaling server unreachable: {e}",
         ) from e
+    except Exception as e:
+        _webrtc_proxy_log.exception("WebRTC proxy unexpected error POST %s", url)
+        raise HTTPException(
+            status_code=502,
+            detail=f"WebRTC signaling proxy failed: {type(e).__name__}: {e}",
+        ) from e
+    if r.status_code >= 400:
+        snippet = ""
+        try:
+            snippet = (r.text or "")[:2000]
+        except Exception:
+            snippet = r.content[:2000].decode(errors="replace")
+        _webrtc_proxy_log.warning(
+            "WebRTC upstream POST %s -> HTTP %s body=%s",
+            url,
+            r.status_code,
+            snippet.replace("\r", " ").replace("\n", " ")[:500],
+        )
     out_headers: dict[str, str] = {}
     if v := r.headers.get("content-type"):
         out_headers["content-type"] = v

@@ -2,6 +2,8 @@ import { defineConfig } from "vite";
 import vue from "@vitejs/plugin-vue";
 
 const HX = "/holuminex";
+/** Must match uvicorn `PORT` from `npm run dev` (scripts/dev.mjs). */
+const backendOrigin = `http://127.0.0.1:${process.env.PORT || "6064"}`;
 
 export default defineConfig({
   base: `${HX}/`,
@@ -41,11 +43,11 @@ export default defineConfig({
   server: {
     port: 6066,
     proxy: {
-      [`${HX}/api`]: { target: "http://127.0.0.1:6064", changeOrigin: true },
-      [`${HX}/outputs`]: { target: "http://127.0.0.1:6064", changeOrigin: true },
-      [`${HX}/offer`]: { target: "http://127.0.0.1:6064", changeOrigin: true },
-      [`${HX}/human`]: { target: "http://127.0.0.1:6064", changeOrigin: true },
-      [`${HX}/record`]: { target: "http://127.0.0.1:6064", changeOrigin: true },
+      [`${HX}/api`]: { target: backendOrigin, changeOrigin: true },
+      [`${HX}/outputs`]: { target: backendOrigin, changeOrigin: true },
+      [`${HX}/offer`]: { target: backendOrigin, changeOrigin: true },
+      [`${HX}/human`]: { target: backendOrigin, changeOrigin: true },
+      [`${HX}/record`]: { target: backendOrigin, changeOrigin: true },
     },
   },
   preview: {
