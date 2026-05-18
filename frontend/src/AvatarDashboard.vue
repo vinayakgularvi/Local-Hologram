@@ -42,6 +42,14 @@ const ragQueryHits = ref([]);
 const ragQueryAnswer = ref("");
 const ragQueryGenerateError = ref("");
 const ragGenerateStreamConfigured = ref(false);
+const ragHoluminexAnswerEligible = ref(false);
+/** Server RAG_QUERY_ANSWER_MODE (.env) — RAG answers follow this automatically (no per-query override in Studio). */
+const ragQueryAnswerModeEnv = ref("auto");
+const ragQueryBackendHint = ref("");
+
+const ragCanAnswer = computed(
+  () => ragGenerateStreamConfigured.value || ragHoluminexAnswerEligible.value
+);
 
 const spConfig = ref(null);
 const spSyncBusy = ref(false);
@@ -358,6 +366,96 @@ function toggleLlmSource(id) {
   activeLlmSource.value = activeLlmSource.value === id ? null : id;
 }
 
+/** Default external RAG UI when no imported connect JSON provides rag_playground_url. */
+const LOCAL_HOLUMINEX_RAG_FALLBACK =
+  String(import.meta.env.VITE_LOCAL_HOLUMINEX_RAG_URL || "http://localhost:5010/holuminex_rag/").trim() ||
+  "http://localhost:5010/holuminex_rag/";
+
+const localRagExternalUrl = computed(() => {
+  const u = llmConfig.value?.holuminex_connect?.rag_playground_url;
+  if (u && String(u).trim()) return String(u).trim();
+  return LOCAL_HOLUMINEX_RAG_FALLBACK;
+});
+
+const localLlmTileTitle = computed(() =>
+  llmConfig.value?.holuminex_connect?.configured ? "Holuminex (Studio chat)" : "Gateway (Ollama / OpenAI)"
+);
+
+const localLlmTileMeta = computed(() => {
+  if (llmConfig.value?.holuminex_connect?.configured) {
+    return llmConfig.value?.provider === "local" ? "Chat active · provider Local" : "Chat active · voice + RAG";
+  }
+  return llmConfig.value?.provider === "local" ? "Active provider" : "No connect JSON";
+});
+
+const holuminexFileInput = ref(null);
+const holuminexImportBusy = ref(false);
+const holuminexImportStatus = ref("");
+const holuminexPlaygroundOverride = ref("");
+
+function openLocalRagPlayground() {
+  window.open(localRagExternalUrl.value, "_blank", "noopener,noreferrer");
+}
+
+async function onHoluminexConnectFile(ev) {
+  const input = ev.target;
+  const file = input?.files?.[0];
+  if (!file) return;
+  holuminexImportStatus.value = "";
+  holuminexImportBusy.value = true;
+  try {
+    const text = await file.text();
+    const data = JSON.parse(text);
+    if (typeof data !== "object" || data === null || Array.isArray(data)) {
+      throw new Error("JSON root must be an object.");
+    }
+    const merged = { ...data };
+    const pg = holuminexPlaygroundOverride.value.trim();
+    if (pg) merged.rag_playground_url = pg;
+    const res = await fetch(apiUrl("/api/studio/holuminex-connect"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(merged),
+    });
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      const d = errBody.detail;
+      throw new Error(typeof d === "string" ? d : JSON.stringify(d));
+    }
+    holuminexImportStatus.value =
+      "Connect JSON saved on this server (persisted to disk). Mic voice turns and RAG answers use chat_post_url when this connect is active.";
+    await loadLlmConfig();
+    await loadRagStatus();
+    if (llmConfig.value?.holuminex_connect?.rag_playground_url) {
+      holuminexPlaygroundOverride.value = String(llmConfig.value.holuminex_connect.rag_playground_url).trim();
+    }
+  } catch (e) {
+    holuminexImportStatus.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    holuminexImportBusy.value = false;
+    if (input) input.value = "";
+  }
+}
+
+async function clearHoluminexConnect() {
+  if (!window.confirm("Remove saved Holuminex connect JSON from this server?")) return;
+  holuminexImportStatus.value = "";
+  try {
+    const res = await fetch(apiUrl("/api/studio/holuminex-connect"), { method: "DELETE" });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const d = data.detail;
+      throw new Error(typeof d === "string" ? d : JSON.stringify(d));
+    }
+    holuminexImportStatus.value = "Removed.";
+    holuminexPlaygroundOverride.value = "";
+    await loadLlmConfig();
+    await loadRagStatus();
+  } catch (e) {
+    holuminexImportStatus.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
 function toggleVectorDbSource(id) {
   activeVectorDbSource.value = activeVectorDbSource.value === id ? null : id;
 }
@@ -478,6 +576,7 @@ async function connectLlmStudio(provider) {
     llmForm.value.google_api_key = "";
     await loadLlmConfig();
     await loadStudioSummary();
+    await loadRagStatus();
   } catch (e) {
     llmSaveStatus.value = e instanceof Error ? e.message : String(e);
   } finally {
@@ -747,6 +846,7 @@ async function clearStudioIntegration(section) {
     await loadAzureBlobConfig();
     await loadGcsConfig();
     await loadLlmConfig();
+    await loadRagStatus();
   } catch (e) {
     window.alert(e instanceof Error ? e.message : String(e));
   }
@@ -984,11 +1084,16 @@ async function loadRagStatus() {
     ragChromaPath.value = String(data.chroma_path || "");
     ragSources.value = Array.isArray(data.sources) ? data.sources : [];
     ragGenerateStreamConfigured.value = data.rag_generate_stream_configured === true;
+    ragHoluminexAnswerEligible.value = data.rag_answer_holuminex_eligible === true;
+    if (typeof data.rag_query_answer_mode === "string" && ["auto", "external_stream", "holuminex"].includes(data.rag_query_answer_mode)) {
+      ragQueryAnswerModeEnv.value = data.rag_query_answer_mode;
+    }
   } catch {
     ragChunkCount.value = null;
     ragChromaPath.value = "";
     ragSources.value = [];
     ragGenerateStreamConfigured.value = false;
+    ragHoluminexAnswerEligible.value = false;
   }
 }
 
@@ -1055,6 +1160,7 @@ async function runRagQuery() {
   ragQueryHits.value = [];
   ragQueryAnswer.value = "";
   ragQueryGenerateError.value = "";
+  ragQueryBackendHint.value = "";
   try {
     const res = await fetch(apiUrl("/api/rag/query"), {
       method: "POST",
@@ -1073,14 +1179,19 @@ async function runRagQuery() {
     if (data.generate_error != null && String(data.generate_error).trim()) {
       ragQueryGenerateError.value = String(data.generate_error).trim();
     }
+    const eff = typeof data.answer_source_effective === "string" ? data.answer_source_effective : "";
+    const be = typeof data.answer_backend === "string" ? data.answer_backend : "";
+    if (eff || be) {
+      ragQueryBackendHint.value = [eff && `mode: ${eff}`, be && `backend: ${be}`].filter(Boolean).join(" · ");
+    }
     if (!ragQueryHits.value.length) {
       if (!ragQueryAnswer.value && !ragQueryGenerateError.value) {
         ragPanelMsg.value = "No matching chunks (ingest documents first).";
       } else {
         ragPanelMsg.value = "";
       }
-    } else if (ragGenerateStreamConfigured.value && !ragQueryAnswer.value && !ragQueryGenerateError.value) {
-      ragPanelMsg.value = "No answer text returned from generate stream.";
+    } else if (ragCanAnswer.value && !ragQueryAnswer.value && !ragQueryGenerateError.value) {
+      ragPanelMsg.value = "No answer text returned from the selected answer backend.";
     }
   } catch (e) {
     ragPanelMsg.value = e instanceof Error ? e.message : String(e);
@@ -1772,11 +1883,18 @@ function formatIso(iso) {
                   <span>Try a semantic search (debug)</span>
                   <textarea v-model="ragQueryText" rows="2" placeholder="Ask what your documents might answer…" />
                 </label>
+                <p class="status status--muted kb-detail__fine">
+                  Generated answers use the server’s active policy:
+                  <code>RAG_QUERY_ANSWER_MODE={{ ragQueryAnswerModeEnv }}</code>
+                  (reload status after changing <code>.env</code>). <code>auto</code> prefers imported Holuminex connect over
+                  <code>RAG_GENERATE_STREAM_URL</code> when both apply.
+                </p>
                 <div class="actions">
                   <button type="button" class="btn btn--secondary" :disabled="ragQueryBusy || !ragQueryText.trim()" @click="runRagQuery">
-                    {{ ragQueryBusy ? "Searching…" : ragGenerateStreamConfigured ? "Search & answer" : "Search index" }}
+                    {{ ragQueryBusy ? "Searching…" : ragCanAnswer ? "Search & answer" : "Search index" }}
                   </button>
                 </div>
+                <p v-if="ragQueryBackendHint" class="status status--muted kb-detail__fine">{{ ragQueryBackendHint }}</p>
                 <p v-if="ragQueryGenerateError" class="status status--warn rag-answer-error">{{ ragQueryGenerateError }}</p>
                 <div v-if="ragQueryAnswer" class="rag-answer">
                   <span class="rag-answer__label">Generated answer</span>
@@ -2710,8 +2828,9 @@ function formatIso(iso) {
             <div>
               <h3>LLM provider</h3>
               <p class="flow-card__sub">
-                Choose where chat completions run for voice turns, RAG answers, and lip-sync Q&amp;A. Cloud keys stay on the
-                server; paste a new key only when rotating.
+                Cloud LLM keys for lip-sync and Studio tools stay on the server. Mic voice and Chroma RAG answers use the
+                imported Holuminex connect (<code>chat_post_url</code>) whenever that file is present, ahead of the external
+                RAG stream URL.
               </p>
             </div>
           </div>
@@ -2725,8 +2844,8 @@ function formatIso(iso) {
             >
               <div class="kb-tile__main">
                 <span class="kb-tile__brand kb-tile__brand--local">Local</span>
-                <span class="kb-tile__title">Ollama / OpenAI-compatible</span>
-                <span class="kb-tile__meta">{{ llmConfig?.provider === "local" ? "Active" : "Inactive" }}</span>
+                <span class="kb-tile__title">{{ localLlmTileTitle }}</span>
+                <span class="kb-tile__meta">{{ localLlmTileMeta }}</span>
               </div>
               <span class="kb-tile__icon kb-tile__icon--local" aria-hidden="true">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
@@ -2813,41 +2932,49 @@ function formatIso(iso) {
             <div v-show="activeLlmSource === 'llm_local'" class="kb-detail__panel">
               <h4 class="kb-detail__h">Local server</h4>
               <p class="status status--muted kb-detail__fine">
-                Same as <code>OLLAMA_BASE</code> + <code>OLLAMA_MODEL</code>. Use <code>MODEL_API_STYLE=openai</code> for
-                <code>/v1/chat/completions</code> gateways.
+                Import Holuminex connect JSON so mic voice and RAG answers call your <code>chat_post_url</code>. Use
+                <strong>RAG Playground</strong> for the external RAG UI (URL from <code>rag_playground_url</code> in the JSON,
+                or <code>VITE_LOCAL_HOLUMINEX_RAG_URL</code> at build time).
               </p>
               <div class="studio-form-grid">
                 <label class="field studio-form-grid__full">
-                  <span>Ollama / API base URL</span>
-                  <input v-model="llmForm.ollama_base" type="text" placeholder="http://127.0.0.1:11434" autocomplete="off" />
+                  <span>Import Holuminex connect JSON</span>
+                  <input
+                    ref="holuminexFileInput"
+                    type="file"
+                    accept="application/json,.json"
+                    :disabled="holuminexImportBusy"
+                    @change="onHoluminexConnectFile"
+                  />
                 </label>
                 <label class="field studio-form-grid__full">
-                  <span>Model name</span>
-                  <input v-model="llmForm.ollama_model" type="text" placeholder="llama3.2" autocomplete="off" />
-                </label>
-                <label class="field studio-form-grid__full">
-                  <span>API style</span>
-                  <select v-model="llmForm.model_api_style">
-                    <option value="auto">auto</option>
-                    <option value="openai">openai (chat completions)</option>
-                    <option value="ollama">ollama (native generate)</option>
-                  </select>
+                  <span>External RAG playground URL (optional, merged as <code>rag_playground_url</code> on import)</span>
+                  <input
+                    v-model="holuminexPlaygroundOverride"
+                    type="text"
+                    placeholder="http://localhost:5010/holuminex_rag/"
+                    autocomplete="off"
+                  />
                 </label>
               </div>
               <div class="actions">
-                <button type="button" class="btn" :disabled="llmSaveBusy" @click="connectLlmStudio('local')">
-                  {{ llmSaveBusy ? "Saving…" : "Save & use local" }}
-                </button>
+                <button type="button" class="btn" @click="openLocalRagPlayground">RAG Playground</button>
                 <button
-                  v-if="studioSummary?.sections?.llm?.has_saved"
                   type="button"
                   class="btn btn--secondary"
-                  @click="clearStudioIntegration('llm')"
+                  :disabled="holuminexImportBusy || !llmConfig?.holuminex_connect?.configured"
+                  @click="clearHoluminexConnect"
                 >
-                  Clear saved LLM
+                  Remove connect JSON
                 </button>
               </div>
-              <p v-if="llmSaveStatus" class="status">{{ llmSaveStatus }}</p>
+              <p v-if="holuminexImportStatus" class="status">{{ holuminexImportStatus }}</p>
+              <p v-if="llmConfig?.holuminex_connect?.configured" class="status status--muted kb-detail__fine">
+                Holuminex chat endpoint:
+                <code>{{ llmConfig.holuminex_connect.chat_post_url }}</code>
+                — mic <code>/api/voice-turn</code> and Studio RAG search use this when connect is saved and
+                <code>RAG_QUERY_ANSWER_MODE=auto</code> (default), ahead of <code>RAG_GENERATE_STREAM_URL</code>.
+              </p>
               <template v-if="llmConfig">
                 <p class="sp-meta sp-meta--small">
                   Active provider: <strong>{{ llmConfig.provider }}</strong>

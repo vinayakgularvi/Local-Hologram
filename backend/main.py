@@ -79,6 +79,13 @@ from studio_integrations import (
 from studio_integrations import GDRIVE_CREDENTIALS_SAVED as STUDIO_GDRIVE_CREDENTIALS_PATH
 from studio_integrations import GCS_CREDENTIALS_SAVED as STUDIO_GCS_CREDENTIALS_PATH
 from studio_live_sync import is_master_enabled, set_master_enabled
+from holuminex_connect import (
+    chat_complete as holuminex_chat_complete,
+    delete_config as holuminex_delete_config,
+    is_configured as holuminex_is_configured,
+    public_info as holuminex_public_info,
+    save_config as holuminex_save_config,
+)
 
 _BACKEND_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _BACKEND_DIR.parent
@@ -122,6 +129,11 @@ def _llm_provider() -> str:
     if v in ("openai", "anthropic", "google"):
         return v
     return "local"
+
+
+def _studio_holuminex_chat_active() -> bool:
+    """True when Studio saved Holuminex connect JSON (valid chat_post_url). Mic voice + RAG answers use it when active."""
+    return holuminex_is_configured()
 
 
 def _google_gemini_api_key() -> str:
@@ -224,6 +236,10 @@ VOICE_RAG_MAX_CONTEXT_CHARS = max(400, _env_first_int("VOICE_RAG_MAX_CONTEXT_CHA
 RAG_GENERATE_STREAM_URL = os.environ.get("RAG_GENERATE_STREAM_URL", "").strip()
 RAG_GENERATE_STREAM_TIMEOUT_SEC = max(5.0, float(_env_first_int("RAG_GENERATE_STREAM_TIMEOUT_SEC", default=120)))
 RAG_GENERATE_STREAM_MAX_CHARS = max(2000, _env_first_int("RAG_GENERATE_STREAM_MAX_CHARS", default=400_000))
+# POST /api/rag/query answer synthesis: auto = same as voice-turn (Local + Holuminex connect beats stream URL);
+# external_stream = always use RAG_GENERATE_STREAM_URL when set; holuminex = prefer Holuminex when eligible, else stream.
+_RAG_Q_MODE_RAW = os.environ.get("RAG_QUERY_ANSWER_MODE", "auto").strip().lower()
+RAG_QUERY_ANSWER_MODE = _RAG_Q_MODE_RAW if _RAG_Q_MODE_RAW in ("auto", "external_stream", "holuminex") else "auto"
 
 # SharePoint → Chroma: background sync (see _sharepoint_live_loop)
 SHAREPOINT_LIVE_SYNC = os.environ.get("SHAREPOINT_LIVE_SYNC", "1").strip().lower() in (
@@ -1412,6 +1428,7 @@ def _llm_public_config() -> dict[str, Any]:
             "base_url": gg_url,
             "model": gg_model,
         },
+        "holuminex_connect": holuminex_public_info(),
     }
 
 
@@ -1428,6 +1445,8 @@ async def health():
         "rag_generate_stream_configured": bool(
             RAG_GENERATE_STREAM_URL and _rag_generate_stream_url_valid(RAG_GENERATE_STREAM_URL)
         ),
+        "rag_query_answer_mode": RAG_QUERY_ANSWER_MODE,
+        "rag_answer_holuminex_eligible": _studio_holuminex_chat_active(),
     }
     try:
         rag_info.update(rag_get_status())
@@ -1458,6 +1477,7 @@ async def health():
         "webrtc_signaling_proxy": bool(WEBRTC_SIGNALING_BASE),
         "avatar_api_base": AVATAR_API_BASE,
         "rag": rag_info,
+        "holuminex_connect": holuminex_public_info(),
         "sharepoint": {
             **sharepoint_public_config(),
         },
@@ -1631,29 +1651,50 @@ def split_voice_answer_receipt(raw: str) -> tuple[str, dict[str, Any] | None, in
 @app.post("/api/voice-turn")
 async def voice_turn(body: VoiceTurnBody):
     """
-    Browser STT text → optional ChromaDB RAG → reply from RAG_GENERATE_STREAM_URL when set, else Ollama
-    → client sends speak_text to LiveTalking /human.
+    Browser STT text → optional ChromaDB RAG → reply from Studio-imported Holuminex connect when present, else
+    RAG_GENERATE_STREAM_URL when set, else Ollama → client sends speak_text to LiveTalking /human.
     """
     user_text = body.text.strip()
     if not user_text:
         raise HTTPException(status_code=400, detail="text is empty.")
-    prompt, rag_meta, chroma_hits = await asyncio.to_thread(_build_voice_llm_prompt, user_text)
     t0 = time.perf_counter()
     ollama_metrics: dict[str, Any] = {}
-    use_rag_stream = bool(RAG_GENERATE_STREAM_URL) and _rag_generate_stream_url_valid(RAG_GENERATE_STREAM_URL)
-    if use_rag_stream:
-        rag_meta["llm"] = "rag_generate_stream"
-        conversation = _build_voice_rag_stream_conversation(user_text, chroma_hits)
+    use_holuminex = _studio_holuminex_chat_active()
+    use_rag_stream = (
+        not use_holuminex
+        and bool(RAG_GENERATE_STREAM_URL)
+        and _rag_generate_stream_url_valid(RAG_GENERATE_STREAM_URL)
+    )
+    if use_holuminex:
+        rag_meta: dict[str, Any] = {
+            "enabled": True,
+            "used": False,
+            "chunks": 0,
+            "llm": "holuminex_connect",
+            "note": "Replies use the Holuminex chat_post_url from Studio-imported connect JSON (prompts/RAG live in that service).",
+        }
         try:
-            answer = await _collect_rag_generate_stream(RAG_GENERATE_STREAM_URL, conversation)
+            answer = await holuminex_chat_complete(user_text)
         except HTTPException:
             raise
         except Exception as e:
-            logger.warning("RAG generate stream (voice-turn) failed: %s", e)
-            raise HTTPException(status_code=502, detail=f"RAG generate stream failed: {e}") from e
+            logger.warning("Holuminex chat (voice-turn) failed: %s", e)
+            raise HTTPException(status_code=502, detail=f"Holuminex chat failed: {e}") from e
     else:
-        rag_meta["llm"] = "ollama"
-        answer = await ollama_generate(prompt, ollama_metrics, max_tokens=VOICE_MAX_TOKENS)
+        prompt, rag_meta, chroma_hits = await asyncio.to_thread(_build_voice_llm_prompt, user_text)
+        if use_rag_stream:
+            rag_meta["llm"] = "rag_generate_stream"
+            conversation = _build_voice_rag_stream_conversation(user_text, chroma_hits)
+            try:
+                answer = await _collect_rag_generate_stream(RAG_GENERATE_STREAM_URL, conversation)
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.warning("RAG generate stream (voice-turn) failed: %s", e)
+                raise HTTPException(status_code=502, detail=f"RAG generate stream failed: {e}") from e
+        else:
+            rag_meta["llm"] = "ollama"
+            answer = await ollama_generate(prompt, ollama_metrics, max_tokens=VOICE_MAX_TOKENS)
     if not (answer or "").strip():
         raise HTTPException(status_code=502, detail="Model returned an empty reply.")
     speak_text, receipt, order_done_num = split_voice_answer_receipt(answer)
@@ -1743,6 +1784,34 @@ async def analytics_reset(body: AnalyticsResetBody):
 class RagQueryBody(BaseModel):
     query: str = Field(..., min_length=1, max_length=4000)
     n_results: int = Field(6, ge=1, le=30)
+    answer_source: str | None = Field(
+        None,
+        max_length=32,
+        description="Override RAG_QUERY_ANSWER_MODE for this request: auto | external_stream | holuminex",
+    )
+
+
+def _effective_rag_query_answer_mode(answer_source: str | None) -> str:
+    raw = (answer_source or "").strip().lower()
+    if raw in ("auto", "external_stream", "holuminex"):
+        return raw
+    return RAG_QUERY_ANSWER_MODE
+
+
+def _rag_query_answer_backends(mode: str) -> tuple[bool, bool]:
+    """Return (use_holuminex, use_external_stream) for POST /api/rag/query."""
+    stream_ok = bool(RAG_GENERATE_STREAM_URL) and _rag_generate_stream_url_valid(RAG_GENERATE_STREAM_URL)
+    holuminex_ok = _studio_holuminex_chat_active()
+    if mode == "external_stream":
+        return False, stream_ok
+    if mode == "holuminex":
+        if holuminex_ok:
+            return True, False
+        return False, stream_ok
+    # auto — match voice_turn: Holuminex wins when Local + connect file is valid
+    if holuminex_ok:
+        return True, False
+    return False, stream_ok
 
 
 def _rag_generate_stream_url_valid(url: str) -> bool:
@@ -1900,6 +1969,8 @@ async def rag_status():
     base["rag_generate_stream_configured"] = bool(
         RAG_GENERATE_STREAM_URL and _rag_generate_stream_url_valid(RAG_GENERATE_STREAM_URL)
     )
+    base["rag_query_answer_mode"] = RAG_QUERY_ANSWER_MODE
+    base["rag_answer_holuminex_eligible"] = _studio_holuminex_chat_active()
     return base
 
 
@@ -1940,7 +2011,7 @@ async def rag_ingest(files: list[UploadFile] = File(...)):
 
 @app.post("/api/rag/query")
 async def rag_query(body: RagQueryBody):
-    """Semantic search over ingested documents; optionally calls RAG_GENERATE_STREAM_URL for an answer."""
+    """Semantic search over ingested documents; optional answer via Holuminex (Local) and/or RAG_GENERATE_STREAM_URL."""
     try:
         out = query_documents(body.query.strip(), body.n_results)
     except Exception as e:
@@ -1948,20 +2019,30 @@ async def rag_query(body: RagQueryBody):
     out = dict(out)
     out["answer"] = None
     out["generate_error"] = None
-    if not RAG_GENERATE_STREAM_URL:
+    mode = _effective_rag_query_answer_mode(body.answer_source)
+    out["answer_source_requested"] = (body.answer_source or "").strip() or None
+    out["answer_source_effective"] = mode
+    use_holuminex, use_stream = _rag_query_answer_backends(mode)
+    out["answer_backend"] = None
+    if use_holuminex:
+        out["answer_backend"] = "holuminex_connect"
+        try:
+            out["answer"] = await holuminex_chat_complete(body.query.strip())
+        except Exception as e:
+            logger.warning("Holuminex chat (rag query) failed: %s", e)
+            out["generate_error"] = str(e)
         return out
-    if not _rag_generate_stream_url_valid(RAG_GENERATE_STREAM_URL):
-        out["generate_error"] = "Invalid RAG_GENERATE_STREAM_URL (use http/https with a host)."
-        return out
-    results = out.get("results") if isinstance(out.get("results"), list) else []
-    conversation = _build_rag_generate_conversation(body.query.strip(), results)
-    try:
-        out["answer"] = await _collect_rag_generate_stream(RAG_GENERATE_STREAM_URL, conversation)
-    except HTTPException as e:
-        out["generate_error"] = str(e.detail) if isinstance(e.detail, str) else json.dumps(e.detail)
-    except Exception as e:
-        logger.warning("RAG generate stream failed: %s", e)
-        out["generate_error"] = str(e)
+    if use_stream:
+        out["answer_backend"] = "rag_generate_stream"
+        results = out.get("results") if isinstance(out.get("results"), list) else []
+        conversation = _build_rag_generate_conversation(body.query.strip(), results)
+        try:
+            out["answer"] = await _collect_rag_generate_stream(RAG_GENERATE_STREAM_URL, conversation)
+        except HTTPException as e:
+            out["generate_error"] = str(e.detail) if isinstance(e.detail, str) else json.dumps(e.detail)
+        except Exception as e:
+            logger.warning("RAG generate stream failed: %s", e)
+            out["generate_error"] = str(e)
     return out
 
 
@@ -2231,6 +2312,33 @@ async def llm_config():
 async def studio_integrations_status():
     """Which connector settings are saved locally (no secret values)."""
     return studio_integrations_summary()
+
+
+@app.get("/api/studio/holuminex-connect")
+async def studio_holuminex_connect_get():
+    """Imported Holuminex RAG connect JSON (non-secret summary)."""
+    return holuminex_public_info()
+
+
+@app.post("/api/studio/holuminex-connect")
+async def studio_holuminex_connect_save(request: Request):
+    try:
+        data = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}") from e
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object.")
+    try:
+        holuminex_save_config(data)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"ok": True, "holuminex": holuminex_public_info(), "summary": studio_integrations_summary()}
+
+
+@app.delete("/api/studio/holuminex-connect")
+async def studio_holuminex_connect_delete():
+    holuminex_delete_config()
+    return {"ok": True, "holuminex": holuminex_public_info(), "summary": studio_integrations_summary()}
 
 
 class StudioLiveSyncBody(BaseModel):
