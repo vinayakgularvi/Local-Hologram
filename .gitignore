@@ -5,6 +5,8 @@ backend/.venv/
 backend/__pycache__/
 backend/outputs/
 backend/data/chroma/
+backend/data/avatar_studio.db
+backend/data/analytics.db
 backend/data/studio_integrations.json
 backend/data/studio_gdrive_credentials.json
 backend/data/studio_gcs_credentials.json

@@ -30,6 +30,17 @@ from gradio_client import Client, handle_file
 from pydantic import BaseModel, Field
 
 from analytics_store import clear_all, get_recent_voice_turns, get_summary, init_db, record_voice_turn
+from avatar_assets_store import (
+    get_audio as livetalking_db_get_audio,
+    get_video as livetalking_db_get_video,
+    init_db as init_avatar_assets_db,
+    latest_prepare_run,
+    list_audios as livetalking_db_list_audios,
+    list_videos as livetalking_db_list_videos,
+    record_prepare_run,
+    upsert_audio as livetalking_db_upsert_audio,
+    upsert_video as livetalking_db_upsert_video,
+)
 from rag_store import (
     delete_source,
     get_status as rag_get_status,
@@ -196,7 +207,38 @@ LIPSYNC_CHUNK_PARALLEL = max(1, _env_first_int("LIPSYNC_CHUNK_PARALLEL", default
 
 # LiveTalking-style WebRTC signaling (POST /offer, /human, /record) — proxied to this origin when set
 WEBRTC_SIGNALING_BASE = os.environ.get("WEBRTC_SIGNALING_BASE", "").strip().rstrip("/")
+HOLOGRAM_UPLOAD_TIMEOUT_SEC = max(60.0, float(_env_first_int("HOLOGRAM_UPLOAD_TIMEOUT_SEC", default=600)))
+HOLOGRAM_PREPARE_TIMEOUT_SEC = max(120.0, float(_env_first_int("HOLOGRAM_PREPARE_TIMEOUT_SEC", default=900)))
+_HOLOGRAM_ASSET_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
+_HOLOGRAM_SERVER_PATH_RE = re.compile(r"^/[\w./-]+$")
 AVATAR_API_BASE = os.environ.get("AVATAR_API_BASE", "http://10.29.145.124:9000").strip().rstrip("/")
+AVATAR_VIDEO_API_BASE = os.environ.get("AVATAR_VIDEO_API_BASE", "http://10.29.145.124:8002").strip().rstrip("/")
+AVATAR_VIDEO_GENERATE_TIMEOUT_SEC = max(60.0, float(_env_first_int("AVATAR_VIDEO_GENERATE_TIMEOUT_SEC", default=600)))
+AVATAR_VIDEO_JOB_TIMEOUT_SEC = max(30.0, float(_env_first_int("AVATAR_VIDEO_JOB_TIMEOUT_SEC", default=120)))
+_AVATAR_VIDEO_JOB_ID_RE = re.compile(r"^[a-f0-9]{32}$")
+AVATAR_VIDEO_PROMPT = (
+    "Preserve the exact same person from the source image with identical face structure, eyes, "
+    "nose, skin tone, hairstyle, and clothing. Do not change identity or facial features. Apply "
+    "only the body motion and camera movement from the reference video. Maintain consistent facial "
+    "appearance across all frames with realistic anatomy, cinematic lighting, and natural motion."
+)
+AVATAR_VIDEO_NEGATIVE_PROMPT = (
+    "different person, face distortion, identity change, different face, mutated face, blurry face, "
+    "extra limbs, unrealistic face, deformed anatomy"
+)
+AVATAR_VIDEO_FIXED_FORM: dict[str, str] = {
+    "prompt": AVATAR_VIDEO_PROMPT,
+    "negative_prompt": AVATAR_VIDEO_NEGATIVE_PROMPT,
+    "height": "1280",
+    "width": "768",
+    "num_frames": "240",
+    "frame_rate": "30",
+    "seed": "42",
+    "image_frame_index": "0",
+    "image_strength": "0.9",
+    "control_strength": "0.5",
+    "lora_strength": "0.6",
+}
 AVATAR_SAMPLE_TEXT = os.environ.get(
     "AVATAR_SAMPLE_TEXT",
     (
@@ -635,6 +677,7 @@ async def _on_startup() -> None:
             "or set CORS_ALLOW_PRIVATE_NETWORK=1 for the dev-style LAN regex."
         )
     init_db()
+    init_avatar_assets_db()
     global _background_tasks
     _background_tasks = []
     # Always run idle loops so Studio can toggle live sync without restarting the API.
@@ -1483,6 +1526,278 @@ async def health():
 async def webrtc_proxy_status():
     """Whether POST /offer, /human, /record are forwarded to WEBRTC_SIGNALING_BASE."""
     return {"signaling_proxy_configured": bool(WEBRTC_SIGNALING_BASE)}
+
+
+def _livetalking_base() -> str:
+    if not WEBRTC_SIGNALING_BASE:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "WEBRTC_SIGNALING_BASE is not set. "
+                "Set it in .env to your LiveTalking server origin (e.g. http://127.0.0.1:8010)."
+            ),
+        )
+    return WEBRTC_SIGNALING_BASE
+
+
+def _hologram_asset_id(value: str, field: str) -> str:
+    v = (value or "").strip()
+    if not _HOLOGRAM_ASSET_ID_RE.fullmatch(v):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid {field} (use letters, numbers, underscore, hyphen; max 64 chars).",
+        )
+    return v
+
+
+def _hologram_server_path(value: str, field: str) -> str:
+    p = (value or "").strip()
+    if not p or len(p) > 512 or ".." in p or not _HOLOGRAM_SERVER_PATH_RE.fullmatch(p):
+        raise HTTPException(status_code=400, detail=f"Invalid {field}.")
+    return p
+
+
+def _livetalking_json_response(r: httpx.Response, *, context: str) -> dict[str, Any]:
+    if r.status_code >= 400:
+        body = r.text[:800] if r.text else ""
+        raise HTTPException(
+            status_code=502,
+            detail=f"{context} failed ({r.status_code}): {body}",
+        )
+    try:
+        payload = r.json()
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"{context} returned invalid JSON.",
+        ) from e
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail=f"{context} returned unexpected payload.")
+    code = payload.get("code")
+    if code is not None and int(code) != 0:
+        msg = payload.get("msg") or payload.get("message") or "Hologram avatar server error"
+        raise HTTPException(status_code=502, detail=str(msg))
+    data = payload.get("data")
+    if isinstance(data, dict):
+        return data
+    return payload
+
+
+async def _hologram_upload_file(
+    *,
+    subpath: str,
+    asset_id_field: str,
+    asset_id: str,
+    upload: UploadFile,
+    prefix: str,
+) -> dict[str, Any]:
+    base = _livetalking_base()
+    work = Path(tempfile.mkdtemp(prefix=prefix))
+    try:
+        ext = Path(upload.filename or "asset").suffix or ""
+        local_path = work / f"upload{ext}"
+        with local_path.open("wb") as f:
+            shutil.copyfileobj(upload.file, f)
+        fname = upload.filename or f"upload{ext or '.bin'}"
+        ctype = upload.content_type or "application/octet-stream"
+        timeout = httpx.Timeout(HOLOGRAM_UPLOAD_TIMEOUT_SEC, connect=30.0)
+        try:
+            with local_path.open("rb") as fh:
+                files = [("file", (fname, fh, ctype))]
+                data = {asset_id_field: asset_id}
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    r = await client.post(
+                        f"{base}{subpath}",
+                        data=data,
+                        files=files,
+                    )
+        except httpx.HTTPError as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Hologram avatar upload unreachable: {e}",
+            ) from e
+        return _livetalking_json_response(r, context=subpath)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+class AvatarHologramPrepareBody(BaseModel):
+    profile_id: str = Field(..., min_length=1, max_length=64)
+    avatar_id: str = Field(..., min_length=1, max_length=64)
+    video_id: str = Field(..., min_length=1, max_length=64)
+    audio_id: str = Field(..., min_length=1, max_length=64)
+    force_regenerate: bool = False
+    set_as_default: bool = True
+    ref_text: str = ""
+
+
+async def _livetalking_prepare_payload(
+    *,
+    profile_id: str,
+    avatar_id: str,
+    video_id: str,
+    audio_id: str,
+    video_path: str,
+    audio_path: str,
+    force_regenerate: bool,
+    set_as_default: bool,
+    ref_text: str,
+) -> dict[str, Any]:
+    base = _livetalking_base()
+    payload = {
+        "profile_id": _hologram_asset_id(profile_id, "profile_id"),
+        "avatar_id": _hologram_asset_id(avatar_id, "avatar_id"),
+        "video_id": _hologram_asset_id(video_id, "video_id"),
+        "video_path": _hologram_server_path(video_path, "video_path"),
+        "audio_id": _hologram_asset_id(audio_id, "audio_id"),
+        "audio_path": _hologram_server_path(audio_path, "audio_path"),
+        "force_regenerate": bool(force_regenerate),
+        "set_as_default": bool(set_as_default),
+        "ref_text": (ref_text or "").strip(),
+    }
+    timeout = httpx.Timeout(HOLOGRAM_PREPARE_TIMEOUT_SEC, connect=30.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.post(
+                f"{base}/api/avatar/prepare",
+                json=payload,
+                headers={"Accept": "application/json", "Content-Type": "application/json"},
+            )
+    except httpx.HTTPError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Hologram avatar prepare unreachable: {e}",
+        ) from e
+    return _livetalking_json_response(r, context="avatar prepare")
+
+
+def _public_video_asset(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "video_id": row["video_id"],
+        "filename": row.get("filename"),
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+    }
+
+
+def _public_audio_asset(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "audio_id": row["audio_id"],
+        "filename": row.get("filename"),
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+    }
+
+
+@app.get("/api/avatar/hologram/assets")
+async def avatar_hologram_assets():
+    latest = latest_prepare_run()
+    if latest is not None:
+        latest = {
+            k: v
+            for k, v in latest.items()
+            if k not in ("result_json", "video_path", "audio_path")
+        }
+    return {
+        "hologram_avatar_configured": bool(WEBRTC_SIGNALING_BASE),
+        "videos": [_public_video_asset(r) for r in livetalking_db_list_videos()],
+        "audios": [_public_audio_asset(r) for r in livetalking_db_list_audios()],
+        "latest_prepare": latest,
+    }
+
+
+@app.post("/api/avatar/hologram/upload/video")
+async def avatar_hologram_upload_video(
+    file: UploadFile = File(...),
+    video_id: str = Form(...),
+):
+    vid = _hologram_asset_id(video_id, "video_id")
+    remote = await _hologram_upload_file(
+        subpath="/api/upload/video",
+        asset_id_field="video_id",
+        asset_id=vid,
+        upload=file,
+        prefix="lt_vid_",
+    )
+    path = remote.get("path")
+    if not isinstance(path, str) or not path.strip():
+        raise HTTPException(status_code=502, detail="Video upload returned no path.")
+    saved = livetalking_db_upsert_video(
+        video_id=vid,
+        path=path.strip(),
+        filename=str(remote.get("filename") or file.filename or ""),
+        remote_stored_at=remote.get("stored_at") if isinstance(remote.get("stored_at"), int) else None,
+    )
+    return {"saved": _public_video_asset(saved)}
+
+
+@app.post("/api/avatar/hologram/upload/audio")
+async def avatar_hologram_upload_audio(
+    file: UploadFile = File(...),
+    audio_id: str = Form(...),
+):
+    aid = _hologram_asset_id(audio_id, "audio_id")
+    remote = await _hologram_upload_file(
+        subpath="/api/upload/audio",
+        asset_id_field="audio_id",
+        asset_id=aid,
+        upload=file,
+        prefix="lt_aud_",
+    )
+    path = remote.get("path")
+    if not isinstance(path, str) or not path.strip():
+        raise HTTPException(status_code=502, detail="Audio upload returned no path.")
+    saved = livetalking_db_upsert_audio(
+        audio_id=aid,
+        path=path.strip(),
+        filename=str(remote.get("filename") or file.filename or ""),
+        remote_stored_at=remote.get("stored_at") if isinstance(remote.get("stored_at"), int) else None,
+    )
+    return {"saved": _public_audio_asset(saved)}
+
+
+@app.post("/api/avatar/hologram/prepare")
+async def avatar_hologram_prepare(body: AvatarHologramPrepareBody):
+    vid = _hologram_asset_id(body.video_id, "video_id")
+    aid = _hologram_asset_id(body.audio_id, "audio_id")
+    video_row = livetalking_db_get_video(vid)
+    audio_row = livetalking_db_get_audio(aid)
+    if not video_row:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No saved video for video_id '{vid}'. Upload it from Avatar Video first.",
+        )
+    if not audio_row:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No saved audio for audio_id '{aid}'. Upload it from Avatar voice first.",
+        )
+    video_path = str(video_row["path"])
+    audio_path = str(audio_row["path"])
+    prepared = await _livetalking_prepare_payload(
+        profile_id=body.profile_id,
+        avatar_id=body.avatar_id,
+        video_id=vid,
+        audio_id=aid,
+        video_path=video_path,
+        audio_path=audio_path,
+        force_regenerate=body.force_regenerate,
+        set_as_default=body.set_as_default,
+        ref_text=body.ref_text,
+    )
+    record_prepare_run(
+        profile_id=_hologram_asset_id(body.profile_id, "profile_id"),
+        avatar_id=_hologram_asset_id(body.avatar_id, "avatar_id"),
+        video_id=vid,
+        audio_id=aid,
+        video_path=video_path,
+        audio_path=audio_path,
+        ref_text=(body.ref_text or "").strip(),
+        set_as_default=body.set_as_default,
+        force_regenerate=body.force_regenerate,
+        result=prepared,
+    )
+    return prepared
 
 
 def _build_voice_llm_prompt(user_text: str) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
@@ -2741,7 +3056,134 @@ async def avatar_run_voice_clone(
 
 @app.get("/api/avatar/config")
 async def avatar_config():
-    return {"sample_text": AVATAR_SAMPLE_TEXT}
+    return {
+        "sample_text": AVATAR_SAMPLE_TEXT,
+        "hologram_avatar_configured": bool(WEBRTC_SIGNALING_BASE),
+    }
+
+
+def _avatar_video_job_id(job_id: str) -> str:
+    jid = (job_id or "").strip().lower()
+    if not _AVATAR_VIDEO_JOB_ID_RE.fullmatch(jid):
+        raise HTTPException(status_code=400, detail="Invalid job id.")
+    return jid
+
+
+def _avatar_video_api_required() -> str:
+    if not AVATAR_VIDEO_API_BASE:
+        raise HTTPException(
+            status_code=503,
+            detail="AVATAR_VIDEO_API_BASE is not set. Configure it in .env (e.g. http://10.29.145.124:8002).",
+        )
+    return AVATAR_VIDEO_API_BASE
+
+
+@app.post("/api/avatar/video/generate")
+async def avatar_video_generate(
+    image: UploadFile = File(...),
+    reference_video: UploadFile = File(...),
+):
+    """Forward controlled avatar video generation (fixed prompt/parameters)."""
+    base = _avatar_video_api_required()
+    work = Path(tempfile.mkdtemp(prefix="avatar_video_"))
+    try:
+        img_ext = Path(image.filename or "image.png").suffix or ".png"
+        vid_ext = Path(reference_video.filename or "reference.mp4").suffix or ".mp4"
+        img_path = work / f"image{img_ext}"
+        vid_path = work / f"reference{vid_ext}"
+        with img_path.open("wb") as f:
+            shutil.copyfileobj(image.file, f)
+        with vid_path.open("wb") as f:
+            shutil.copyfileobj(reference_video.file, f)
+
+        img_name = image.filename or f"image{img_ext}"
+        vid_name = reference_video.filename or f"reference{vid_ext}"
+        img_ct = image.content_type or "application/octet-stream"
+        vid_ct = reference_video.content_type or "video/mp4"
+        timeout = httpx.Timeout(AVATAR_VIDEO_GENERATE_TIMEOUT_SEC, connect=30.0)
+        try:
+            with img_path.open("rb") as img_f, vid_path.open("rb") as vid_f:
+                files = [
+                    ("image", (img_name, img_f, img_ct)),
+                    ("reference_video", (vid_name, vid_f, vid_ct)),
+                ]
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    r = await client.post(
+                        f"{base}/generate-controlled",
+                        data=AVATAR_VIDEO_FIXED_FORM,
+                        files=files,
+                    )
+        except httpx.HTTPError as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Avatar video service unreachable: {e}",
+            ) from e
+        if r.status_code >= 400:
+            body = r.text[:800] if r.text else ""
+            raise HTTPException(
+                status_code=502,
+                detail=f"Avatar video generate failed ({r.status_code}): {body}",
+            )
+        try:
+            return r.json()
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=502, detail="Avatar video service returned invalid JSON.") from e
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@app.get("/api/avatar/video/jobs/{job_id}")
+async def avatar_video_job_status(job_id: str):
+    base = _avatar_video_api_required()
+    jid = _avatar_video_job_id(job_id)
+    url = f"{base}/jobs/{jid}"
+    timeout = httpx.Timeout(AVATAR_VIDEO_JOB_TIMEOUT_SEC, connect=15.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(url)
+    except httpx.HTTPError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Avatar video service unreachable: {e}",
+        ) from e
+    if r.status_code >= 400:
+        body = r.text[:800] if r.text else ""
+        raise HTTPException(
+            status_code=502,
+            detail=f"Avatar video job status failed ({r.status_code}): {body}",
+        )
+    try:
+        return r.json()
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=502, detail="Avatar video service returned invalid JSON.") from e
+
+
+@app.get("/api/avatar/video/jobs/{job_id}/video")
+async def avatar_video_job_video(job_id: str):
+    base = _avatar_video_api_required()
+    jid = _avatar_video_job_id(job_id)
+    url = f"{base}/jobs/{jid}/video"
+    timeout = httpx.Timeout(AVATAR_VIDEO_GENERATE_TIMEOUT_SEC, connect=30.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(url)
+    except httpx.HTTPError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Avatar video service unreachable: {e}",
+        ) from e
+    if r.status_code >= 400:
+        body = r.text[:800] if r.text else ""
+        raise HTTPException(
+            status_code=502,
+            detail=f"Avatar video download failed ({r.status_code}): {body}",
+        )
+    out_headers: dict[str, str] = {}
+    if v := r.headers.get("content-type"):
+        out_headers["content-type"] = v
+    if v := r.headers.get("content-disposition"):
+        out_headers["content-disposition"] = v
+    return Response(content=r.content, status_code=200, headers=out_headers)
 
 
 @app.get("/api/avatar/voices")

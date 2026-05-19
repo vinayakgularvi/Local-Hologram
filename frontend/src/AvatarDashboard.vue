@@ -26,6 +26,17 @@ const generateStatus = ref("");
 const generateAudioUrl = ref("");
 
 const voiceCount = computed(() => voicesAvailable.value.length);
+const avatarVideoSucceeded = computed(
+  () => avatarVideoJobStatus.value === "succeeded" && Boolean(avatarVideoUrl.value),
+);
+
+function hologramAssetLabel(item, idKey) {
+  if (!item) return "";
+  const id = item[idKey] || "";
+  const name = item.filename;
+  return name ? `${id} (${name})` : id;
+}
+
 const hasSavedRecording = computed(() => Boolean(customerSaveUrl.value));
 const hasVoiceProfile = computed(() => Boolean(voiceProfileUrl.value));
 const hasVoiceFileReady = computed(() => Boolean(selectedVoiceFile.value));
@@ -57,6 +68,37 @@ const dropboxSyncSummary = ref("");
 
 /** Avatar voice hub: which step panel is open (1–3) */
 const openVoiceStudioStep = ref(null);
+
+const avatarVideoImageFile = ref(null);
+const avatarVideoImagePreview = ref("");
+const avatarVideoRefFile = ref(null);
+const avatarVideoRefPreview = ref("");
+const avatarVideoBusy = ref(false);
+const avatarVideoStatus = ref("");
+const avatarVideoJobId = ref("");
+const avatarVideoJobStatus = ref("");
+const avatarVideoUrl = ref("");
+
+const hologramAvatarConfigured = ref(false);
+const hologramGeneratedVideoId = ref("gen_video_1");
+const hologramAudioId = ref("ref_audio_1");
+const hologramUploadGeneratedVideoBusy = ref(false);
+const hologramUploadAudioBusy = ref(false);
+const hologramUploadGeneratedVideoStatus = ref("");
+const hologramUploadAudioStatus = ref("");
+const hologramSavedVideos = ref([]);
+const hologramSavedAudios = ref([]);
+const hologramPrepareForm = ref({
+  profile_id: "new_profile",
+  avatar_id: "new_avatar",
+  video_id: "",
+  audio_id: "",
+  ref_text: "",
+  force_regenerate: false,
+  set_as_default: true,
+});
+const hologramPrepareBusy = ref(false);
+const hologramPrepareStatus = ref("");
 
 /** Knowledge hub: grid + detail panel */
 const activeKbSource = ref(null);
@@ -217,8 +259,154 @@ function toPreview(file) {
 async function postForm(path, fd) {
   const res = await fetch(apiUrl(path), { method: "POST", body: fd });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.detail || data.error || `Request failed (${res.status})`);
+  if (!res.ok) throw new Error(apiErrorMessage(data, res.status));
   return data;
+}
+
+function apiErrorMessage(data, status) {
+  const d = data?.detail;
+  if (typeof d === "string") return d;
+  if (Array.isArray(d)) return d.map((x) => x?.msg || x).join("; ");
+  return data?.error || `Request failed (${status})`;
+}
+
+async function postJson(path, body) {
+  const res = await fetch(apiUrl(path), {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(apiErrorMessage(data, res.status));
+  return data;
+}
+
+async function loadHologramAvatarAssets() {
+  try {
+    const res = await fetch(apiUrl("/api/avatar/hologram/assets"));
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return;
+    hologramAvatarConfigured.value = data.hologram_avatar_configured === true;
+    hologramSavedVideos.value = Array.isArray(data.videos) ? data.videos : [];
+    hologramSavedAudios.value = Array.isArray(data.audios) ? data.audios : [];
+    const pf = hologramPrepareForm.value;
+    if (!pf.video_id && hologramSavedVideos.value.length) {
+      pf.video_id = hologramSavedVideos.value[0].video_id || "";
+    }
+    if (!pf.audio_id && hologramSavedAudios.value.length) {
+      pf.audio_id = hologramSavedAudios.value[0].audio_id || "";
+    }
+    const latest = data.latest_prepare;
+    if (latest?.profile_id && !pf.profile_id) pf.profile_id = latest.profile_id;
+    if (latest?.avatar_id && pf.avatar_id === "new_avatar") pf.avatar_id = latest.avatar_id;
+  } catch {
+    hologramAvatarConfigured.value = false;
+  }
+}
+
+async function uploadHologramGeneratedVideo() {
+  if (!avatarVideoSucceeded.value) {
+    hologramUploadGeneratedVideoStatus.value = "Wait until generated video status is succeeded.";
+    return;
+  }
+  const vid = hologramGeneratedVideoId.value.trim();
+  if (!vid) {
+    hologramUploadGeneratedVideoStatus.value = "Video ID is required.";
+    return;
+  }
+  hologramUploadGeneratedVideoBusy.value = true;
+  hologramUploadGeneratedVideoStatus.value = "Uploading generated video…";
+  try {
+    const res = await fetch(avatarVideoUrl.value);
+    if (!res.ok) throw new Error(`Unable to download generated video (${res.status}).`);
+    const blob = await res.blob();
+    const file = new File([blob], `${vid}.mp4`, { type: blob.type || "video/mp4" });
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("video_id", vid);
+    const out = await postForm("/api/avatar/hologram/upload/video", fd);
+    hologramUploadGeneratedVideoStatus.value = `Saved as "${vid}".`;
+    hologramPrepareForm.value.video_id = vid;
+    await loadHologramAvatarAssets();
+  } catch (e) {
+    hologramUploadGeneratedVideoStatus.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    hologramUploadGeneratedVideoBusy.value = false;
+  }
+}
+
+async function resolveVoiceFileForHologramAvatar() {
+  if (selectedVoiceFile.value) return selectedVoiceFile.value;
+  if (voiceProfileUrl.value) {
+    const res = await fetch(apiUrl(voiceProfileUrl.value));
+    if (!res.ok) throw new Error(`Unable to fetch voice profile (${res.status}).`);
+    const blob = await res.blob();
+    return new File([blob], "voice_profile.pt", { type: blob.type || "application/octet-stream" });
+  }
+  return null;
+}
+
+async function uploadHologramVoiceAudio() {
+  if (!hologramAudioId.value.trim()) {
+    hologramUploadAudioStatus.value = "Audio ID is required.";
+    return;
+  }
+  hologramUploadAudioBusy.value = true;
+  hologramUploadAudioStatus.value = "Uploading audio…";
+  try {
+    const file = await resolveVoiceFileForHologramAvatar();
+    if (!file) {
+      hologramUploadAudioStatus.value = "Load or create a voice profile (.pt) first.";
+      return;
+    }
+    const aid = hologramAudioId.value.trim();
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("audio_id", aid);
+    await postForm("/api/avatar/hologram/upload/audio", fd);
+    hologramUploadAudioStatus.value = `Saved as "${aid}".`;
+    hologramPrepareForm.value.audio_id = aid;
+    await loadHologramAvatarAssets();
+  } catch (e) {
+    hologramUploadAudioStatus.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    hologramUploadAudioBusy.value = false;
+  }
+}
+
+async function prepareHologramAvatar() {
+  const f = hologramPrepareForm.value;
+  if (!f.profile_id.trim() || !f.avatar_id.trim() || !f.video_id.trim() || !f.audio_id.trim()) {
+    hologramPrepareStatus.value = "Profile, avatar, and saved video/audio IDs are required.";
+    return;
+  }
+  if (!hologramAvatarConfigured.value) {
+    hologramPrepareStatus.value = "Hologram server is not configured.";
+    return;
+  }
+  hologramPrepareBusy.value = true;
+  hologramPrepareStatus.value = "Preparing…";
+  try {
+    const out = await postJson("/api/avatar/hologram/prepare", {
+      profile_id: f.profile_id.trim(),
+      avatar_id: f.avatar_id.trim(),
+      video_id: f.video_id.trim(),
+      audio_id: f.audio_id.trim(),
+      ref_text: f.ref_text.trim(),
+      force_regenerate: f.force_regenerate,
+      set_as_default: f.set_as_default,
+    });
+    hologramPrepareStatus.value = out.default_profile_updated
+      ? "Prepared and set as default."
+      : out.generated_now
+        ? "Generated."
+        : "Already prepared.";
+    await loadHologramAvatarAssets();
+  } catch (e) {
+    hologramPrepareStatus.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    hologramPrepareBusy.value = false;
+  }
 }
 
 function cleanStatusText(v) {
@@ -231,8 +419,10 @@ async function loadConfig() {
     if (!res.ok) throw new Error("Unable to load avatar config.");
     const data = await res.json();
     promptText.value = String(data.sample_text || "").trim();
+    hologramAvatarConfigured.value = data.hologram_avatar_configured === true;
   } catch {
     promptText.value = "Please read this script clearly while recording your voice.";
+    hologramAvatarConfigured.value = false;
   }
 }
 
@@ -1212,9 +1402,95 @@ async function generateVoice() {
 }
 
 let syncSourcesPollId = null;
+let avatarVideoPollId = null;
+
+function onAvatarVideoImage(ev) {
+  const f = ev.target.files?.[0];
+  avatarVideoImageFile.value = f || null;
+  avatarVideoImagePreview.value = f ? toPreview(f) : "";
+}
+
+function onAvatarVideoRef(ev) {
+  const f = ev.target.files?.[0];
+  avatarVideoRefFile.value = f || null;
+  avatarVideoRefPreview.value = f ? toPreview(f) : "";
+}
+
+function stopAvatarVideoPolling() {
+  if (avatarVideoPollId != null) {
+    window.clearInterval(avatarVideoPollId);
+    avatarVideoPollId = null;
+  }
+}
+
+async function pollAvatarVideoJob() {
+  if (!avatarVideoJobId.value) return;
+  try {
+    const res = await fetch(apiUrl(`/api/avatar/video/jobs/${avatarVideoJobId.value}`));
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || data.error || `Status check failed (${res.status})`);
+    avatarVideoJobStatus.value = String(data.status || "");
+    if (data.status === "succeeded") {
+      avatarVideoUrl.value = apiUrl(`/api/avatar/video/jobs/${avatarVideoJobId.value}/video`);
+      avatarVideoStatus.value = "Video ready.";
+      const shortId = avatarVideoJobId.value.slice(0, 8);
+      if (!hologramGeneratedVideoId.value.trim() || hologramGeneratedVideoId.value === "gen_video_1") {
+        hologramGeneratedVideoId.value = `gen_${shortId}`;
+      }
+      hologramUploadGeneratedVideoStatus.value = "";
+      stopAvatarVideoPolling();
+      avatarVideoBusy.value = false;
+    } else if (data.status === "failed" || data.error) {
+      avatarVideoStatus.value = String(data.error || "Job failed.");
+      stopAvatarVideoPolling();
+      avatarVideoBusy.value = false;
+    } else {
+      avatarVideoStatus.value = `Status: ${data.status || "unknown"}`;
+    }
+  } catch (e) {
+    avatarVideoStatus.value = e instanceof Error ? e.message : String(e);
+    stopAvatarVideoPolling();
+    avatarVideoBusy.value = false;
+  }
+}
+
+function startAvatarVideoPolling() {
+  stopAvatarVideoPolling();
+  avatarVideoPollId = window.setInterval(() => void pollAvatarVideoJob(), 3000);
+  void pollAvatarVideoJob();
+}
+
+async function startAvatarVideo() {
+  if (!avatarVideoImageFile.value) return void (avatarVideoStatus.value = "Upload a source image.");
+  if (!avatarVideoRefFile.value) return void (avatarVideoStatus.value = "Upload a reference video.");
+  avatarVideoBusy.value = true;
+  avatarVideoStatus.value = "Submitting job…";
+  avatarVideoJobId.value = "";
+  avatarVideoJobStatus.value = "";
+  avatarVideoUrl.value = "";
+  hologramUploadGeneratedVideoStatus.value = "";
+  stopAvatarVideoPolling();
+  try {
+    const fd = new FormData();
+    fd.append("image", avatarVideoImageFile.value);
+    fd.append("reference_video", avatarVideoRefFile.value);
+    const out = await postForm("/api/avatar/video/generate", fd);
+    avatarVideoJobId.value = String(out.id || "");
+    avatarVideoJobStatus.value = String(out.status || "queued");
+    avatarVideoStatus.value = avatarVideoJobId.value
+      ? `Job queued (${avatarVideoJobId.value}). Waiting for render…`
+      : "Job submitted.";
+    if (avatarVideoJobId.value) startAvatarVideoPolling();
+    else avatarVideoBusy.value = false;
+  } catch (e) {
+    avatarVideoStatus.value = e instanceof Error ? e.message : String(e);
+    avatarVideoBusy.value = false;
+  }
+}
 
 onMounted(() => {
   void loadConfig();
+  void loadHologramAvatarAssets();
   void loadVoices();
   void loadRagStatus();
   void loadSharepointConfig();
@@ -1238,6 +1514,7 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
+  stopAvatarVideoPolling();
   if (syncSourcesPollId != null) {
     window.clearInterval(syncSourcesPollId);
     syncSourcesPollId = null;
@@ -1272,10 +1549,7 @@ function formatIso(iso) {
           <h1>Avatar Studio</h1>
           <span v-if="voiceCount" class="chip">{{ voiceCount }} voice{{ voiceCount === 1 ? "" : "s" }} on server</span>
         </div>
-        <p class="hero__lede">
-          Record against the sample script, clone a voice profile, synthesize speech — and plug in a knowledge base from
-          your documents (ChromaDB RAG).
-        </p>
+        <p class="hero__lede">Avatar video, voice, hologram setup, and knowledge-base tools.</p>
       </header>
 
       <div class="studio-stack">
@@ -1284,55 +1558,109 @@ function formatIso(iso) {
             <span class="step-badge step-badge--video">AV</span>
             <div>
               <h3>Avatar Video</h3>
-              <p class="flow-card__sub">
-                Lip-sync video workflows, presets, and exports — <strong>coming soon</strong>.
-              </p>
             </div>
           </div>
-          <div class="studio-hub-grid" role="list" aria-label="Avatar video (coming soon)">
-            <div class="kb-tile kb-tile--disabled" role="listitem" aria-disabled="true">
-              <div class="kb-tile__main">
-                <span class="kb-tile__brand kb-tile__brand--video">Lip-sync</span>
-                <span class="kb-tile__title">Templates &amp; timing</span>
-                <span class="kb-tile__meta">Coming soon</span>
+
+          <div class="video-hub-panel">
+            <div class="video-hub-row">
+              <div class="video-hub-slot">
+                <label class="field field--video-slot">
+                  <span>Source image</span>
+                  <input type="file" accept="image/*" @change="onAvatarVideoImage" />
+                </label>
+                <div
+                  class="video-hub-preview"
+                  :class="{ 'video-hub-preview--empty': !avatarVideoImagePreview }"
+                >
+                  <img
+                    v-if="avatarVideoImagePreview"
+                    :src="avatarVideoImagePreview"
+                    alt="Source image preview"
+                    class="video-hub-preview__media"
+                  />
+                  <span v-else class="video-hub-preview__placeholder">Upload image</span>
+                </div>
               </div>
-              <span class="kb-tile__icon kb-tile__icon--video" aria-hidden="true">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-                  <rect x="2" y="5" width="20" height="14" rx="2" />
-                  <path d="M10 9v6l5-3-5-3Z" />
-                </svg>
-              </span>
-              <span class="kb-tile__soon">Soon</span>
-            </div>
-            <div class="kb-tile kb-tile--disabled" role="listitem" aria-disabled="true">
-              <div class="kb-tile__main">
-                <span class="kb-tile__brand kb-tile__brand--video">Framing</span>
-                <span class="kb-tile__title">Crop &amp; safe areas</span>
-                <span class="kb-tile__meta">Coming soon</span>
+
+              <div class="video-hub-slot">
+                <label class="field field--video-slot">
+                  <span>Reference video (motion)</span>
+                  <input type="file" accept="video/*" @change="onAvatarVideoRef" />
+                </label>
+                <div
+                  class="video-hub-preview"
+                  :class="{ 'video-hub-preview--empty': !avatarVideoRefPreview }"
+                >
+                  <video
+                    v-if="avatarVideoRefPreview"
+                    :src="avatarVideoRefPreview"
+                    controls
+                    class="video-hub-preview__media"
+                  />
+                  <span v-else class="video-hub-preview__placeholder">Upload reference clip</span>
+                </div>
               </div>
-              <span class="kb-tile__icon kb-tile__icon--video" aria-hidden="true">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M4 7h16v10H4z" />
-                  <path d="M9 7v10M15 7v10" />
-                </svg>
-              </span>
-              <span class="kb-tile__soon">Soon</span>
-            </div>
-            <div class="kb-tile kb-tile--disabled" role="listitem" aria-disabled="true">
-              <div class="kb-tile__main">
-                <span class="kb-tile__brand kb-tile__brand--video">Batch</span>
-                <span class="kb-tile__title">Queue &amp; export</span>
-                <span class="kb-tile__meta">Coming soon</span>
+
+              <div class="video-hub-slot">
+                <label class="field field--video-slot">
+                  <span>Generated video</span>
+                  <span v-if="avatarVideoJobStatus" class="video-hub-slot__status">{{ avatarVideoJobStatus }}</span>
+                </label>
+                <div
+                  class="video-hub-preview"
+                  :class="{ 'video-hub-preview--empty': !avatarVideoUrl }"
+                >
+                  <video
+                    v-if="avatarVideoUrl"
+                    :src="avatarVideoUrl"
+                    controls
+                    class="video-hub-preview__media"
+                  />
+                  <span v-else class="video-hub-preview__placeholder">
+                    {{ avatarVideoBusy ? "Rendering…" : "Output appears here" }}
+                  </span>
+                </div>
+                <template v-if="avatarVideoSucceeded">
+                  <label class="field field--video-slot field--compact">
+                    <span>Video ID</span>
+                    <input
+                      v-model="hologramGeneratedVideoId"
+                      type="text"
+                      autocomplete="off"
+                      placeholder="e.g. gen_video_1"
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    class="btn btn--secondary btn--compact"
+                    :disabled="hologramUploadGeneratedVideoBusy || !hologramAvatarConfigured"
+                    @click="uploadHologramGeneratedVideo"
+                  >
+                    {{ hologramUploadGeneratedVideoBusy ? "Saving…" : "Save video" }}
+                  </button>
+                  <p v-if="hologramUploadGeneratedVideoStatus" class="status status--compact">
+                    {{ hologramUploadGeneratedVideoStatus }}
+                  </p>
+                </template>
               </div>
-              <span class="kb-tile__icon kb-tile__icon--video" aria-hidden="true">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M12 3v12" />
-                  <path d="M8 15l4 4 4-4" />
-                  <path d="M5 21h14" />
-                </svg>
-              </span>
-              <span class="kb-tile__soon">Soon</span>
             </div>
+
+            <div class="actions video-hub-actions">
+              <button type="button" class="btn" :disabled="avatarVideoBusy" @click="startAvatarVideo">
+                {{ avatarVideoBusy ? "Generating…" : "Generate" }}
+              </button>
+              <a
+                v-if="avatarVideoUrl"
+                class="pill pill--link"
+                :href="avatarVideoUrl"
+                download
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                Download MP4
+              </a>
+            </div>
+            <p v-if="avatarVideoStatus" class="status">{{ avatarVideoStatus }}</p>
           </div>
         </article>
 
@@ -1341,7 +1669,6 @@ function formatIso(iso) {
             <span class="step-badge step-badge--voice-hub">Vo</span>
             <div>
               <h3>Avatar voice</h3>
-              <p class="flow-card__sub">Record a sample, create a voice profile, then generate speech — all in this panel.</p>
             </div>
           </div>
           <div class="studio-hub-grid" role="group" aria-label="Avatar voice shortcuts">
@@ -1410,9 +1737,6 @@ function formatIso(iso) {
           </div>
 
           <div class="voice-hub-panels">
-            <p v-if="openVoiceStudioStep === null" class="voice-hub-panels__hint">
-              Select <strong>Record</strong>, <strong>Clone</strong>, or <strong>Generate</strong> above to open that step.
-            </p>
             <article
               v-show="openVoiceStudioStep === 1"
               id="studio-voice-step1"
@@ -1423,7 +1747,6 @@ function formatIso(iso) {
                 <span class="step-badge">1</span>
                 <div>
                   <h3>Record avatar voice</h3>
-                  <p class="flow-card__sub">Use a clear, steady read of the script below.</p>
                 </div>
                 <span v-if="customerRecording" class="rec-dot" aria-hidden="true"><span class="rec-dot__pulse" /></span>
               </div>
@@ -1469,7 +1792,6 @@ function formatIso(iso) {
                 <audio :src="customerRecordPreview" controls class="audio" />
               </div>
               <p v-if="customerStatus" class="status">{{ customerStatus }}</p>
-              <p v-else class="status status--muted">Status appears here after you record or save.</p>
             </article>
 
             <article v-show="openVoiceStudioStep === 2" id="studio-voice-step2" class="flow-card">
@@ -1477,7 +1799,6 @@ function formatIso(iso) {
                 <span class="step-badge">2</span>
                 <div>
                   <h3>Create voice profile</h3>
-                  <p class="flow-card__sub">Turns the saved recording into a <code>.pt</code> profile on the server.</p>
                 </div>
               </div>
 
@@ -1496,12 +1817,6 @@ function formatIso(iso) {
                 </a>
               </div>
               <p v-if="voiceProfileStatus" class="status">{{ voiceProfileStatus }}</p>
-              <p v-else class="status status--muted">Save a recording in step 1, then clone here.</p>
-
-              <ul class="mini-check">
-                <li :class="{ 'mini-check__on': hasSavedRecording }">Recording saved</li>
-                <li :class="{ 'mini-check__on': hasVoiceProfile }">Profile file created</li>
-              </ul>
             </article>
 
             <article v-show="openVoiceStudioStep === 3" id="studio-voice-step3" class="flow-card">
@@ -1509,7 +1824,6 @@ function formatIso(iso) {
                 <span class="step-badge">3</span>
                 <div>
                   <h3>Generate with saved voice</h3>
-                  <p class="flow-card__sub">Pick a profile, load it, enter target text, then render audio.</p>
                 </div>
               </div>
 
@@ -1525,6 +1839,22 @@ function formatIso(iso) {
                   Load selected profile
                 </button>
                 <span v-if="hasVoiceFileReady" class="chip chip--ok">Ready to generate</span>
+              </div>
+
+              <div class="hologram-avatar-voice-block">
+                <label class="field">
+                  <span>Audio ID</span>
+                  <input v-model="hologramAudioId" type="text" autocomplete="off" placeholder="e.g. new_audiotest" />
+                </label>
+                <button
+                  type="button"
+                  class="btn btn--secondary"
+                  :disabled="hologramUploadAudioBusy || !hologramAvatarConfigured"
+                  @click="uploadHologramVoiceAudio"
+                >
+                  {{ hologramUploadAudioBusy ? "Saving…" : "Save audio" }}
+                </button>
+                <p v-if="hologramUploadAudioStatus" class="status">{{ hologramUploadAudioStatus }}</p>
               </div>
 
               <label class="field">
@@ -1548,10 +1878,72 @@ function formatIso(iso) {
                 <audio :src="generateAudioUrl" controls class="audio" />
               </div>
               <p v-if="generateStatus" class="status">{{ generateStatus }}</p>
-              <p v-else class="status status--muted">Output audio appears here after generation.</p>
             </article>
           </div>
         </article>
+
+        <article class="flow-card flow-card--hologram-avatar">
+          <div class="flow-card__head flow-card__head--rag">
+            <span class="step-badge step-badge--hologram-avatar">HA</span>
+            <div>
+              <h3>Hologram Avatar</h3>
+            </div>
+          </div>
+
+          <div class="hologram-avatar-prepare-grid">
+            <label class="field">
+              <span>Profile ID</span>
+              <input v-model="hologramPrepareForm.profile_id" type="text" autocomplete="off" />
+            </label>
+            <label class="field">
+              <span>Avatar ID</span>
+              <input v-model="hologramPrepareForm.avatar_id" type="text" autocomplete="off" />
+            </label>
+            <label class="field">
+              <span>Saved video</span>
+              <select v-model="hologramPrepareForm.video_id">
+                <option value="">Select uploaded video…</option>
+                <option v-for="v in hologramSavedVideos" :key="v.video_id" :value="v.video_id">
+                  {{ hologramAssetLabel(v, "video_id") }}
+                </option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Saved audio</span>
+              <select v-model="hologramPrepareForm.audio_id">
+                <option value="">Select uploaded audio…</option>
+                <option v-for="a in hologramSavedAudios" :key="a.audio_id" :value="a.audio_id">
+                  {{ hologramAssetLabel(a, "audio_id") }}
+                </option>
+              </select>
+            </label>
+          </div>
+
+          <label class="field">
+            <span>Ref text (optional)</span>
+            <textarea v-model="hologramPrepareForm.ref_text" rows="2" />
+          </label>
+
+          <div class="hologram-avatar-prepare-checks">
+            <label class="hologram-avatar-check">
+              <input v-model="hologramPrepareForm.set_as_default" type="checkbox" />
+              Set as default profile
+            </label>
+            <label class="hologram-avatar-check">
+              <input v-model="hologramPrepareForm.force_regenerate" type="checkbox" />
+              Force regenerate
+            </label>
+          </div>
+
+          <div class="actions">
+            <button type="button" class="btn" :disabled="hologramPrepareBusy || !hologramAvatarConfigured" @click="prepareHologramAvatar">
+              {{ hologramPrepareBusy ? "Preparing…" : "Prepare" }}
+            </button>
+          </div>
+
+          <p v-if="hologramPrepareStatus" class="status">{{ hologramPrepareStatus }}</p>
+        </article>
+
 
         <article class="flow-card flow-card--kb-hub">
           <div class="flow-card__head flow-card__head--rag">
@@ -3451,6 +3843,171 @@ input[type="password"]:focus {
 
 .flow-card--video-hub::before {
   background: linear-gradient(180deg, #a855f7, #ec4899);
+}
+
+.flow-card--video-hub .video-hub-panel {
+  display: grid;
+  gap: 0.85rem;
+  margin-top: 0.35rem;
+}
+
+.flow-card--video-hub .video-hub-row {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.75rem;
+  align-items: stretch;
+}
+
+@media (max-width: 960px) {
+  .flow-card--video-hub .video-hub-row {
+    grid-template-columns: 1fr;
+  }
+}
+
+.flow-card--video-hub .video-hub-slot {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  min-width: 0;
+}
+
+.flow-card--video-hub .field--video-slot {
+  margin: 0;
+}
+
+.flow-card--video-hub .field--video-slot > span:first-child {
+  font-weight: 600;
+}
+
+.flow-card--video-hub .video-hub-slot__status {
+  display: block;
+  margin-top: 0.15rem;
+  font-size: 0.78rem;
+  font-weight: 500;
+  color: var(--muted);
+  text-transform: capitalize;
+}
+
+.flow-card--video-hub .video-hub-actions {
+  margin-top: 0.15rem;
+}
+
+.flow-card--video-hub .video-hub-preview {
+  position: relative;
+  width: 100%;
+  flex: 1 1 auto;
+  aspect-ratio: 16 / 9;
+  border-radius: 12px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  background: rgba(15, 23, 42, 0.06);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.flow-card--video-hub .video-hub-preview--empty {
+  border-style: dashed;
+  background: rgba(15, 23, 42, 0.03);
+}
+
+.flow-card--video-hub .video-hub-preview__placeholder {
+  padding: 0.75rem;
+  font-size: 0.8rem;
+  line-height: 1.35;
+  text-align: center;
+  color: var(--muted);
+}
+
+.flow-card--video-hub .video-hub-preview__media {
+  display: block;
+  width: 100%;
+  height: 100%;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  object-position: center;
+  background: rgba(15, 23, 42, 0.92);
+}
+
+.flow-card--video-hub .field--compact {
+  margin-bottom: 0.25rem;
+}
+
+.flow-card--video-hub .btn--compact {
+  width: 100%;
+  padding: 0.4rem 0.65rem;
+  font-size: 0.78rem;
+  margin-bottom: 0.35rem;
+}
+
+.flow-card--video-hub .status--compact {
+  margin: 0 0 0.4rem;
+  font-size: 0.75rem;
+}
+
+.flow-card--hologram-avatar::before {
+  background: linear-gradient(180deg, #0ea5e9, #6366f1);
+}
+
+.step-badge--hologram-avatar {
+  font-size: 0.72rem;
+  background: linear-gradient(145deg, #0ea5e9, #6366f1);
+  box-shadow: 0 6px 16px rgba(99, 102, 241, 0.28);
+}
+
+.hologram-avatar-prepare-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.65rem;
+  margin-bottom: 0.65rem;
+}
+
+@media (max-width: 640px) {
+  .hologram-avatar-prepare-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.hologram-avatar-voice-block {
+  margin: 0.75rem 0;
+  padding: 0.75rem 0;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.hologram-avatar-prepare-checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem 1.25rem;
+  margin-bottom: 0.65rem;
+}
+
+.hologram-avatar-check {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.82rem;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.hologram-avatar-prepare-details {
+  margin-top: 0.75rem;
+  font-size: 0.78rem;
+}
+
+.hologram-avatar-prepare-pre {
+  margin: 0.5rem 0 0;
+  padding: 0.5rem;
+  max-height: 14rem;
+  overflow: auto;
+  border-radius: 8px;
+  background: #f8fafc;
+  border: 1px solid var(--line);
+  font-size: 0.68rem;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .flow-card--voice-hub::before {

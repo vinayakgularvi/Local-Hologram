@@ -644,6 +644,7 @@ onUnmounted(() => {
       <router-link class="panel-nav__link" to="/avatar">Studio</router-link>
       <router-link class="panel-nav__link" to="/analytics">Analytics</router-link>
     </nav>
+
     <div v-if="!mediaVisible" class="lang-picker">
       <label class="lang-picker__label" for="top-lang-select">Language</label>
       <select id="top-lang-select" class="lang-picker__select" v-model="selectedMicLang">
