@@ -35,6 +35,7 @@ export default defineConfig({
     port: 5173,
     proxy: {
       "/api": { target: backendOrigin, changeOrigin: true },
+      "/cloths": { target: backendOrigin, changeOrigin: true },
       "/outputs": { target: backendOrigin, changeOrigin: true },
       "/offer": { target: backendOrigin, changeOrigin: true },
       "/human": { target: backendOrigin, changeOrigin: true },

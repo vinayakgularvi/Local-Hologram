@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from "vue";
+import { ref, computed, onMounted, onUnmounted, watch, nextTick } from "vue";
 
 const busy = ref(false);
 /** True once the remote video is actually rendering (not only SDP done). */
@@ -78,6 +78,33 @@ const liveBill = ref(null);
 /** Shown at top of stage when <orderdone> is present; live bill is cleared. */
 const orderPlacedMessage = ref("");
 let orderPlacedHideTimer = null;
+const clothItems = ref([]);
+const selectedClothId = ref("");
+const centeredClothId = ref("");
+const clothSelectBusy = ref(false);
+const clothStripScroll = ref(null);
+let clothScrollRaf = 0;
+const clothTryonConfig = ref(null);
+const clothCaptureOpen = ref(false);
+const clothCaptureError = ref("");
+const clothCapturePhase = ref("idle");
+const clothPendingItem = ref(null);
+const clothPipelineJobId = ref("");
+const clothPipelineMessage = ref("");
+const clothCaptureFileInput = ref(null);
+const clothUploadPreviewUrl = ref("");
+/** @type {import('vue').Ref<Blob | null>} */
+const clothCaptureBlob = ref(null);
+/** Stage + hologram avatar (same design size, width × height). */
+const STAGE_WIDTH = 2490;
+const STAGE_HEIGHT = 3840;
+const HOLOGRAM_WIDTH = STAGE_WIDTH;
+const HOLOGRAM_HEIGHT = STAGE_HEIGHT;
+/** Try-on human photo size (width × height). */
+const CLOTH_CAPTURE_WIDTH = 768;
+const CLOTH_CAPTURE_HEIGHT = 1280;
+const CLOTH_UPLOAD_MAX_MB = 25;
+let clothPipelinePollId = null;
 const finalTranscript = ref("");
 const interimTranscript = ref("");
 const WEBRTC_ICE_GATHER_TIMEOUT_MS = Math.max(
@@ -135,6 +162,298 @@ function signalingUrl(path) {
   const p = path.startsWith("/") ? path : `/${path}`;
   const base = apiOrigin();
   return base ? `${base}${p}` : p;
+}
+
+function clothThumbUrl(item) {
+  const u = String(item?.url || "").trim();
+  if (!u) return "";
+  return signalingUrl(u);
+}
+
+async function loadCloths() {
+  try {
+    const res = await fetch(signalingUrl("/api/cloths"), { headers: { Accept: "application/json" } });
+    if (!res.ok) return;
+    const data = await res.json();
+    clothItems.value = Array.isArray(data.items) ? data.items : [];
+  } catch {
+    clothItems.value = [];
+  }
+}
+
+async function loadClothTryonConfig() {
+  try {
+    const res = await fetch(signalingUrl("/api/cloth/tryon/config"), { headers: { Accept: "application/json" } });
+    if (!res.ok) return;
+    const data = await res.json();
+    clothTryonConfig.value = data;
+  } catch {
+    clothTryonConfig.value = null;
+  }
+}
+
+function clearClothUploadPreview() {
+  if (clothUploadPreviewUrl.value) {
+    URL.revokeObjectURL(clothUploadPreviewUrl.value);
+    clothUploadPreviewUrl.value = "";
+  }
+  clothCaptureBlob.value = null;
+}
+
+function stopClothPipelinePoll() {
+  if (clothPipelinePollId != null) {
+    window.clearInterval(clothPipelinePollId);
+    clothPipelinePollId = null;
+  }
+}
+
+function closeClothCapture() {
+  clearClothUploadPreview();
+  clothCaptureOpen.value = false;
+  clothCapturePhase.value = "idle";
+  clothCaptureError.value = "";
+  clothPendingItem.value = null;
+  if (!clothPipelineJobId.value) clothSelectBusy.value = false;
+}
+
+function openClothFilePicker() {
+  clothCaptureFileInput.value?.click();
+}
+
+function drawClothImageToCanvas(img) {
+  const w = CLOTH_CAPTURE_WIDTH;
+  const h = CLOTH_CAPTURE_HEIGHT;
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Could not process image.");
+  const iw = img.naturalWidth || img.width;
+  const ih = img.naturalHeight || img.height;
+  const targetAspect = w / h;
+  const srcAspect = iw / ih;
+  let sx = 0;
+  let sy = 0;
+  let sw = iw;
+  let sh = ih;
+  if (srcAspect > targetAspect) {
+    sw = ih * targetAspect;
+    sx = (iw - sw) / 2;
+  } else if (srcAspect < targetAspect) {
+    sh = iw / targetAspect;
+    sy = (ih - sh) / 2;
+  }
+  ctx.drawImage(img, sx, sy, sw, sh, 0, 0, w, h);
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(
+      (blob) => {
+        if (!blob) reject(new Error("Could not process image."));
+        else resolve(blob);
+      },
+      "image/jpeg",
+      0.92,
+    );
+  });
+}
+
+function resizeClothImageFile(file) {
+  const maxBytes = CLOTH_UPLOAD_MAX_MB * 1024 * 1024;
+  if (file.size > maxBytes) {
+    return Promise.reject(new Error(`Image must be under ${CLOTH_UPLOAD_MAX_MB} MB.`));
+  }
+  const url = URL.createObjectURL(file);
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      void drawClothImageToCanvas(img).then(resolve).catch(reject);
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("Could not read image file."));
+    };
+    img.src = url;
+  });
+}
+
+async function onClothImageFileChange(ev) {
+  const input = ev.target;
+  const file = input?.files?.[0];
+  if (input) input.value = "";
+  if (!file) return;
+  if (!/^image\/(jpeg|png|webp)$/i.test(file.type || "")) {
+    clothCaptureError.value = "Choose a JPEG, PNG, or WebP image.";
+    return;
+  }
+  clothCaptureError.value = "";
+  clothCapturePhase.value = "preview";
+  try {
+    const blob = await resizeClothImageFile(file);
+    clearClothUploadPreview();
+    clothCaptureBlob.value = blob;
+    clothUploadPreviewUrl.value = URL.createObjectURL(blob);
+  } catch (e) {
+    clothCaptureError.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
+function openClothCapture(item) {
+  clearClothUploadPreview();
+  clothCaptureError.value = "";
+  clothPendingItem.value = item;
+  clothCaptureOpen.value = true;
+  clothCapturePhase.value = "choose";
+}
+
+async function submitClothTryonPhoto() {
+  const item = clothPendingItem.value;
+  const blob = clothCaptureBlob.value;
+  if (!item) {
+    closeClothCapture();
+    return;
+  }
+  if (!blob) {
+    clothCaptureError.value = "Choose a photo to continue.";
+    return;
+  }
+  clothCaptureOpen.value = false;
+  clothCapturePhase.value = "uploading";
+  clearClothUploadPreview();
+  selectedClothId.value = item.id;
+  await uploadClothTryon(item, blob);
+}
+
+async function uploadClothTryon(item, blob) {
+  clothSelectBusy.value = true;
+  clothPipelineMessage.value = "Uploading your photo…";
+  stopClothPipelinePoll();
+  try {
+    const fd = new FormData();
+    fd.append("cloth_id", item.id);
+    const isImage = (blob.type || "").startsWith("image/");
+    fd.append("capture", blob, isImage ? "capture.jpg" : "capture.webm");
+    const res = await fetch(signalingUrl("/api/cloth/tryon"), { method: "POST", body: fd });
+    if (!res.ok) {
+      const t = await res.text();
+      throw new Error(t.slice(0, 400) || `Try-on failed (${res.status})`);
+    }
+    const data = await res.json();
+    clothPipelineJobId.value = String(data.job_id || "");
+    if (!clothPipelineJobId.value) throw new Error("Server did not return a job id.");
+    startClothPipelinePoll();
+  } catch (e) {
+    clothSelectBusy.value = false;
+    selectedClothId.value = "";
+    clothPipelineMessage.value = "";
+    webrtcError.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
+async function pollClothPipelineJob() {
+  if (!clothPipelineJobId.value) return;
+  try {
+    const res = await fetch(signalingUrl(`/api/cloth/tryon/jobs/${clothPipelineJobId.value}`), {
+      headers: { Accept: "application/json" },
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `Status failed (${res.status})`);
+    clothPipelineMessage.value = String(data.message || data.stage || "Working…");
+    if (data.status === "succeeded") {
+      stopClothPipelinePoll();
+      clothSelectBusy.value = false;
+      clothPipelineJobId.value = "";
+      clothPipelineMessage.value = "Reconnecting hologram…";
+      await refreshWebRtcOffer();
+      clothPipelineMessage.value = "Avatar ready — hologram updated with your try-on.";
+    } else if (data.status === "failed") {
+      stopClothPipelinePoll();
+      clothSelectBusy.value = false;
+      clothPipelineJobId.value = "";
+      selectedClothId.value = "";
+      clothPipelineMessage.value = "";
+      webrtcError.value = String(data.error || data.message || "Try-on pipeline failed.");
+    }
+  } catch (e) {
+    stopClothPipelinePoll();
+    clothSelectBusy.value = false;
+    clothPipelineJobId.value = "";
+    clothPipelineMessage.value = "";
+    webrtcError.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
+function startClothPipelinePoll() {
+  stopClothPipelinePoll();
+  clothPipelinePollId = window.setInterval(() => void pollClothPipelineJob(), 2500);
+  void pollClothPipelineJob();
+}
+
+function onClothStripScroll() {
+  if (clothScrollRaf) cancelAnimationFrame(clothScrollRaf);
+  clothScrollRaf = requestAnimationFrame(() => {
+    clothScrollRaf = 0;
+    updateCenteredCloth();
+  });
+}
+
+function updateCenteredCloth() {
+  const scroller = clothStripScroll.value;
+  if (!scroller || !clothItems.value.length) return;
+  const box = scroller.getBoundingClientRect();
+  const midX = box.left + box.width / 2;
+  let bestId = "";
+  let bestDist = Infinity;
+  for (const btn of scroller.querySelectorAll(".cloth-thumb[data-cloth-id]")) {
+    const r = btn.getBoundingClientRect();
+    const dist = Math.abs(r.left + r.width / 2 - midX);
+    if (dist < bestDist) {
+      bestDist = dist;
+      bestId = btn.getAttribute("data-cloth-id") || "";
+    }
+  }
+  if (bestId) centeredClothId.value = bestId;
+}
+
+function scrollClothIntoCenter(item, behavior = "smooth") {
+  const scroller = clothStripScroll.value;
+  if (!scroller || !item?.id) return;
+  const btn = scroller.querySelector(`.cloth-thumb[data-cloth-id="${CSS.escape(item.id)}"]`);
+  if (btn) btn.scrollIntoView({ inline: "center", block: "nearest", behavior });
+}
+
+watch(
+  clothItems,
+  async (items) => {
+    if (!items.length) {
+      centeredClothId.value = "";
+      return;
+    }
+    await nextTick();
+    scrollClothIntoCenter(items[0], "instant");
+    updateCenteredCloth();
+  },
+  { flush: "post" },
+);
+
+async function selectCloth(item) {
+  if (!item?.id || clothSelectBusy.value) return;
+  scrollClothIntoCenter(item);
+  webrtcError.value = "";
+  const cfg = clothTryonConfig.value;
+  if (
+    cfg &&
+    (!cfg.tryon_configured ||
+      !cfg.avatar_video_configured ||
+      !cfg.hologram_configured ||
+      !cfg.reference_video_present ||
+      !cfg.hologram_assets_ready)
+  ) {
+    webrtcError.value =
+      "Try-on is not ready. Configure APIs, reference video, and upload voice in Avatar Studio (Hologram Avatar) first.";
+    return;
+  }
+  clothSelectBusy.value = true;
+  await openClothCapture(item);
 }
 
 fetch(signalingUrl("/api/webrtc"))
@@ -262,6 +581,13 @@ async function connect() {
   } finally {
     busy.value = false;
   }
+}
+
+/** Re-run POST /offer after hologram avatar prepare (new default profile on server). */
+async function refreshWebRtcOffer() {
+  if (proxyConfigured.value === false) return;
+  disconnect();
+  await connect();
 }
 
 function disconnect() {
@@ -625,8 +951,18 @@ function formatBillMoney(n) {
   return x.toFixed(2);
 }
 
+const HOLOGRAM_PREPARED_CHANNEL = "hologram-avatar-prepared";
+/** @type {BroadcastChannel | null} */
+let hologramPreparedChannel = null;
+
 onMounted(() => {
   void connect();
+  void loadCloths();
+  void loadClothTryonConfig();
+  if (typeof BroadcastChannel !== "undefined") {
+    hologramPreparedChannel = new BroadcastChannel(HOLOGRAM_PREPARED_CHANNEL);
+    hologramPreparedChannel.onmessage = () => void refreshWebRtcOffer();
+  }
 });
 
 onUnmounted(() => {
@@ -634,6 +970,10 @@ onUnmounted(() => {
     window.clearTimeout(orderPlacedHideTimer);
     orderPlacedHideTimer = null;
   }
+  hologramPreparedChannel?.close();
+  hologramPreparedChannel = null;
+  stopClothPipelinePoll();
+  closeClothCapture();
   disconnect();
 });
 </script>
@@ -700,10 +1040,98 @@ onUnmounted(() => {
           </div>
         </div>
 
-        <video ref="videoEl" class="video" autoplay playsinline />
+        <div class="hologram-viewport">
+          <video ref="videoEl" class="video" autoplay playsinline />
+        </div>
         <div class="video-rail video-rail--left" aria-hidden="true" />
         <div class="video-rail video-rail--right" aria-hidden="true" />
+        <aside v-if="clothItems.length" class="cloth-strip" aria-label="Select clothing">
+          <div class="cloth-strip__viewport">
+            <div
+              ref="clothStripScroll"
+              class="cloth-strip__scroll"
+              tabindex="0"
+              @scroll="onClothStripScroll"
+            >
+              <button
+                v-for="item in clothItems"
+                :key="item.id"
+                type="button"
+                class="cloth-thumb"
+                :data-cloth-id="item.id"
+                :class="{
+                  'cloth-thumb--on': selectedClothId === item.id,
+                  'cloth-thumb--center':
+                    centeredClothId === item.id && selectedClothId !== item.id,
+                }"
+                :disabled="clothSelectBusy"
+                :title="item.id"
+                :aria-pressed="selectedClothId === item.id"
+                @click="selectCloth(item)"
+              >
+                <img :src="clothThumbUrl(item)" :alt="item.id" loading="lazy" />
+              </button>
+            </div>
+          </div>
+        </aside>
         <audio ref="audioEl" class="sr-only" autoplay />
+
+        <div
+          v-if="clothPipelineMessage"
+          class="cloth-pipeline-banner"
+          role="status"
+          aria-live="polite"
+        >
+          {{ clothPipelineMessage }}
+        </div>
+
+        <div
+          v-if="clothCaptureOpen"
+          class="cloth-capture-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Upload photo for try-on"
+        >
+          <div class="cloth-capture-card">
+            <h2 class="cloth-capture-card__title">Try on {{ clothPendingItem?.id }}</h2>
+            <p class="cloth-capture-card__sub">
+              Upload a portrait photo ({{ CLOTH_CAPTURE_WIDTH }}×{{ CLOTH_CAPTURE_HEIGHT }}). JPEG, PNG, or WebP.
+            </p>
+            <div class="cloth-capture-preview">
+              <img
+                v-if="clothUploadPreviewUrl"
+                :src="clothUploadPreviewUrl"
+                class="cloth-capture-preview__img"
+                alt="Selected photo"
+              />
+              <p v-else class="cloth-capture-preview__placeholder">No photo selected</p>
+            </div>
+            <input
+              ref="clothCaptureFileInput"
+              type="file"
+              class="cloth-capture-file-input"
+              accept="image/jpeg,image/png,image/webp"
+              @change="onClothImageFileChange"
+            />
+            <p v-if="clothCaptureError" class="cloth-capture-card__error">{{ clothCaptureError }}</p>
+            <div class="cloth-capture-card__actions">
+              <button type="button" class="cloth-capture-btn cloth-capture-btn--ghost" @click="closeClothCapture">
+                Cancel
+              </button>
+              <button type="button" class="cloth-capture-btn cloth-capture-btn--ghost" @click="openClothFilePicker">
+                Choose photo
+              </button>
+              <button
+                type="button"
+                class="cloth-capture-btn"
+                :disabled="!clothCaptureBlob || clothCapturePhase === 'uploading'"
+                @click="submitClothTryonPhoto"
+              >
+                Try on
+              </button>
+            </div>
+          </div>
+        </div>
 
         <div
           v-if="orderPlacedMessage"
@@ -738,27 +1166,6 @@ onUnmounted(() => {
           <div class="live-bill__total" role="status">
             <span>Total</span>
             <span class="live-bill__total-amt">${{ formatBillMoney(liveBillTotal) }}</span>
-          </div>
-        </aside>
-
-        <aside class="menu-overlay" aria-label="Holuminex Cafe menu">
-          <div class="menu-overlay__inner">
-            <div class="menu-banner">
-              <span class="menu-banner__bean" aria-hidden="true">☕</span>
-              <div>
-                <h2 class="menu-banner__title">Holuminex Cafe</h2>
-                <p class="menu-banner__meta">Seattle · All day</p>
-              </div>
-            </div>
-            <figure class="menu-figure">
-              <img
-                src="/menu-holuminex.png"
-                alt="Holuminex Cafe menu"
-                width="640"
-                height="360"
-                loading="lazy"
-              />
-            </figure>
           </div>
         </aside>
 
@@ -923,17 +1330,27 @@ onUnmounted(() => {
   aspect-ratio: 2490 / 3840;
   width: min(2490px, 100vw, calc(100dvh * 2490 / 3840));
   height: auto;
+  --stage-w: 2490;
+  --stage-h: 3840;
   background: #e4e2e2;
   overflow: hidden;
   box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.06);
 }
 
-.video {
-  display: block;
+/* Full 2490×3840 avatar layer (same scale as .video-wrap) */
+.hologram-viewport {
   position: absolute;
   inset: 0;
   z-index: 0;
-  width: 80%;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.video {
+  display: block;
+  width: 100%;
   height: 100%;
   object-fit: cover;
   object-position: center center;
@@ -956,6 +1373,233 @@ onUnmounted(() => {
 
 .video-rail--right {
   right: 0;
+}
+
+.cloth-strip {
+  position: absolute;
+  left: clamp(2rem, 9.65cqw, 15rem);
+  right: clamp(2rem, 9.65cqw, 15rem);
+  bottom: 0;
+  z-index: 4;
+  padding-bottom: max(0.35rem, env(safe-area-inset-bottom));
+  background: linear-gradient(to top, rgba(228, 226, 226, 0.98) 88%, rgba(228, 226, 226, 0));
+  pointer-events: none;
+}
+
+.cloth-strip__viewport {
+  overflow: hidden;
+  width: 100%;
+  pointer-events: auto;
+}
+
+.cloth-strip__scroll {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-end;
+  gap: clamp(0.45rem, 1.1cqw, 0.85rem);
+  padding: clamp(0.5rem, 1.2cqw, 0.9rem) 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  scroll-snap-type: x mandatory;
+  scroll-padding-inline: 50%;
+  padding-inline: 50%;
+  scrollbar-width: none;
+}
+
+.cloth-strip__scroll::-webkit-scrollbar {
+  display: none;
+}
+
+.cloth-thumb {
+  flex: 0 0 auto;
+  scroll-snap-align: center;
+  width: clamp(3.75rem, 12cqw, 7.5rem);
+  height: clamp(5rem, 15cqw, 9.5rem);
+  padding: 0;
+  border: 3px solid rgba(148, 163, 184, 0.45);
+  border-radius: clamp(8px, 1cqw, 14px);
+  background: #fff;
+  cursor: pointer;
+  overflow: hidden;
+  opacity: 0.88;
+  transform: scale(0.88);
+  box-shadow: 0 2px 10px rgba(15, 23, 42, 0.1);
+  transition:
+    width 0.22s ease,
+    height 0.22s ease,
+    border-color 0.15s ease,
+    box-shadow 0.15s ease,
+    transform 0.22s ease,
+    opacity 0.22s ease;
+}
+
+.cloth-thumb:hover:not(:disabled) {
+  border-color: rgba(13, 148, 136, 0.65);
+  opacity: 0.96;
+}
+
+.cloth-thumb--center {
+  width: clamp(5.5rem, 17.5cqw, 11rem);
+  height: clamp(7.25rem, 22cqw, 14rem);
+  opacity: 1;
+  transform: scale(1);
+  border-color: rgba(13, 148, 136, 0.55);
+  box-shadow: 0 5px 16px rgba(13, 148, 136, 0.18);
+  z-index: 2;
+}
+
+.cloth-thumb--on {
+  width: clamp(6.75rem, 21cqw, 13.5rem);
+  height: clamp(9rem, 27cqw, 17rem);
+  opacity: 1;
+  transform: scale(1.06);
+  border-color: #0d9488;
+  border-width: 4px;
+  box-shadow:
+    0 0 0 4px rgba(13, 148, 136, 0.28),
+    0 8px 22px rgba(13, 148, 136, 0.28);
+  z-index: 3;
+}
+
+.cloth-thumb:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.cloth-thumb img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.cloth-pipeline-banner {
+  position: absolute;
+  left: 50%;
+  bottom: min(32cqh, 38vh);
+  transform: translateX(-50%);
+  z-index: 6;
+  max-width: min(90cqw, 96%);
+  padding: clamp(0.45rem, 1cqw, 0.7rem) clamp(0.75rem, 1.6cqw, 1.2rem);
+  border-radius: 999px;
+  font-size: clamp(0.62rem, 1.35cqw, 0.88rem);
+  font-weight: 700;
+  color: #0f172a;
+  background: rgba(255, 255, 255, 0.94);
+  border: 1px solid rgba(13, 148, 136, 0.45);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.12);
+  pointer-events: none;
+}
+
+.cloth-capture-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: clamp(0.75rem, 2cqw, 1.5rem);
+  background: rgba(15, 23, 42, 0.55);
+  backdrop-filter: blur(6px);
+}
+
+.cloth-capture-card {
+  width: min(92cqw, 28rem);
+  max-height: min(88cqh, 92vh);
+  overflow: auto;
+  padding: clamp(0.85rem, 2cqw, 1.25rem);
+  border-radius: clamp(12px, 1.4cqw, 18px);
+  background: #fff;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.2);
+}
+
+.cloth-capture-card__title {
+  margin: 0 0 0.35rem;
+  font-size: clamp(1rem, 2.2cqw, 1.35rem);
+  color: #0f172a;
+}
+
+.cloth-capture-card__sub {
+  margin: 0 0 0.75rem;
+  font-size: clamp(0.78rem, 1.5cqw, 0.92rem);
+  color: #475569;
+  line-height: 1.4;
+}
+
+.cloth-capture-preview {
+  position: relative;
+  aspect-ratio: 768 / 1280;
+  max-height: min(52cqh, 55vh);
+  border-radius: clamp(10px, 1.1cqw, 14px);
+  overflow: hidden;
+  background: #0f172a;
+}
+
+.cloth-capture-preview__img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.cloth-capture-preview__placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  margin: 0;
+  padding: 1rem;
+  text-align: center;
+  font-size: 0.88rem;
+  color: #94a3b8;
+}
+
+.cloth-capture-file-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.cloth-capture-card__error {
+  margin: 0.65rem 0 0;
+  font-size: 0.82rem;
+  color: #b91c1c;
+}
+
+.cloth-capture-card__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  justify-content: flex-end;
+  margin-top: 0.85rem;
+}
+
+.cloth-capture-btn {
+  border: none;
+  border-radius: 999px;
+  padding: 0.5rem 1rem;
+  font-size: 0.88rem;
+  font-weight: 700;
+  cursor: pointer;
+  background: linear-gradient(120deg, #0d9488, #14b8a6);
+  color: #fff;
+}
+
+.cloth-capture-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.cloth-capture-btn--ghost {
+  background: #e2e8f0;
+  color: #334155;
 }
 
 /* Top center: order confirmed when model sends <orderdone>…</orderdone> */
@@ -1095,169 +1739,6 @@ onUnmounted(() => {
   font-size: 1.08em;
   color: #0d9488;
   font-variant-numeric: tabular-nums;
-}
-
-@keyframes menu-card-entrance {
-  from {
-    opacity: 0;
-    transform: translate3d(-14%, 18px, 0) scale(0.94);
-  }
-  to {
-    opacity: 1;
-    transform: translate3d(0, 0, 0) scale(1);
-  }
-}
-
-@keyframes menu-card-glow {
-  0%,
-  100% {
-    box-shadow:
-      0 8px 28px rgba(0, 0, 0, 0.12),
-      0 0 0 0 rgba(13, 148, 136, 0);
-  }
-  50% {
-    box-shadow:
-      0 14px 36px rgba(0, 0, 0, 0.14),
-      0 0 28px rgba(13, 148, 136, 0.14);
-  }
-}
-
-@keyframes menu-banner-in {
-  from {
-    opacity: 0;
-    transform: translateY(10px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-@keyframes menu-figure-in {
-  from {
-    opacity: 0;
-    transform: scale(0.97);
-  }
-  to {
-    opacity: 1;
-    transform: scale(1);
-  }
-}
-
-@keyframes menu-bean-wiggle {
-  0%,
-  100% {
-    transform: rotate(0deg);
-  }
-  30% {
-    transform: rotate(-10deg);
-  }
-  60% {
-    transform: rotate(8deg);
-  }
-}
-
-.menu-overlay {
-  position: absolute;
-  top: auto;
-  bottom: max(0.45rem, env(safe-area-inset-bottom));
-  right: max(0.35rem, env(safe-area-inset-left));
-  z-index: 2;
-  width: min(42cqw, 92vw);
-  max-height: min(62cqh, 78vh);
-  overflow: hidden auto;
-  border-radius: clamp(10px, 1.2cqw, 16px);
-  background: rgba(255, 255, 255, 0.93);
-  border: 1px solid rgba(15, 23, 42, 0.12);
-  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.12);
-  pointer-events: auto;
-  -webkit-overflow-scrolling: touch;
-  transform-origin: left bottom;
-  animation:
-    menu-card-entrance 0.68s cubic-bezier(0.22, 1, 0.36, 1) both,
-    menu-card-glow 4.5s ease-in-out 0.72s infinite;
-  will-change: transform, opacity;
-}
-
-.menu-overlay__inner {
-  padding: clamp(0.35rem, 0.9cqw, 0.65rem);
-}
-
-.menu-banner {
-  display: flex;
-  align-items: center;
-  gap: clamp(0.25rem, 0.6cqw, 0.5rem);
-  padding: clamp(0.25rem, 0.55cqw, 0.45rem) clamp(0.35rem, 0.8cqw, 0.55rem);
-  border-radius: clamp(8px, 1cqw, 12px);
-  background: linear-gradient(120deg, #0d9488, #14b8a6);
-  color: #fff;
-  margin-bottom: clamp(0.25rem, 0.6cqw, 0.45rem);
-  animation: menu-banner-in 0.55s ease backwards;
-  animation-delay: 0.1s;
-}
-
-.menu-banner__bean {
-  font-size: clamp(0.85rem, 2cqw, 1.15rem);
-  line-height: 1;
-  display: inline-block;
-  transform-origin: 60% 70%;
-  animation: menu-bean-wiggle 3.2s ease-in-out 0.85s infinite;
-}
-
-.menu-banner__title {
-  margin: 0;
-  font-size: clamp(0.62rem, 1.45cqw, 0.88rem);
-  letter-spacing: 0.03em;
-}
-
-.menu-banner__meta {
-  margin: 0.05rem 0 0;
-  font-size: clamp(0.52rem, 1.1cqw, 0.68rem);
-  opacity: 0.95;
-}
-
-.menu-figure {
-  margin: 0;
-  border-radius: clamp(6px, 0.8cqw, 10px);
-  overflow: hidden;
-  border: 1px solid rgba(148, 163, 184, 0.35);
-  animation: menu-figure-in 0.6s ease backwards;
-  animation-delay: 0.22s;
-}
-
-.menu-figure img {
-  display: block;
-  width: 100%;
-  height: auto;
-  transition: transform 0.35s ease;
-}
-
-.menu-overlay:hover .menu-figure img {
-  transform: scale(1.02);
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .menu-overlay {
-    animation: none;
-    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.12);
-  }
-
-  .menu-banner,
-  .menu-figure {
-    animation: none;
-  }
-
-  .menu-banner__bean {
-    animation: none;
-  }
-
-  .menu-figure img {
-    transition: none;
-  }
-
-  .menu-overlay:hover .menu-figure img {
-    transform: none;
-  }
 }
 
 .video-loading {

@@ -30,6 +30,7 @@ from gradio_client import Client, handle_file
 from pydantic import BaseModel, Field
 
 from analytics_store import clear_all, get_recent_voice_turns, get_summary, init_db, record_voice_turn
+from cloth_tryon_pipeline import resolve_cloth_hologram_context, run_cloth_tryon_pipeline
 from avatar_assets_store import (
     get_audio as livetalking_db_get_audio,
     get_video as livetalking_db_get_video,
@@ -305,6 +306,34 @@ GCS_SYNC_INTERVAL_SEC = max(30, _env_first_int("GCS_SYNC_INTERVAL_SEC", default=
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+CLOTHS_DIR = _BACKEND_DIR / "cloths"
+_CLOTH_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
+_CLOTH_IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".webp"})
+TRYON_API_BASE = os.environ.get("TRYON_API_BASE", "http://10.29.145.124:8888").strip().rstrip("/")
+TRYON_TIMEOUT_SEC = max(60.0, float(_env_first_int("TRYON_TIMEOUT_SEC", default=180)))
+CLOTH_REFERENCE_VIDEO = Path(
+    os.environ.get(
+        "CLOTH_REFERENCE_VIDEO",
+        str(_BACKEND_DIR / "cloths" / "reference_video" / "ref_video_1.mov"),
+    )
+).resolve()
+CLOTH_TRYON_GARMENT_DESCRIPTION = os.environ.get(
+    "CLOTH_TRYON_GARMENT_DESCRIPTION", "upper body garment"
+).strip()
+CLOTH_TRYON_FORCE_REGENERATE = os.environ.get("CLOTH_TRYON_FORCE_REGENERATE", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+CLOTH_TRYON_SET_AS_DEFAULT = os.environ.get("CLOTH_TRYON_SET_AS_DEFAULT", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+CLOTH_CAPTURE_MAX_BYTES = max(8_000_000, _env_first_int("CLOTH_CAPTURE_MAX_MB", default=80) * 1024 * 1024)
+CLOTH_CAPTURE_COUNTDOWN_SEC = max(1, min(10, _env_first_int("CLOTH_CAPTURE_SECONDS", default=3)))
+_CLOTH_CAPTURE_IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".webp"})
+_CLOTH_CAPTURE_VIDEO_SUFFIXES = frozenset({".webm", ".mp4", ".mov", ".mkv"})
 
 app = FastAPI(title="Lip-Sync Agent")
 
@@ -421,6 +450,8 @@ if _env_truthy("TRUST_FORWARDED") or _env_truthy("TRUST_PROXY_HEADERS"):
 
 
 app.mount("/outputs", StaticFiles(directory=str(OUTPUT_DIR)), name="outputs")
+if CLOTHS_DIR.is_dir():
+    app.mount("/cloths", StaticFiles(directory=str(CLOTHS_DIR)), name="cloths")
 _analytics_subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
 
 
@@ -818,6 +849,289 @@ async def webrtc_human_proxy(request: Request) -> Response:
 @app.post("/record")
 async def webrtc_record_proxy(request: Request) -> Response:
     return await _forward_webrtc_post("/record", request)
+
+
+def _resolve_cloth_path(cloth_id: str) -> Path:
+    cid = (cloth_id or "").strip()
+    if not _CLOTH_ID_RE.fullmatch(cid):
+        raise HTTPException(status_code=400, detail="Invalid cloth_id.")
+    if not CLOTHS_DIR.is_dir():
+        raise HTTPException(status_code=503, detail="Cloths directory is not available.")
+    for ext in sorted(_CLOTH_IMAGE_SUFFIXES):
+        candidate = (CLOTHS_DIR / f"{cid}{ext}").resolve()
+        try:
+            candidate.relative_to(CLOTHS_DIR.resolve())
+        except ValueError:
+            continue
+        if candidate.is_file():
+            return candidate
+    raise HTTPException(status_code=404, detail="Cloth not found.")
+
+
+@app.get("/api/cloths")
+async def list_cloths() -> dict[str, Any]:
+    """List garment images from backend/cloths for the live stage picker."""
+    if not CLOTHS_DIR.is_dir():
+        return {"items": []}
+    items: list[dict[str, str]] = []
+    for path in sorted(CLOTHS_DIR.iterdir()):
+        if not path.is_file() or path.suffix.lower() not in _CLOTH_IMAGE_SUFFIXES:
+            continue
+        items.append({"id": path.stem, "filename": path.name, "url": f"/cloths/{path.name}"})
+    return {"items": items}
+
+
+class ClothSelectRequest(BaseModel):
+    cloth_id: str = Field(..., min_length=1, max_length=64)
+    sessionid: str = Field(default="0", max_length=64)
+
+
+async def _post_webrtc_json(subpath: str, payload: dict[str, Any]) -> httpx.Response:
+    base = _livetalking_base()
+    url = f"{base}{subpath}"
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=20.0)) as client:
+            return await client.post(
+                url,
+                json=payload,
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+            )
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Upstream WebRTC server unreachable: {e}") from e
+
+
+@app.post("/api/cloth/select")
+async def select_cloth(body: ClothSelectRequest) -> dict[str, Any]:
+    """Apply a garment from backend/cloths on the hologram session."""
+    cloth_path = _resolve_cloth_path(body.cloth_id)
+    sessionid = (body.sessionid or "0").strip() or "0"
+    payload: dict[str, Any] = {
+        "type": "cloth",
+        "cloth_id": cloth_path.stem,
+        "cloth_file": cloth_path.name,
+        "cloth_path": f"/cloths/{cloth_path.name}",
+        "sessionid": sessionid,
+        "interrupt": True,
+    }
+    for subpath in ("/cloth", "/change_cloth", "/set_cloth"):
+        r = await _post_webrtc_json(subpath, payload)
+        if r.status_code < 400:
+            try:
+                data = r.json()
+            except Exception:
+                data = {"ok": True, "upstream_status": r.status_code}
+            return {"ok": True, "cloth_id": cloth_path.stem, "upstream": subpath, "response": data}
+    r_human = await _post_webrtc_json(
+        "/human",
+        {
+            **payload,
+            "text": "",
+        },
+    )
+    if r_human.status_code < 400:
+        try:
+            data = r_human.json()
+        except Exception:
+            data = {"ok": True, "upstream_status": r_human.status_code}
+        return {"ok": True, "cloth_id": cloth_path.stem, "upstream": "/human", "response": data}
+    detail = (r_human.text or "")[:400] or f"Cloth change failed ({r_human.status_code})"
+    raise HTTPException(status_code=502, detail=detail)
+
+
+_cloth_tryon_jobs: dict[str, dict[str, Any]] = {}
+_cloth_tryon_jobs_lock = asyncio.Lock()
+
+
+def _cloth_tryon_job_snapshot(job: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "job_id": job.get("job_id"),
+        "cloth_id": job.get("cloth_id"),
+        "status": job.get("status"),
+        "stage": job.get("stage"),
+        "message": job.get("message"),
+        "error": job.get("error"),
+        "result": job.get("result"),
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+    }
+
+
+async def _set_cloth_tryon_job(job_id: str, **fields: Any) -> None:
+    async with _cloth_tryon_jobs_lock:
+        job = _cloth_tryon_jobs.get(job_id)
+        if not job:
+            return
+        job.update(fields)
+        job["updated_at"] = time.time()
+
+
+async def _cloth_tryon_status_cb(job_id: str, stage: str, message: str) -> None:
+    status = "running" if stage not in ("succeeded", "failed") else stage
+    await _set_cloth_tryon_job(job_id, status=status, stage=stage, message=message)
+
+
+async def _run_cloth_tryon_job_task(
+    job_id: str,
+    cloth_id: str,
+    capture_path: Path,
+) -> None:
+    try:
+        if not TRYON_API_BASE:
+            raise RuntimeError("TRYON_API_BASE is not set.")
+        if not AVATAR_VIDEO_API_BASE:
+            raise RuntimeError("AVATAR_VIDEO_API_BASE is not set.")
+        if not WEBRTC_SIGNALING_BASE:
+            raise RuntimeError("WEBRTC_SIGNALING_BASE is not set.")
+        if not CLOTH_REFERENCE_VIDEO.is_file():
+            raise RuntimeError(f"Reference video not found: {CLOTH_REFERENCE_VIDEO}")
+        garment_path = _resolve_cloth_path(cloth_id)
+        hologram_ctx = resolve_cloth_hologram_context(
+            cloth_id,
+            force_regenerate=CLOTH_TRYON_FORCE_REGENERATE,
+            set_as_default=CLOTH_TRYON_SET_AS_DEFAULT,
+        )
+
+        async def on_status(stage: str, message: str) -> None:
+            await _cloth_tryon_status_cb(job_id, stage, message)
+
+        result = await run_cloth_tryon_pipeline(
+            cloth_id=cloth_id,
+            garment_path=garment_path,
+            capture_path=capture_path,
+            reference_video_path=CLOTH_REFERENCE_VIDEO,
+            tryon_base=TRYON_API_BASE,
+            video_api_base=AVATAR_VIDEO_API_BASE,
+            webrtc_base=WEBRTC_SIGNALING_BASE,
+            avatar_video_fixed_form=AVATAR_VIDEO_FIXED_FORM,
+            garment_description=CLOTH_TRYON_GARMENT_DESCRIPTION,
+            hologram=hologram_ctx,
+            tryon_timeout_sec=TRYON_TIMEOUT_SEC,
+            avatar_video_submit_timeout_sec=AVATAR_VIDEO_GENERATE_TIMEOUT_SEC,
+            avatar_video_poll_interval_sec=3.0,
+            avatar_video_job_timeout_sec=AVATAR_VIDEO_GENERATE_TIMEOUT_SEC,
+            hologram_upload_timeout_sec=HOLOGRAM_UPLOAD_TIMEOUT_SEC,
+            hologram_prepare_timeout_sec=HOLOGRAM_PREPARE_TIMEOUT_SEC,
+            on_status=on_status,
+        )
+        await _set_cloth_tryon_job(
+            job_id,
+            status="succeeded",
+            stage="succeeded",
+            message="Your hologram avatar is ready.",
+            result=result,
+            error=None,
+        )
+    except Exception as e:
+        logger.exception("cloth try-on job %s failed", job_id)
+        await _set_cloth_tryon_job(
+            job_id,
+            status="failed",
+            stage="failed",
+            message=str(e),
+            error=str(e),
+        )
+    finally:
+        shutil.rmtree(capture_path.parent, ignore_errors=True)
+
+
+@app.get("/api/cloth/tryon/config")
+async def cloth_tryon_config() -> dict[str, Any]:
+    hologram_ready = False
+    hologram_preview: dict[str, str] = {}
+    try:
+        ctx = resolve_cloth_hologram_context(
+            "preview",
+            force_regenerate=CLOTH_TRYON_FORCE_REGENERATE,
+            set_as_default=CLOTH_TRYON_SET_AS_DEFAULT,
+        )
+        hologram_ready = True
+        hologram_preview = {
+            "profile_id": ctx.profile_id,
+            "avatar_id": ctx.avatar_id,
+            "audio_id": ctx.audio_id,
+            "audio_path": ctx.audio_path,
+        }
+    except Exception:
+        hologram_ready = bool(livetalking_db_list_audios())
+    return {
+        "capture_seconds": CLOTH_CAPTURE_COUNTDOWN_SEC,
+        "tryon_configured": bool(TRYON_API_BASE),
+        "avatar_video_configured": bool(AVATAR_VIDEO_API_BASE),
+        "hologram_configured": bool(WEBRTC_SIGNALING_BASE),
+        "reference_video_present": CLOTH_REFERENCE_VIDEO.is_file(),
+        "hologram_assets_ready": hologram_ready,
+        "hologram_preview": hologram_preview,
+    }
+
+
+@app.post("/api/cloth/tryon")
+async def cloth_tryon_start(
+    cloth_id: str = Form(...),
+    capture: UploadFile = File(...),
+):
+    """Start try-on → avatar video → hologram prepare from a front-camera photo (or legacy video)."""
+    cid = (cloth_id or "").strip()
+    if not _CLOTH_ID_RE.fullmatch(cid):
+        raise HTTPException(status_code=400, detail="Invalid cloth_id.")
+    _resolve_cloth_path(cid)
+    if not capture.filename and not capture.content_type:
+        raise HTTPException(status_code=400, detail="Missing capture file.")
+    work = Path(tempfile.mkdtemp(prefix="cloth_capture_"))
+    ext = Path(capture.filename or "").suffix.lower()
+    ct = (capture.content_type or "").lower()
+    if ext in _CLOTH_CAPTURE_IMAGE_SUFFIXES:
+        capture_path = work / f"capture{ext}"
+    elif ext in _CLOTH_CAPTURE_VIDEO_SUFFIXES:
+        capture_path = work / f"capture{ext}"
+    elif "image" in ct:
+        capture_path = work / "capture.jpg"
+    elif "video" in ct:
+        capture_path = work / "capture.webm"
+    else:
+        raise HTTPException(status_code=400, detail="Capture must be a photo (JPEG/PNG) or video.")
+    size = 0
+    with capture_path.open("wb") as out:
+        while True:
+            chunk = await capture.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > CLOTH_CAPTURE_MAX_BYTES:
+                shutil.rmtree(work, ignore_errors=True)
+                raise HTTPException(status_code=413, detail="Capture file is too large.")
+            out.write(chunk)
+    if size < 256:
+        shutil.rmtree(work, ignore_errors=True)
+        raise HTTPException(status_code=400, detail="Capture file is empty or too small.")
+
+    job_id = uuid.uuid4().hex
+    now = time.time()
+    async with _cloth_tryon_jobs_lock:
+        _cloth_tryon_jobs[job_id] = {
+            "job_id": job_id,
+            "cloth_id": cid,
+            "status": "queued",
+            "stage": "queued",
+            "message": "Starting…",
+            "error": None,
+            "result": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+    asyncio.create_task(_run_cloth_tryon_job_task(job_id, cid, capture_path))
+    return {"job_id": job_id, "cloth_id": cid}
+
+
+@app.get("/api/cloth/tryon/jobs/{job_id}")
+async def cloth_tryon_job_status(job_id: str):
+    jid = (job_id or "").strip().lower()
+    if not re.fullmatch(r"^[a-f0-9]{32}$", jid):
+        raise HTTPException(status_code=400, detail="Invalid job id.")
+    async with _cloth_tryon_jobs_lock:
+        job = _cloth_tryon_jobs.get(jid)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    return _cloth_tryon_job_snapshot(job)
 
 
 logger = logging.getLogger("lipsync")

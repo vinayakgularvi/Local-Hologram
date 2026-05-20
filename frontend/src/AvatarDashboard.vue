@@ -401,6 +401,9 @@ async function prepareHologramAvatar() {
       : out.generated_now
         ? "Generated."
         : "Already prepared.";
+    if (typeof BroadcastChannel !== "undefined") {
+      new BroadcastChannel("hologram-avatar-prepared").postMessage({ source: "avatar-studio" });
+    }
     await loadHologramAvatarAssets();
   } catch (e) {
     hologramPrepareStatus.value = e instanceof Error ? e.message : String(e);
