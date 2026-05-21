@@ -133,7 +133,7 @@ const CAFE_MENU = [
       },
       {
         id: "salmon-bagel",
-        name: "Smoked Salmon Bagel",
+        name: "Smoked Chicken Burger",
         desc: "Cream Cheese, Dill, Capers, Red Onion",
         price: 16.0,
       },
