@@ -127,9 +127,9 @@ const CAFE_MENU = [
         price: 13.0,
       },
       {
-        id: "salmon-bagel",
+        id: "sourdough-chicken-sandwich",
         name: "Sourdough Chicken Sandwich",
-        desc: "Cream Cheese, Dill, Capers, Red Onion",
+        desc: "Crispy chicken, lettuce, tomato, onion, cheese, toasted sourdough",
         price: 16.0,
       },
       { id: "veg-sandwich", name: "Veg Sandwich", price: 12.0 },
@@ -148,10 +148,146 @@ const CAFE_MENU = [
 ];
 
 const MENU_HERO_ITEMS = [
-  { id: "burger", label: "Burger", src: "/menu-items/Burger.png" },
+  {
+    id: "sourdough-chicken-sandwich",
+    label: "Sourdough Chicken Sandwich",
+    src: "/menu-items/SourdoughChickenSandwich.png",
+  },
   { id: "latte", label: "Latte", src: "/menu-items/Latte.png" },
+  { id: "indian-filter-coffee", label: "Indian Filter Coffee", src: "/menu-items/IndianFilterCoffee.png" },
   { id: "croissant", label: "Croissant", src: "/menu-items/Croissant.png" },
 ];
+
+function normalizeMenuImageName(name) {
+  return String(name || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+/** Every cafe menu name → image (extend when adding PNGs under public/menu-items/). */
+const MENU_IMAGE_BY_NORMALIZED_NAME = (() => {
+  const map = new Map();
+  for (const h of MENU_HERO_ITEMS) {
+    map.set(normalizeMenuImageName(h.label), { id: h.id, label: h.label, src: h.src });
+  }
+  const assign = (name, id, src) => {
+    map.set(normalizeMenuImageName(name), { id, label: name, src });
+  };
+  assign("Espresso", "espresso", "/menu-items/Latte.png");
+  assign("Americano", "americano", "/menu-items/Latte.png");
+  assign("Latte", "latte", "/menu-items/Latte.png");
+  assign("Mocha", "mocha", "/menu-items/Latte.png");
+  assign("Indian Filter Coffee", "indian-filter-coffee", "/menu-items/IndianFilterCoffee.png");
+  assign("Lavender Oat Latte", "lavender-oat-latte", "/menu-items/Latte.png");
+  assign("Honey Blossom Cold Brew", "honey-blossom", "/menu-items/OrangeJuice.png");
+  assign("Matcha Rose Latte", "matcha-rose", "/menu-items/Latte.png");
+  assign("Acai Berry Bowl", "acai-bowl", "/menu-items/Croissant.png");
+  assign("Sourdough Chicken Sandwich", "sourdough-chicken-sandwich", "/menu-items/SourdoughChickenSandwich.png");
+  assign("Veg Sandwich", "veg-sandwich", "/menu-items/SourdoughChickenSandwich.png");
+  assign("Almond Croissant", "almond-croissant", "/menu-items/Croissant.png");
+  assign("Blueberry Muffin", "blueberry-muffin", "/menu-items/Croissant.png");
+  assign("House Granola", "house-granola", "/menu-items/Croissant.png");
+  assign("Vegan Brownie", "vegan-brownie", "/menu-items/Croissant.png");
+  return map;
+})();
+
+/** Hero strip above the text menu (static PNGs). */
+const MENU_HERO_IMAGES_ENABLED = false;
+/** Voice show_image featured item photos with 3D animation. */
+const SHOW_IMAGE_ENABLED = true;
+
+/** When non-empty, menu + hero strip hidden; item images shown with 3D animation. */
+const featuredMenuImages = ref([]);
+
+function resolveMenuImageByName(name) {
+  const key = normalizeMenuImageName(name);
+  if (!key) return null;
+  return MENU_IMAGE_BY_NORMALIZED_NAME.get(key) || null;
+}
+
+function parseShowImageInner(inner) {
+  const s = String(inner || "").trim();
+  if (!s) return null;
+  const candidates = [s];
+  if (s.includes("{{") || s.includes("}}")) {
+    candidates.push(s.replace(/\{\{/g, "{").replace(/\}\}/g, "}"));
+  }
+  for (const cand of candidates) {
+    try {
+      const obj = JSON.parse(cand);
+      if (obj && typeof obj === "object" && Array.isArray(obj.items)) {
+        const items = obj.items
+          .filter((it) => it && typeof it === "object" && String(it.name || "").trim())
+          .map((it) => ({ name: String(it.name).trim() }));
+        if (items.length) return { items };
+      }
+    } catch {
+      /* plain name fallback below */
+    }
+  }
+  return { items: [{ name: s }] };
+}
+
+function parseShowImageFromAnswer(raw) {
+  const re = /<show_image>\s*([\s\S]*?)\s*<\/show_image>/gi;
+  let lastInner = null;
+  for (const m of String(raw || "").matchAll(re)) {
+    const inner = (m[1] || "").trim();
+    if (inner) lastInner = inner;
+  }
+  if (!lastInner) return null;
+  return parseShowImageInner(lastInner);
+}
+
+function normalizeShowImagePayload(payload) {
+  if (!payload) return null;
+  if (typeof payload === "string") {
+    const s = payload.trim();
+    if (!s) return null;
+    try {
+      return parseShowImageInner(s);
+    } catch {
+      return { items: [{ name: s }] };
+    }
+  }
+  if (typeof payload === "object" && Array.isArray(payload.items)) {
+    const items = payload.items
+      .filter((it) => it && String(it.name || "").trim())
+      .map((it) => ({ name: String(it.name).trim() }));
+    return items.length ? { items } : null;
+  }
+  return null;
+}
+
+function resolveMenuImagesFromPayload(payload) {
+  const norm = normalizeShowImagePayload(payload);
+  if (!norm?.items?.length) return [];
+  const out = [];
+  const seen = new Set();
+  for (const it of norm.items) {
+    const img = resolveMenuImageByName(it.name);
+    if (!img || seen.has(img.id)) continue;
+    seen.add(img.id);
+    out.push(img);
+  }
+  return out;
+}
+
+function applyShowImageFromVoiceTurn(data) {
+  if (!SHOW_IMAGE_ENABLED) {
+    featuredMenuImages.value = [];
+    return;
+  }
+  const payload =
+    normalizeShowImagePayload(data?.show_image) || parseShowImageFromAnswer(data?.answer);
+  const images = resolveMenuImagesFromPayload(payload);
+  featuredMenuImages.value = images;
+}
+
+function clearFeaturedMenuImage() {
+  featuredMenuImages.value = [];
+}
 
 const finalTranscript = ref("");
 const interimTranscript = ref("");
@@ -508,7 +644,9 @@ async function runVoicePipeline(userText) {
     } else if (receipt?.items?.length) {
       liveBill.value = { items: receipt.items };
     }
-    if (!speakText && !receipt?.items?.length && orderNum == null) {
+    applyShowImageFromVoiceTurn(data);
+    const hasShowImage = SHOW_IMAGE_ENABLED && featuredMenuImages.value.length > 0;
+    if (!speakText && !receipt?.items?.length && orderNum == null && !hasShowImage) {
       throw new Error("Model returned an empty reply.");
     }
     if (speakText) {
@@ -541,6 +679,7 @@ function stopMicInternal({ cancel }) {
 
 function toggleMic() {
   webrtcError.value = "";
+  clearFeaturedMenuImage();
   if (!started.value) {
     webrtcError.value = "Connecting… try again in a moment.";
     return;
@@ -642,6 +781,7 @@ function stripReceiptForSpeech(raw) {
   return String(raw || "")
     .replace(/<receipt>\s*[\s\S]*?\s*<\/receipt>/gi, "")
     .replace(/<orderdone>\s*[\s\S]*?\s*<\/orderdone>/gi, "")
+    .replace(/<show_image>\s*[\s\S]*?\s*<\/show_image>/gi, "")
     .trim();
 }
 
@@ -729,7 +869,10 @@ onUnmounted(() => {
       </select>
     </div>
     <div class="media-stack">
-      <div class="video-wrap">
+      <div
+        class="video-wrap"
+        :class="{ 'video-wrap--featured-image': SHOW_IMAGE_ENABLED && featuredMenuImages.length > 0 }"
+      >
         <div
           v-if="!videoReady && !webrtcError"
           class="video-loading"
@@ -816,9 +959,46 @@ onUnmounted(() => {
           </div>
         </aside>
 
-        <aside class="cafe-menu" aria-label="Holuminex Cafe menu">
+        <div
+          v-if="SHOW_IMAGE_ENABLED && featuredMenuImages.length"
+          class="menu-featured"
+          :class="{ 'menu-featured--multi': featuredMenuImages.length > 1 }"
+          role="group"
+          aria-label="Featured menu items"
+        >
+          <div class="menu-featured__grid">
+            <article
+              v-for="(img, fIdx) in featuredMenuImages"
+              :key="img.id"
+              class="menu-featured__card"
+              :style="{
+                '--featured-delay': `${fIdx * 0.1}s`,
+                '--featured-3d-phase': `${fIdx * 0.35}s`,
+              }"
+            >
+              <div class="menu-featured__stage">
+                <img
+                  class="menu-featured__img"
+                  :src="img.src"
+                  :alt="img.label"
+                  width="480"
+                  height="480"
+                  loading="lazy"
+                  decoding="async"
+                />
+              </div>
+              <p v-if="featuredMenuImages.length > 1" class="menu-featured__caption">{{ img.label }}</p>
+            </article>
+          </div>
+        </div>
+
+        <aside
+          v-show="!featuredMenuImages.length"
+          class="cafe-menu"
+          aria-label="Holuminex Cafe menu"
+        >
           <div class="cafe-menu__center">
-            <div class="cafe-menu__heroes" aria-hidden="true">
+            <div v-if="MENU_HERO_IMAGES_ENABLED" class="cafe-menu__heroes" aria-hidden="true">
               <div
                 v-for="(hero, hIdx) in MENU_HERO_ITEMS"
                 :key="hero.id"
@@ -1259,11 +1439,150 @@ onUnmounted(() => {
   }
 }
 
+@keyframes menu-featured-3d-in {
+  from {
+    opacity: 0;
+    transform: rotateY(-14deg) rotateX(8deg) translateY(18px) scale(0.88);
+  }
+  to {
+    opacity: 1;
+    transform: rotateY(-4deg) rotateX(3deg) translateY(0) scale(1);
+  }
+}
+
+@keyframes menu-featured-3d-idle {
+  0%,
+  100% {
+    transform: rotateY(-5deg) rotateX(2deg) translateY(0) scale(1);
+  }
+  25% {
+    transform: rotateY(5deg) rotateX(-2deg) translateY(-4px) scale(1.02);
+  }
+  50% {
+    transform: rotateY(7deg) rotateX(3deg) translateY(-2px) scale(1.03);
+  }
+  75% {
+    transform: rotateY(-3deg) rotateX(2deg) translateY(-3px) scale(1.01);
+  }
+}
+
+.video-wrap--featured-image {
+  overflow: visible;
+}
+
+.menu-featured {
+  position: absolute;
+  left: clamp(1.25rem, 5.5cqw, 8rem);
+  right: clamp(1.25rem, 5.5cqw, 8rem);
+  top: clamp(6rem, 18cqh, 14rem);
+  bottom: max(3.5rem, 9cqh, env(safe-area-inset-bottom));
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  perspective: clamp(900px, 120cqw, 1400px);
+  perspective-origin: 50% 55%;
+}
+
+.menu-featured__grid {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: clamp(0.45rem, 1.35cqw, 1.15rem);
+  width: 100%;
+  max-width: 100%;
+  max-height: 100%;
+  overflow: visible;
+  padding: clamp(0.75rem, 2cqh, 1.5rem) clamp(0.5rem, 1.2cqw, 1rem);
+  background: transparent;
+  border: none;
+  box-shadow: none;
+}
+
+.menu-featured__card {
+  --featured-delay: 0s;
+  --featured-3d-phase: 0s;
+  flex: 0 1 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: clamp(0.15rem, 0.4cqw, 0.3rem);
+  padding: clamp(0.35rem, 1cqh, 0.75rem);
+  background: transparent;
+  overflow: visible;
+}
+
+.menu-featured__stage {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  transform-style: preserve-3d;
+  transform-origin: 50% 62%;
+  animation:
+    menu-featured-3d-in 0.75s cubic-bezier(0.22, 1, 0.36, 1) var(--featured-delay) both,
+    menu-featured-3d-idle 5.5s ease-in-out calc(0.75s + var(--featured-3d-phase)) infinite;
+  will-change: transform;
+  overflow: visible;
+}
+
+.menu-featured__img {
+  position: relative;
+  z-index: 1;
+  display: block;
+  width: auto;
+  max-width: min(100%, 36rem);
+  max-height: min(100%, 48cqh, 54vh);
+  height: auto;
+  object-fit: contain;
+  object-position: center center;
+  background: transparent;
+  /* PNGs exported on black: knock out dark backdrop, show avatar through */
+  mix-blend-mode: screen;
+  transform: translateZ(24px);
+  transform-style: preserve-3d;
+  filter: none;
+  box-shadow: none;
+}
+
+.menu-featured__caption {
+  margin: 0;
+  max-width: clamp(5rem, 18cqw, 11rem);
+  font-size: clamp(0.52rem, 1.05cqw, 0.75rem);
+  font-weight: 700;
+  line-height: 1.2;
+  text-align: center;
+  color: #fff;
+  text-shadow:
+    0 1px 3px rgba(0, 0, 0, 0.55),
+    0 0 12px rgba(0, 0, 0, 0.35);
+}
+
+.menu-featured--multi .menu-featured__stage {
+  width: auto;
+  max-width: clamp(5.5rem, 19cqw, 11.5rem);
+}
+
+.menu-featured--multi .menu-featured__img {
+  width: auto;
+  max-width: 100%;
+  max-height: min(100%, 22cqh, 26vh);
+}
+
 .cafe-menu {
   position: absolute;
   left: clamp(2rem, 9.65cqw, 15rem);
   right: clamp(2rem, 9.65cqw, 15rem);
-  bottom: max(1.85rem, 5cqh, env(safe-area-inset-bottom));
+  bottom: max(3.35rem, 8.5cqh, env(safe-area-inset-bottom));
   z-index: 4;
   display: flex;
   justify-content: center;
@@ -1470,8 +1789,19 @@ onUnmounted(() => {
 @media (prefers-reduced-motion: reduce) {
   .cafe-menu,
   .cafe-menu__section,
-  .cafe-menu__hero {
+  .cafe-menu__hero,
+  .menu-featured,
+  .menu-featured__stage,
+  .menu-featured__card {
     animation: none;
+  }
+
+  .menu-featured__stage {
+    transform: none;
+  }
+
+  .menu-featured__img {
+    transform: none;
   }
 
   .cafe-menu__box::before {

@@ -1898,6 +1898,7 @@ class VoiceTurnBody(BaseModel):
 
 _RECEIPT_BLOCK_RE = re.compile(r"<receipt>\s*([\s\S]*?)\s*</receipt>", re.IGNORECASE)
 _ORDERDONE_BLOCK_RE = re.compile(r"<orderdone>\s*(.*?)\s*</orderdone>", re.IGNORECASE | re.DOTALL)
+_SHOW_IMAGE_BLOCK_RE = re.compile(r"<show_image>\s*([\s\S]*?)\s*</show_image>", re.IGNORECASE)
 
 
 def _parse_order_done_number(inner: str) -> int:
@@ -1938,9 +1939,58 @@ def split_voice_answer_receipt(raw: str) -> tuple[str, dict[str, Any] | None, in
     for m in _ORDERDONE_BLOCK_RE.finditer(text):
         order_done = _parse_order_done_number(m.group(1) or "")
     speak = _RECEIPT_BLOCK_RE.sub("", text)
-    speak = _ORDERDONE_BLOCK_RE.sub("", speak).strip()
+    speak = _ORDERDONE_BLOCK_RE.sub("", speak)
+    speak = _SHOW_IMAGE_BLOCK_RE.sub("", speak).strip()
     receipt: dict[str, Any] | None = {"items": merged_items} if merged_items else None
     return speak, receipt, order_done
+
+
+def _parse_show_image_inner(inner: str) -> dict[str, Any] | None:
+    """
+    Parse <show_image> body: JSON {"items":[{"name":"..."}]} or plain item name.
+    Tolerates doubled braces from templating: {{"items":[...]}}.
+    """
+    s = (inner or "").strip()
+    if not s:
+        return None
+    candidates = [s]
+    if "{{" in s or "}}" in s:
+        candidates.append(s.replace("{{", "{").replace("}}", "}"))
+    for cand in candidates:
+        try:
+            obj = json.loads(cand)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and isinstance(obj.get("items"), list):
+            items = [
+                {"name": str(it.get("name", "")).strip()}
+                for it in obj["items"]
+                if isinstance(it, dict) and str(it.get("name", "")).strip()
+            ]
+            if items:
+                return {"items": items}
+    return {"items": [{"name": s}]}
+
+
+def parse_show_image_from_answer(raw: str) -> dict[str, Any] | None:
+    """Last <show_image>…</show_image> payload as {items: [{name}, …]}."""
+    if not raw or not isinstance(raw, str):
+        return None
+    last_inner: str | None = None
+    for m in _SHOW_IMAGE_BLOCK_RE.finditer(raw.strip()):
+        inner = (m.group(1) or "").strip()
+        if inner:
+            last_inner = inner
+    if last_inner is None:
+        return None
+    return _parse_show_image_inner(last_inner)
+
+
+def _show_image_has_items(payload: dict[str, Any] | None) -> bool:
+    if not payload or not isinstance(payload, dict):
+        return False
+    items = payload.get("items")
+    return isinstance(items, list) and len(items) > 0
 
 
 @app.post("/api/voice-turn")
@@ -1972,7 +2022,13 @@ async def voice_turn(body: VoiceTurnBody):
     if not (answer or "").strip():
         raise HTTPException(status_code=502, detail="Model returned an empty reply.")
     speak_text, receipt, order_done_num = split_voice_answer_receipt(answer)
-    if not speak_text.strip() and not (receipt and receipt.get("items")) and order_done_num is None:
+    show_image = parse_show_image_from_answer(answer)
+    if (
+        not speak_text.strip()
+        and not (receipt and receipt.get("items"))
+        and order_done_num is None
+        and not _show_image_has_items(show_image)
+    ):
         raise HTTPException(status_code=502, detail="Model returned an empty reply.")
     total_ms = (time.perf_counter() - t0) * 1000.0
     if os.environ.get("ANALYTICS_DISABLE", "").strip().lower() not in (
@@ -1994,6 +2050,7 @@ async def voice_turn(body: VoiceTurnBody):
     return {
         "answer": answer,
         "speak_text": speak_text,
+        "show_image": show_image,
         "receipt": receipt,
         "order_done": ({"number": int(order_done_num)} if order_done_num is not None else None),
         "heard": user_text,
