@@ -220,7 +220,7 @@ AVATAR_VIDEO_PROMPT = (
     "Preserve the exact same person from the source image with identical face structure, eyes, "
     "nose, skin tone, hairstyle, and clothing. Do not change identity or facial features. Apply "
     "only the body motion and camera movement from the reference video. Maintain consistent facial "
-    "appearance across all frames with realistic anatomy, cinematic lighting, and natural motion."
+    "appearance across all frames with realistic anatomy, cinematic lighting, and natural motion. copy exact same motion do not add extra motion or anything else. keep smiling face as reference video."
 )
 AVATAR_VIDEO_NEGATIVE_PROMPT = (
     "different person, face distortion, identity change, different face, mutated face, blurry face, "

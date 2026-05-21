@@ -78,6 +78,85 @@ const liveBill = ref(null);
 /** Shown at top of stage when <orderdone> is present; live bill is cleared. */
 const orderPlacedMessage = ref("");
 let orderPlacedHideTimer = null;
+
+/** Holuminex Cafe menu (transparent panel on hologram stage). */
+const CAFE_MENU = [
+  {
+    id: "coffee",
+    title: "Coffee & Espresso",
+    items: [
+      { id: "espresso", name: "Espresso", price: 3.5 },
+      { id: "americano", name: "Americano", price: 4.0 },
+      { id: "latte", name: "Latte", price: 5.5 },
+      { id: "mocha", name: "Mocha", price: 6.0 },
+    ],
+  },
+  {
+    id: "signature",
+    title: "Signature Drinks",
+    items: [
+      {
+        id: "lavender-oat-latte",
+        name: "Lavender Oat Latte",
+        desc: "Espresso, Lavender, Oat Milk",
+        price: 7.0,
+      },
+      {
+        id: "honey-blossom",
+        name: "Honey Blossom Cold Brew",
+        desc: "Honey, Vanilla Cold Foam",
+        price: 6.5,
+      },
+      {
+        id: "matcha-rose",
+        name: "Matcha Rose Latte",
+        desc: "Ceremonial Matcha, Rose Water, Steamed Milk",
+        price: 7.25,
+      },
+    ],
+  },
+  {
+    id: "brunch",
+    title: "All-Day Brunch",
+    items: [
+      {
+        id: "avocado-toast",
+        name: "Smashed Avocado Toast",
+        desc: "Sourdough, Feta, Cherry Tomatoes, Chili Flakes",
+        price: 14.0,
+      },
+      {
+        id: "acai-bowl",
+        name: "Acai Berry Bowl",
+        desc: "Granola, Fruit, Coconut, Honey",
+        price: 13.0,
+      },
+      {
+        id: "salmon-bagel",
+        name: "Smoked Salmon Bagel",
+        desc: "Cream Cheese, Dill, Capers, Red Onion",
+        price: 16.0,
+      },
+    ],
+  },
+  {
+    id: "pastries",
+    title: "Bites & Pastries",
+    items: [
+      { id: "almond-croissant", name: "Almond Croissant", price: 5.0 },
+      { id: "blueberry-muffin", name: "Blueberry Muffin", price: 4.5 },
+      { id: "house-granola", name: "House Granola", price: 6.0 },
+      { id: "vegan-brownie", name: "Vegan Brownie", price: 5.5 },
+    ],
+  },
+];
+
+const MENU_HERO_ITEMS = [
+  { id: "burger", label: "Burger", src: "/menu-items/Burger.png" },
+  { id: "latte", label: "Latte", src: "/menu-items/Latte.png" },
+  { id: "croissant", label: "Croissant", src: "/menu-items/Croissant.png" },
+];
+
 const finalTranscript = ref("");
 const interimTranscript = ref("");
 const WEBRTC_ICE_GATHER_TIMEOUT_MS = Math.max(
@@ -741,24 +820,56 @@ onUnmounted(() => {
           </div>
         </aside>
 
-        <aside class="menu-overlay" aria-label="Holuminex Cafe menu">
-          <div class="menu-overlay__inner">
-            <div class="menu-banner">
-              <span class="menu-banner__bean" aria-hidden="true">☕</span>
-              <div>
-                <h2 class="menu-banner__title">Holuminex Cafe</h2>
-                <p class="menu-banner__meta">Seattle · All day</p>
+        <aside class="cafe-menu" aria-label="Holuminex Cafe menu">
+          <div class="cafe-menu__center">
+            <div class="cafe-menu__heroes" aria-hidden="true">
+              <div
+                v-for="(hero, hIdx) in MENU_HERO_ITEMS"
+                :key="hero.id"
+                class="cafe-menu__hero"
+                :style="{
+                  '--hero-delay': `${0.05 + hIdx * 0.09}s`,
+                  '--hero-float-delay': `${hIdx * 0.55}s`,
+                }"
+              >
+                <img
+                  class="cafe-menu__hero-img"
+                  :src="hero.src"
+                  :alt="hero.label"
+                  width="160"
+                  height="160"
+                  loading="lazy"
+                  decoding="async"
+                />
               </div>
             </div>
-            <figure class="menu-figure">
-              <img
-                src="/menu-holuminex.png"
-                alt="Holuminex Cafe menu"
-                width="640"
-                height="360"
-                loading="lazy"
-              />
-            </figure>
+            <div class="cafe-menu__box">
+              <div class="cafe-menu__panel">
+                <section
+                  v-for="(section, sIdx) in CAFE_MENU"
+                  :key="section.id"
+                  class="cafe-menu__section"
+                  :style="{ '--section-delay': `${0.08 + sIdx * 0.07}s` }"
+                >
+                  <h3 class="cafe-menu__section-title">{{ section.title }}</h3>
+                  <ul class="cafe-menu__list">
+                    <li
+                      v-for="item in section.items"
+                      :key="item.id"
+                      class="cafe-menu__row"
+                    >
+                      <div class="cafe-menu__row-main">
+                        <span class="cafe-menu__name">{{ item.name }}</span>
+                        <span class="cafe-menu__leader" aria-hidden="true" />
+                        <span class="cafe-menu__price">${{ formatBillMoney(item.price) }}</span>
+                      </div>
+                      <p v-if="item.desc" class="cafe-menu__desc">{{ item.desc }}</p>
+                      <p v-if="item.note" class="cafe-menu__note">{{ item.note }}</p>
+                    </li>
+                  </ul>
+                </section>
+              </div>
+            </div>
           </div>
         </aside>
 
@@ -925,7 +1036,8 @@ onUnmounted(() => {
   height: auto;
   background: #e4e2e2;
   overflow: hidden;
-  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.06);
+  border: clamp(2px, 0.14cqw, 5px) solid #d8d8d8;
+  box-shadow: none;
 }
 
 .video {
@@ -933,7 +1045,7 @@ onUnmounted(() => {
   position: absolute;
   inset: 0;
   z-index: 0;
-  width: 80%;
+  width: 100%;
   height: 100%;
   object-fit: cover;
   object-position: center center;
@@ -944,9 +1056,8 @@ onUnmounted(() => {
   top: 0;
   bottom: 0;
   z-index: 1;
-  /* ~240px at 2490px wide */
   width: clamp(2rem, 9.65cqw, 15rem);
-  background: #e4e2e2;
+  background: transparent;
   pointer-events: none;
 }
 
@@ -1097,32 +1208,18 @@ onUnmounted(() => {
   font-variant-numeric: tabular-nums;
 }
 
-@keyframes menu-card-entrance {
+@keyframes cafe-menu-in {
   from {
     opacity: 0;
-    transform: translate3d(-14%, 18px, 0) scale(0.94);
+    transform: translateY(18px);
   }
   to {
     opacity: 1;
-    transform: translate3d(0, 0, 0) scale(1);
+    transform: translateY(0);
   }
 }
 
-@keyframes menu-card-glow {
-  0%,
-  100% {
-    box-shadow:
-      0 8px 28px rgba(0, 0, 0, 0.12),
-      0 0 0 0 rgba(13, 148, 136, 0);
-  }
-  50% {
-    box-shadow:
-      0 14px 36px rgba(0, 0, 0, 0.14),
-      0 0 28px rgba(13, 148, 136, 0.14);
-  }
-}
-
-@keyframes menu-banner-in {
+@keyframes cafe-menu-section-in {
   from {
     opacity: 0;
     transform: translateY(10px);
@@ -1133,130 +1230,257 @@ onUnmounted(() => {
   }
 }
 
-@keyframes menu-figure-in {
+@keyframes cafe-menu-hero-pop {
   from {
     opacity: 0;
-    transform: scale(0.97);
+    transform: translateY(20px) scale(0.86);
   }
   to {
     opacity: 1;
-    transform: scale(1);
+    transform: translateY(0) scale(1);
   }
 }
 
-@keyframes menu-bean-wiggle {
+@keyframes cafe-menu-hero-float {
   0%,
   100% {
-    transform: rotate(0deg);
+    transform: translateY(0);
   }
-  30% {
-    transform: rotate(-10deg);
-  }
-  60% {
-    transform: rotate(8deg);
+  50% {
+    transform: translateY(-8px);
   }
 }
 
-.menu-overlay {
+@keyframes cafe-menu-border-flow {
+  0% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0% 50%;
+  }
+}
+
+.cafe-menu {
   position: absolute;
-  top: auto;
-  bottom: max(0.45rem, env(safe-area-inset-bottom));
-  right: max(0.35rem, env(safe-area-inset-left));
-  z-index: 2;
-  width: min(42cqw, 92vw);
-  max-height: min(62cqh, 78vh);
-  overflow: hidden auto;
-  border-radius: clamp(10px, 1.2cqw, 16px);
-  background: rgba(255, 255, 255, 0.93);
-  border: 1px solid rgba(15, 23, 42, 0.12);
-  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.12);
-  pointer-events: auto;
-  -webkit-overflow-scrolling: touch;
-  transform-origin: left bottom;
-  animation:
-    menu-card-entrance 0.68s cubic-bezier(0.22, 1, 0.36, 1) both,
-    menu-card-glow 4.5s ease-in-out 0.72s infinite;
-  will-change: transform, opacity;
-}
-
-.menu-overlay__inner {
-  padding: clamp(0.35rem, 0.9cqw, 0.65rem);
-}
-
-.menu-banner {
+  left: clamp(2rem, 9.65cqw, 15rem);
+  right: clamp(2rem, 9.65cqw, 15rem);
+  bottom: max(1.85rem, 5cqh, env(safe-area-inset-bottom));
+  z-index: 4;
   display: flex;
+  justify-content: center;
+  pointer-events: none;
+  animation: cafe-menu-in 0.65s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.cafe-menu__center {
+  display: flex;
+  flex-direction: column;
   align-items: center;
-  gap: clamp(0.25rem, 0.6cqw, 0.5rem);
-  padding: clamp(0.25rem, 0.55cqw, 0.45rem) clamp(0.35rem, 0.8cqw, 0.55rem);
-  border-radius: clamp(8px, 1cqw, 12px);
-  background: linear-gradient(120deg, #0d9488, #14b8a6);
-  color: #fff;
-  margin-bottom: clamp(0.25rem, 0.6cqw, 0.45rem);
-  animation: menu-banner-in 0.55s ease backwards;
-  animation-delay: 0.1s;
+  gap: clamp(0.35rem, 0.9cqw, 0.7rem);
+  width: 100%;
+  max-width: min(98cqw, 100%);
 }
 
-.menu-banner__bean {
-  font-size: clamp(0.85rem, 2cqw, 1.15rem);
-  line-height: 1;
-  display: inline-block;
-  transform-origin: 60% 70%;
-  animation: menu-bean-wiggle 3.2s ease-in-out 0.85s infinite;
+.cafe-menu__heroes {
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  flex-wrap: nowrap;
+  gap: clamp(0.5rem, 2cqw, 1.5rem);
+  width: 100%;
+  padding: 0 clamp(0.25rem, 0.6cqw, 0.5rem);
+  pointer-events: none;
 }
 
-.menu-banner__title {
-  margin: 0;
-  font-size: clamp(0.62rem, 1.45cqw, 0.88rem);
-  letter-spacing: 0.03em;
+.cafe-menu__hero {
+  --hero-delay: 0s;
+  --hero-float-delay: 0s;
+  flex: 0 1 auto;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  min-width: clamp(3.5rem, 14cqw, 8rem);
+  max-width: clamp(4.5rem, 18cqw, 10rem);
+  animation:
+    cafe-menu-hero-pop 0.55s cubic-bezier(0.22, 1, 0.36, 1) var(--hero-delay) both,
+    cafe-menu-hero-float 3.4s ease-in-out var(--hero-float-delay) infinite;
 }
 
-.menu-banner__meta {
-  margin: 0.05rem 0 0;
-  font-size: clamp(0.52rem, 1.1cqw, 0.68rem);
-  opacity: 0.95;
-}
-
-.menu-figure {
-  margin: 0;
-  border-radius: clamp(6px, 0.8cqw, 10px);
-  overflow: hidden;
-  border: 1px solid rgba(148, 163, 184, 0.35);
-  animation: menu-figure-in 0.6s ease backwards;
-  animation-delay: 0.22s;
-}
-
-.menu-figure img {
+.cafe-menu__hero-img {
   display: block;
   width: 100%;
-  height: auto;
-  transition: transform 0.35s ease;
+  height: clamp(3.25rem, 14cqw, 7.5rem);
+  object-fit: contain;
+  filter: drop-shadow(0 8px 16px rgba(0, 0, 0, 0.22));
 }
 
-.menu-overlay:hover .menu-figure img {
-  transform: scale(1.02);
+.cafe-menu__box {
+  --menu-border-width: clamp(2px, 0.35cqw, 3px);
+  position: relative;
+  isolation: isolate;
+  display: block;
+  width: 100%;
+  padding: clamp(0.55rem, 1.25cqw, 0.9rem) clamp(0.65rem, 1.5cqw, 1.1rem);
+  border: none;
+  border-radius: clamp(8px, 1.1cqw, 14px);
+  background: rgba(15, 23, 42, 0.14);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  box-shadow: 0 6px 20px rgba(15, 23, 42, 0.12);
+  pointer-events: auto;
+}
+
+.cafe-menu__box::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: var(--menu-border-width);
+  background: linear-gradient(
+    90deg,
+    rgba(167, 139, 250, 0.55),
+    rgba(233, 213, 255, 1),
+    rgba(196, 181, 253, 0.95),
+    rgba(139, 92, 246, 0.7),
+    rgba(233, 213, 255, 1),
+    rgba(167, 139, 250, 0.55)
+  );
+  background-size: 280% 100%;
+  animation: cafe-menu-border-flow 3.2s ease-in-out infinite;
+  pointer-events: none;
+  z-index: -1;
+  -webkit-mask:
+    linear-gradient(#fff 0 0) content-box,
+    linear-gradient(#fff 0 0);
+  mask:
+    linear-gradient(#fff 0 0) content-box,
+    linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+}
+
+.cafe-menu__panel {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: clamp(0.45rem, 1.1cqw, 0.85rem) clamp(0.55rem, 1.35cqw, 1rem);
+  width: 100%;
+  max-height: min(48cqh, 54vh);
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: clamp(0.1rem, 0.3cqw, 0.25rem) clamp(0.15rem, 0.4cqw, 0.35rem);
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(196, 181, 253, 0.55) transparent;
+}
+
+.cafe-menu__panel::-webkit-scrollbar {
+  width: 4px;
+}
+
+.cafe-menu__panel::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: rgba(196, 181, 253, 0.55);
+}
+
+.cafe-menu__section {
+  --section-delay: 0s;
+  min-width: 0;
+  margin: 0;
+  animation: cafe-menu-section-in 0.5s ease var(--section-delay) both;
+}
+
+.cafe-menu__section-title {
+  margin: 0 0 clamp(0.28rem, 0.55cqw, 0.45rem);
+  padding: clamp(0.28rem, 0.55cqw, 0.42rem) clamp(0.65rem, 1.45cqw, 1rem);
+  border-radius: clamp(6px, 0.75cqw, 10px);
+  font-size: clamp(0.62rem, 1.38cqw, 0.95rem);
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  text-align: center;
+  color: #fff;
+  background: linear-gradient(120deg, rgba(233, 213, 255, 0.92) 0%, rgba(196, 181, 253, 0.88) 100%);
+  text-shadow: 0 1px 2px rgba(91, 33, 182, 0.2);
+}
+
+.cafe-menu__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.cafe-menu__row {
+  margin-bottom: clamp(0.22rem, 0.45cqw, 0.32rem);
+}
+
+.cafe-menu__row-main {
+  display: flex;
+  align-items: baseline;
+  gap: 0.25rem;
+}
+
+.cafe-menu__name {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: clamp(0.68rem, 1.48cqw, 1rem);
+  font-weight: 700;
+  color: #fff;
+  line-height: 1.25;
+  word-break: break-word;
+  text-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.55),
+    0 0 10px rgba(0, 0, 0, 0.35);
+}
+
+.cafe-menu__leader {
+  flex: 1 1 auto;
+  min-width: 0.35rem;
+  margin: 0 0.15rem;
+  border-bottom: 1px dotted rgba(255, 255, 255, 0.45);
+  transform: translateY(-0.15em);
+}
+
+.cafe-menu__price {
+  flex: 0 0 auto;
+  font-size: clamp(0.68rem, 1.45cqw, 0.98rem);
+  font-weight: 800;
+  color: #fff;
+  font-variant-numeric: tabular-nums;
+  text-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.55),
+    0 0 10px rgba(0, 0, 0, 0.35);
+}
+
+.cafe-menu__desc,
+.cafe-menu__note {
+  margin: 0.1rem 0 0;
+  font-size: clamp(0.55rem, 1.15cqw, 0.82rem);
+  line-height: 1.3;
+  color: rgba(255, 255, 255, 0.88);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
+}
+
+.cafe-menu__note {
+  font-style: italic;
+  color: rgba(233, 213, 255, 0.95);
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .menu-overlay {
-    animation: none;
-    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.12);
-  }
-
-  .menu-banner,
-  .menu-figure {
+  .cafe-menu,
+  .cafe-menu__section,
+  .cafe-menu__hero {
     animation: none;
   }
 
-  .menu-banner__bean {
+  .cafe-menu__box::before {
     animation: none;
-  }
-
-  .menu-figure img {
-    transition: none;
-  }
-
-  .menu-overlay:hover .menu-figure img {
-    transform: none;
+    background-position: 50% 50%;
   }
 }
 

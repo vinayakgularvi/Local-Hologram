@@ -5,6 +5,9 @@ const languages = ["Auto", "Chinese", "English", "German", "Italian", "Portugues
 
 const avatarVoiceName = ref("Avatar Voice");
 const promptText = ref("");
+const voiceAudioUploadInput = ref(null);
+const audioScriptUploadInput = ref(null);
+const VOICE_AUDIO_ACCEPT = "audio/*,.wav,.webm,.mp3,.m4a,.ogg,.aac";
 const customerRecordFile = ref(null);
 const customerRecordPreview = ref("");
 const customerSaveUrl = ref("");
@@ -38,6 +41,7 @@ function hologramAssetLabel(item, idKey) {
 }
 
 const hasSavedRecording = computed(() => Boolean(customerSaveUrl.value));
+const hasVoiceSourceAudio = computed(() => Boolean(customerRecordFile.value));
 const hasVoiceProfile = computed(() => Boolean(voiceProfileUrl.value));
 const hasVoiceFileReady = computed(() => Boolean(selectedVoiceFile.value));
 
@@ -1324,8 +1328,46 @@ function stopRecording() {
   if (mediaRecorder && customerRecording.value) mediaRecorder.stop();
 }
 
+function onUploadVoiceAudio(ev) {
+  const f = ev.target.files?.[0];
+  if (!f) return;
+  if (customerRecording.value) {
+    customerStatus.value = "Stop the microphone recording before uploading a file.";
+    ev.target.value = "";
+    return;
+  }
+  customerRecordFile.value = f;
+  customerRecordPreview.value = toPreview(f);
+  customerSaveUrl.value = "";
+  customerStatus.value = `Uploaded ${f.name}. Save it to continue, or go to step 2 to clone.`;
+  ev.target.value = "";
+}
+
+function triggerVoiceAudioUpload() {
+  voiceAudioUploadInput.value?.click();
+}
+
+function onUploadAudioScript(ev) {
+  const f = ev.target.files?.[0];
+  if (!f) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    promptText.value = String(reader.result || "").trim();
+    customerStatus.value = f.name ? `Audio script loaded from ${f.name}.` : "Audio script loaded from file.";
+  };
+  reader.onerror = () => {
+    customerStatus.value = "Could not read the script file.";
+  };
+  reader.readAsText(f);
+  ev.target.value = "";
+}
+
+function triggerAudioScriptUpload() {
+  audioScriptUploadInput.value?.click();
+}
+
 async function saveRecording() {
-  if (!customerRecordFile.value) return void (customerStatus.value = "Please record audio first.");
+  if (!customerRecordFile.value) return void (customerStatus.value = "Please record or upload audio first.");
   customerRecordBusy.value = true;
   customerStatus.value = "Saving recording...";
   try {
@@ -1344,17 +1386,32 @@ async function saveRecording() {
 }
 
 async function cloneAndSaveVoice() {
-  if (!customerSaveUrl.value) return void (customerStatus.value = "Save a recording first.");
+  if (!promptText.value.trim()) {
+    voiceProfileStatus.value = "Audio script is required (text must match the spoken audio).";
+    openVoiceStudioStep.value = 1;
+    return;
+  }
   customerCloneBusy.value = true;
   voiceProfileStatus.value = "Creating reusable voice profile...";
   try {
-    const res = await fetch(customerSaveUrl.value);
-    if (!res.ok) throw new Error(`Unable to load saved recording (${res.status}).`);
-    const blob = await res.blob();
-    const refFile = new File([blob], blob.type.includes("wav") ? "avatar_source.wav" : "avatar_source.webm", { type: blob.type || "audio/webm" });
+    let refFile = customerRecordFile.value;
+    if (!refFile && customerSaveUrl.value) {
+      const res = await fetch(customerSaveUrl.value);
+      if (!res.ok) throw new Error(`Unable to load saved recording (${res.status}).`);
+      const blob = await res.blob();
+      refFile = new File(
+        [blob],
+        blob.type.includes("wav") ? "avatar_source.wav" : "avatar_source.webm",
+        { type: blob.type || "audio/webm" },
+      );
+    }
+    if (!refFile) {
+      voiceProfileStatus.value = "Record or upload audio in step 1 first.";
+      return;
+    }
     const fd = new FormData();
     fd.append("ref_aud", refFile);
-    fd.append("ref_txt", promptText.value || "Sample prompt text.");
+    fd.append("ref_txt", promptText.value.trim());
     fd.append("use_xvec", "false");
     fd.append("voice_name", avatarVoiceName.value || "Avatar Voice");
     const out = await postForm("/api/avatar/save-voice", fd);
@@ -1682,8 +1739,8 @@ function formatIso(iso) {
             >
               <div class="kb-tile__main">
                 <span class="kb-tile__brand kb-tile__brand--voice-rec">Record</span>
-                <span class="kb-tile__title">Mic &amp; script</span>
-                <span class="kb-tile__meta">Capture audio</span>
+                <span class="kb-tile__title">Record &amp; upload</span>
+                <span class="kb-tile__meta">Audio + script</span>
               </div>
               <span class="kb-tile__icon kb-tile__icon--voice-rec" aria-hidden="true">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
@@ -1746,7 +1803,7 @@ function formatIso(iso) {
               <div class="flow-card__head">
                 <span class="step-badge">1</span>
                 <div>
-                  <h3>Record avatar voice</h3>
+                  <h3>Record or upload avatar voice</h3>
                 </div>
                 <span v-if="customerRecording" class="rec-dot" aria-hidden="true"><span class="rec-dot__pulse" /></span>
               </div>
@@ -1755,27 +1812,75 @@ function formatIso(iso) {
                 <span>Avatar voice name</span>
                 <input v-model="avatarVoiceName" type="text" placeholder="e.g. Concierge North" autocomplete="off" />
               </label>
+
               <label class="field">
-                <span>Sample script</span>
-                <textarea v-model="promptText" rows="5" placeholder="Script loads from server config…" />
+                <span>Audio script</span>
+                <textarea
+                  v-model="promptText"
+                  rows="5"
+                  placeholder="Text spoken in the recording or upload — required for voice cloning."
+                />
               </label>
+              <div class="actions">
+                <button type="button" class="btn btn--secondary" @click="triggerAudioScriptUpload">
+                  Upload script file
+                </button>
+                <input
+                  ref="audioScriptUploadInput"
+                  type="file"
+                  accept=".txt,.md,text/plain"
+                  class="sr-only"
+                  @change="onUploadAudioScript"
+                />
+              </div>
+
+              <p class="voice-source-divider">Voice audio</p>
+              <div class="voice-source-options">
+                <div class="voice-source-options__block">
+                  <span class="voice-source-options__label">Microphone</span>
+                  <div class="actions">
+                    <button v-if="!customerRecording" type="button" class="btn" @click="startRecording">
+                      <span class="btn__icon" aria-hidden="true">●</span>
+                      Start recording
+                    </button>
+                    <button v-else type="button" class="btn btn--warn" @click="stopRecording">
+                      <span class="btn__icon btn__icon--blink" aria-hidden="true">■</span>
+                      Stop recording
+                    </button>
+                  </div>
+                </div>
+                <span class="voice-source-options__or" aria-hidden="true">or</span>
+                <div class="voice-source-options__block">
+                  <span class="voice-source-options__label">Upload file</span>
+                  <div class="actions">
+                    <button
+                      type="button"
+                      class="btn btn--secondary"
+                      :disabled="customerRecording"
+                      @click="triggerVoiceAudioUpload"
+                    >
+                      Choose audio file
+                    </button>
+                    <input
+                      ref="voiceAudioUploadInput"
+                      type="file"
+                      :accept="VOICE_AUDIO_ACCEPT"
+                      class="sr-only"
+                      @change="onUploadVoiceAudio"
+                    />
+                  </div>
+                  <p class="voice-source-options__hint">WAV, WebM, MP3, M4A, OGG</p>
+                </div>
+              </div>
 
               <div class="actions">
-                <button v-if="!customerRecording" type="button" class="btn" @click="startRecording">
-                  <span class="btn__icon" aria-hidden="true">●</span>
-                  Start recording
-                </button>
-                <button v-else type="button" class="btn btn--warn" @click="stopRecording">
-                  <span class="btn__icon btn__icon--blink" aria-hidden="true">■</span>
-                  Stop recording
-                </button>
                 <button
                   type="button"
                   class="btn btn--secondary"
-                  :disabled="customerRecordBusy || !customerRecordFile"
+                  :disabled="customerRecordBusy || !hasVoiceSourceAudio"
                   @click="saveRecording"
                 >
-                  {{ customerRecordBusy ? "Saving…" : "Save recording" }}
+                  {{ customerRecordBusy ? "Saving…" : "Save audio" }}
                 </button>
                 <a
                   v-if="customerSaveUrl"
@@ -1786,6 +1891,7 @@ function formatIso(iso) {
                 >
                   Open saved file
                 </a>
+                <span v-if="hasVoiceSourceAudio && !customerSaveUrl" class="chip">Audio ready</span>
               </div>
 
               <div v-if="customerRecordPreview" class="audio-shell">
@@ -1803,7 +1909,12 @@ function formatIso(iso) {
               </div>
 
               <div class="actions">
-                <button type="button" class="btn" :disabled="customerCloneBusy || !customerSaveUrl" @click="cloneAndSaveVoice">
+                <button
+                  type="button"
+                  class="btn"
+                  :disabled="customerCloneBusy || (!hasVoiceSourceAudio && !hasSavedRecording)"
+                  @click="cloneAndSaveVoice"
+                >
                   {{ customerCloneBusy ? "Cloning…" : "Clone & save profile" }}
                 </button>
                 <a
@@ -3508,6 +3619,60 @@ function formatIso(iso) {
   margin-top: 1rem;
   padding-top: 1rem;
   border-top: 1px solid var(--line);
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.voice-source-divider {
+  margin: 0.85rem 0 0.5rem;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.voice-source-options {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  gap: 0.75rem 1rem;
+}
+
+.voice-source-options__block {
+  flex: 1 1 12rem;
+  min-width: 0;
+}
+
+.voice-source-options__label {
+  display: block;
+  margin-bottom: 0.4rem;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.voice-source-options__or {
+  align-self: center;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.voice-source-options__hint {
+  margin: 0.35rem 0 0;
+  font-size: 0.78rem;
+  color: var(--muted);
 }
 
 .voice-hub-panels__hint {
