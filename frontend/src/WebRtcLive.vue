@@ -89,6 +89,7 @@ const CAFE_MENU = [
       { id: "americano", name: "Americano", price: 4.0 },
       { id: "latte", name: "Latte", price: 5.5 },
       { id: "mocha", name: "Mocha", price: 6.0 },
+      { id: "indian-filter-coffee", name: "Indian Filter Coffee", price: 8.0 },
     ],
   },
   {
@@ -120,12 +121,6 @@ const CAFE_MENU = [
     title: "All-Day Brunch",
     items: [
       {
-        id: "avocado-toast",
-        name: "Smashed Avocado Toast",
-        desc: "Sourdough, Feta, Cherry Tomatoes, Chili Flakes",
-        price: 14.0,
-      },
-      {
         id: "acai-bowl",
         name: "Acai Berry Bowl",
         desc: "Granola, Fruit, Coconut, Honey",
@@ -133,10 +128,11 @@ const CAFE_MENU = [
       },
       {
         id: "salmon-bagel",
-        name: "Smoked Chicken Burger",
+        name: "Sourdough Chicken Sandwich",
         desc: "Cream Cheese, Dill, Capers, Red Onion",
         price: 16.0,
       },
+      { id: "veg-sandwich", name: "Veg Sandwich", price: 12.0 },
     ],
   },
   {
