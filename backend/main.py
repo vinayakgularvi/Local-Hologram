@@ -34,7 +34,10 @@ from analytics_store import (
     get_recent_voice_turns,
     get_summary,
     init_db,
+    mark_voice_turn_human_dispatched,
     record_voice_turn,
+    update_voice_turn_human_dispatch_ms,
+    update_voice_turn_lip_sync_latency,
     update_voice_turn_webrtc_first_voice,
 )
 from avatar_assets_store import (
@@ -214,6 +217,13 @@ LIPSYNC_CHUNK_PARALLEL = max(1, _env_first_int("LIPSYNC_CHUNK_PARALLEL", default
 
 # LiveTalking-style WebRTC signaling (POST /offer, /human, /record) — proxied to this origin when set
 WEBRTC_SIGNALING_BASE = os.environ.get("WEBRTC_SIGNALING_BASE", "").strip().rstrip("/")
+# After /api/voice-turn, POST speak_text to LiveTalking /human from the API (saves browser round-trip).
+VOICE_DISPATCH_HUMAN = os.environ.get("VOICE_DISPATCH_HUMAN", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+HUMAN_DISPATCH_TIMEOUT_SEC = max(5.0, float(_env_first_int("HUMAN_DISPATCH_TIMEOUT_SEC", default=90)))
 HOLOGRAM_UPLOAD_TIMEOUT_SEC = max(60.0, float(_env_first_int("HOLOGRAM_UPLOAD_TIMEOUT_SEC", default=600)))
 HOLOGRAM_PREPARE_TIMEOUT_SEC = max(120.0, float(_env_first_int("HOLOGRAM_PREPARE_TIMEOUT_SEC", default=900)))
 _HOLOGRAM_ASSET_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
@@ -820,6 +830,54 @@ async def webrtc_offer_proxy(request: Request) -> Response:
 @app.post("/human")
 async def webrtc_human_proxy(request: Request) -> Response:
     return await _forward_webrtc_post("/human", request)
+
+
+async def _dispatch_livetalking_human(
+    speak_text: str,
+    sessionid: str,
+    *,
+    analytics_turn_id: int | None = None,
+) -> None:
+    """Fire TTS/lip-sync on LiveTalking without blocking the voice-turn HTTP response."""
+    if not WEBRTC_SIGNALING_BASE:
+        return
+    text = speak_text.strip()
+    sid = str(sessionid or "").strip()
+    if not text or not sid:
+        return
+    url = f"{WEBRTC_SIGNALING_BASE}/human"
+    payload = {
+        "text": text,
+        "type": "echo",
+        "interrupt": True,
+        "sessionid": sid,
+    }
+    timeout = httpx.Timeout(HUMAN_DISPATCH_TIMEOUT_SEC, connect=8.0)
+    t0 = time.perf_counter()
+    status_code: int | None = None
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.post(url, json=payload)
+            status_code = r.status_code
+        if status_code >= 400:
+            logger.warning(
+                "LiveTalking /human dispatch HTTP %s: %s",
+                status_code,
+                r.text[:300],
+            )
+    except Exception as e:
+        logger.warning("LiveTalking /human dispatch failed: %s", e)
+    finally:
+        ms = (time.perf_counter() - t0) * 1000.0
+        logger.info(
+            "LiveTalking /human finished sessionid=%s dispatch_ms=%.0f status=%s",
+            sid,
+            ms,
+            status_code if status_code is not None else "error",
+        )
+        if analytics_turn_id is not None and analytics_turn_id > 0:
+            if update_voice_turn_human_dispatch_ms(int(analytics_turn_id), ms):
+                await _publish_analytics_snapshot()
 
 
 @app.post("/record")
@@ -1903,11 +1961,16 @@ def _build_voice_rag_stream_conversation(user_text: str, chroma_results: list[di
 
 class VoiceTurnBody(BaseModel):
     text: str = Field(..., min_length=1, max_length=8000)
+    sessionid: str | None = Field(
+        None,
+        max_length=64,
+        description="LiveTalking WebRTC session id; when set, API dispatches /human after speak_text is ready.",
+    )
     stt_latency_ms: float | None = Field(
         None,
         ge=0,
         le=600_000,
-        description="Browser speech-to-text: mic recognition start → final transcript ready (ms).",
+        description="Browser speech-to-text: voice input request (recognition start) → final transcript ready (ms).",
     )
 
 
@@ -2067,7 +2130,7 @@ def _show_image_has_items(payload: dict[str, Any] | None) -> bool:
 async def voice_turn(body: VoiceTurnBody):
     """
     Browser STT text → optional ChromaDB RAG → reply from RAG_GENERATE_STREAM_URL when set, else Ollama
-    → client sends speak_text to LiveTalking /human.
+    → speak_text dispatched to LiveTalking /human from the API when sessionid is provided (else client POST /human).
     """
     user_text = body.text.strip()
     if not user_text:
@@ -2118,6 +2181,7 @@ async def voice_turn(body: VoiceTurnBody):
     ):
         raise HTTPException(status_code=502, detail="Model returned an empty reply.")
     total_ms = (time.perf_counter() - t0) * 1000.0
+    speak_len = len(speak_text.strip())
     analytics_turn_id: int | None = None
     if os.environ.get("ANALYTICS_DISABLE", "").strip().lower() not in (
         "1",
@@ -2129,13 +2193,43 @@ async def voice_turn(body: VoiceTurnBody):
             stt_ms = None
         analytics_turn_id = record_voice_turn(
             heard_chars=len(user_text),
-            answer_chars=len(speak_text),
+            answer_chars=speak_len,
             total_request_ms=total_ms,
             rag_latency_ms=rag_latency_ms,
             stt_latency_ms=stt_ms,
             prompt_tokens=ollama_metrics.get("prompt_eval_count"),
             completion_tokens=ollama_metrics.get("eval_count"),
         )
+    human_dispatched = False
+    sid = (body.sessionid or "").strip()
+    if (
+        VOICE_DISPATCH_HUMAN
+        and WEBRTC_SIGNALING_BASE
+        and speak_len > 0
+        and sid
+        and sid != "0"
+    ):
+        asyncio.create_task(
+            _dispatch_livetalking_human(
+                speak_text,
+                sid,
+                analytics_turn_id=analytics_turn_id,
+            )
+        )
+        human_dispatched = True
+        if analytics_turn_id is not None:
+            mark_voice_turn_human_dispatched(analytics_turn_id)
+        logger.info(
+            "voice-turn: queued LiveTalking /human sessionid=%s speak_chars=%d",
+            sid,
+            speak_len,
+        )
+    elif speak_len > 0 and (not sid or sid == "0"):
+        logger.warning(
+            "voice-turn: skip server /human — invalid sessionid=%r (check WebRTC /offer)",
+            sid or None,
+        )
+    if analytics_turn_id is not None:
         await _publish_analytics_snapshot()
     return {
         "answer": answer,
@@ -2147,6 +2241,7 @@ async def voice_turn(body: VoiceTurnBody):
         "rag": rag_meta,
         "analytics_turn_id": analytics_turn_id,
         "total_request_ms": round(total_ms, 1),
+        "human_dispatched": human_dispatched,
     }
 
 
@@ -2167,12 +2262,91 @@ class WebrtcFirstVoiceBody(BaseModel):
 
     turn_id: int = Field(..., ge=1)
     webrtc_first_voice_ms: float = Field(..., ge=0, le=600_000)
+    tts_latency_ms: float | None = Field(
+        None,
+        ge=0,
+        le=600_000,
+        description="Server voice-turn complete → first WebRTC audio playback (TTS + transport).",
+    )
     time_to_first_voice_ms: float | None = Field(None, ge=0, le=600_000)
     mic_to_speaker_voice_ms: float | None = Field(
         None,
         ge=0,
         le=600_000,
-        description="Mic tap → first avatar audio on speakers (browser).",
+        description="Deprecated; use mic_to_first_audio_ms.",
+    )
+    mic_to_first_audio_ms: float | None = Field(
+        None,
+        ge=0,
+        le=600_000,
+        description="Mic tap → first avatar audio on speakers.",
+    )
+    client_voice_turn_ms: float | None = Field(
+        None,
+        ge=0,
+        le=600_000,
+        description="Client: transcript sent → voice-turn JSON received.",
+    )
+    time_to_audio_playback_ms: float | None = Field(
+        None,
+        ge=0,
+        le=600_000,
+        description="Voice-turn complete → WebRTC audio element playing.",
+    )
+
+
+class LipSyncLatencyBody(BaseModel):
+    """First avatar audio → lip-synced video visible on WebRTC stream."""
+
+    turn_id: int = Field(..., ge=1)
+    lip_sync_latency_ms: float = Field(..., ge=0, le=600_000)
+    mic_to_lip_sync_ms: float | None = Field(
+        None,
+        ge=0,
+        le=600_000,
+        description="Mic tap → lip-synced video visible (full perceived wait).",
+    )
+    lip_sync_to_video_stream_ms: float | None = Field(
+        None,
+        ge=0,
+        le=600_000,
+        description="Voice-turn complete → video timeline advances (proxy).",
+    )
+    time_to_video_playback_ms: float | None = Field(
+        None,
+        ge=0,
+        le=600_000,
+        description="Voice-turn complete → WebRTC video element playing new frames.",
+    )
+    mic_to_video_playback_ms: float | None = Field(
+        None,
+        ge=0,
+        le=600_000,
+        description="Mic tap → lip-synced avatar playing on video.",
+    )
+    lip_sync_avatar_play_ms: float | None = Field(
+        None,
+        ge=0,
+        le=600_000,
+        description="Server voice-turn complete → lip-synced avatar visibly playing (stricter than early stream tick).",
+    )
+    stream_start_to_avatar_ms: float | None = Field(
+        None,
+        ge=0,
+        le=600_000,
+        description="Gap: first video timeline tick → lip-synced avatar play (previously unmeasured).",
+    )
+    video_stream_first_ms: float | None = Field(
+        None,
+        ge=0,
+        le=600_000,
+        description="Voice-turn complete → first video currentTime tick (early; may be stale frames).",
+    )
+    webrtc_real_playback_ms: float | None = Field(
+        None,
+        ge=0,
+        le=600_000,
+        description="Server voice-turn complete → WebRTC audio playing with lip-synced avatar video.",
     )
 
 
@@ -2189,6 +2363,35 @@ async def analytics_webrtc_first_voice(body: WebrtcFirstVoiceBody):
         body.webrtc_first_voice_ms,
         time_to_first_voice_ms=body.time_to_first_voice_ms,
         mic_to_speaker_voice_ms=body.mic_to_speaker_voice_ms,
+        tts_latency_ms=body.tts_latency_ms,
+        mic_to_first_audio_ms=body.mic_to_first_audio_ms,
+        client_voice_turn_ms=body.client_voice_turn_ms,
+        time_to_audio_playback_ms=body.time_to_audio_playback_ms,
+    )
+    if updated:
+        await _publish_analytics_snapshot()
+    return {"ok": updated, "turn_id": body.turn_id}
+
+
+@app.post("/api/analytics/lip-sync-latency")
+async def analytics_lip_sync_latency(body: LipSyncLatencyBody):
+    if os.environ.get("ANALYTICS_DISABLE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return {"ok": False, "reason": "analytics_disabled"}
+    updated = update_voice_turn_lip_sync_latency(
+        body.turn_id,
+        body.lip_sync_latency_ms,
+        mic_to_lip_sync_ms=body.mic_to_lip_sync_ms,
+        lip_sync_to_video_stream_ms=body.lip_sync_to_video_stream_ms,
+        time_to_video_playback_ms=body.time_to_video_playback_ms,
+        mic_to_video_playback_ms=body.mic_to_video_playback_ms,
+        lip_sync_avatar_play_ms=body.lip_sync_avatar_play_ms,
+        stream_start_to_avatar_ms=body.stream_start_to_avatar_ms,
+        video_stream_first_ms=body.video_stream_first_ms,
+        webrtc_real_playback_ms=body.webrtc_real_playback_ms,
     )
     if updated:
         await _publish_analytics_snapshot()

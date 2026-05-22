@@ -125,144 +125,234 @@ function latestChartRows(rows, limit = 24, predicate = () => true) {
 
 const recentTableRows = computed(() => recent.value);
 
-const cards = computed(() => {
+/** Unique pipeline metrics only (mic tap → lip-sync avatar). No duplicate aliases. */
+const PIPELINE_STEPS = [
+  {
+    id: "mic",
+    step: 1,
+    title: "Mic tap → lip-sync avatar",
+    sub: "End-to-end until avatar is visibly playing",
+    field: "mic_to_lip_sync_ms",
+    track: "speaker",
+    hero: true,
+    empty: "Complete a spoken turn on Live with avatar video.",
+  },
+  {
+    id: "mica",
+    step: 2,
+    title: "Mic tap → first audio",
+    sub: "Until avatar speaks on speakers",
+    field: "mic_to_first_audio_ms",
+    track: "ttfv",
+    empty: "Complete a spoken turn with TTS.",
+  },
+  {
+    id: "stt",
+    step: 3,
+    title: "Speech-to-text",
+    sub: "Voice input request → final transcript",
+    field: "stt_latency_ms",
+    track: "stt",
+    empty: "Use the mic on the Live page.",
+  },
+  {
+    id: "cvt",
+    step: 4,
+    title: "Client voice-turn",
+    sub: "Transcript sent → voice-turn JSON",
+    field: "client_voice_turn_ms",
+    track: "rag",
+    empty: "Complete a spoken voice-turn on Live.",
+  },
+  {
+    id: "rag",
+    step: 5,
+    title: "RAG latency",
+    sub: "Stream request → response (when configured)",
+    field: "rag_latency_ms",
+    track: "rag",
+    empty: "Voice turns using RAG_GENERATE_STREAM_URL only.",
+  },
+  {
+    id: "server",
+    step: 6,
+    title: "Server voice-turn",
+    sub: "API wall time (until JSON returned)",
+    field: "total_request_ms",
+    track: "default",
+    empty: null,
+  },
+  {
+    id: "human",
+    step: 7,
+    title: "Human dispatch",
+    sub: "Server POST LiveTalking /human",
+    field: "human_dispatch_ms",
+    track: "webrtc",
+    empty: "Requires VOICE_DISPATCH_HUMAN.",
+  },
+  {
+    id: "tts",
+    step: 8,
+    title: "Server complete → WebRTC audio",
+    sub: "Voice-turn JSON received → audible audio on stream",
+    field: "tts_latency_ms",
+    track: "tts",
+    empty: "Complete a spoken turn with TTS.",
+  },
+  {
+    id: "realpb",
+    step: 9,
+    title: "Server complete → real WebRTC playback",
+    sub: "Audible audio + lip-sync video (timestamp = later of the two)",
+    field: "webrtc_real_playback_ms",
+    track: "speaker",
+    highlight: true,
+    empty: "Complete a turn with avatar video and TTS.",
+  },
+  {
+    id: "avatar",
+    step: 10,
+    title: "Server complete → lip-sync video",
+    sub: "Voice-turn JSON received → avatar visibly playing",
+    field: "lip_sync_avatar_play_ms",
+    track: "speaker",
+    highlight: true,
+    empty: "Complete a turn with visible avatar video.",
+  },
+  {
+    id: "vfirst",
+    step: 11,
+    title: "Video stream first tick",
+    sub: "Early timeline bump (may be stale frames)",
+    field: "video_stream_first_ms",
+    track: "lvs",
+    empty: "Complete a turn with visible avatar video.",
+  },
+  {
+    id: "gap",
+    step: 12,
+    title: "Stream tick → avatar play",
+    sub: "Gap after first tick until lip-synced avatar plays",
+    field: "stream_start_to_avatar_ms",
+    track: "lip",
+    empty: "Complete a turn with visible avatar video.",
+  },
+  {
+    id: "lip",
+    step: 13,
+    title: "Audio → lip-sync video",
+    sub: "First audio → lip-synced avatar playing",
+    field: "lip_sync_latency_ms",
+    track: "lip",
+    empty: "Complete a turn with visible avatar video.",
+  },
+  {
+    id: "ttfv",
+    step: 14,
+    title: "Time to first voice",
+    sub: "STT + RAG (or server) + WebRTC audio (sum)",
+    field: "time_to_first_voice_ms",
+    track: "ttfv",
+    empty: "Complete a spoken turn with TTS.",
+  },
+];
+
+function summaryAvgKey(field) {
+  if (field === "total_request_ms") return "avg_total_ms";
+  return `avg_${field}`;
+}
+
+function barsForField(field, limit = 16) {
+  const rows = latestChartRows(
+    recent.value,
+    limit,
+    (r) => r[field] != null && !Number.isNaN(Number(r[field]))
+  );
+  const maxVal = Math.max(1, ...rows.map((r) => Number(r[field] || 0)));
+  return rows.map((r) => ({
+    id: r.id,
+    label: `#${r.id}`,
+    ms: Number(r[field] || 0),
+    pct: Math.max(3, (Number(r[field] || 0) / maxVal) * 100),
+  }));
+}
+
+const pipelineCharts = computed(() =>
+  PIPELINE_STEPS.map((step) => ({
+    ...step,
+    bars: barsForField(step.field),
+  }))
+);
+
+const pipelineCards = computed(() => {
+  const s = summary.value;
+  if (!s) return [];
+  const cards = [
+    { label: "Total questions", value: fmtNum(s.total_questions, 0) },
+    {
+      label: "Server /human dispatched",
+      value: `${fmtNum(s.human_dispatched_count, 0)} / ${fmtNum(s.total_questions, 0)}`,
+    },
+  ];
+  for (const step of PIPELINE_STEPS) {
+    cards.push({
+      label: `${step.step}. ${step.title} (avg)`,
+      value: fmtMs(s[summaryAvgKey(step.field)]),
+      highlight: Boolean(step.hero || step.highlight),
+    });
+  }
+  return cards;
+});
+
+const tableColumns = computed(() => [
+  { key: "id", label: "#", sticky: true },
+  { key: "ts", label: "Time (UTC)", sticky: true },
+  ...PIPELINE_STEPS.map((step) => ({
+    key: step.field,
+    label: String(step.step),
+    mono: true,
+    pipeline: true,
+    hero: Boolean(step.hero),
+  })),
+  { key: "human_dispatched", label: "Disp.", mono: true },
+  { key: "prompt_tokens", label: "Tokens", mono: true },
+  { key: "heard_chars", label: "Chars", mono: true },
+]);
+
+const secondaryCards = computed(() => {
   const s = summary.value;
   if (!s) return [];
   return [
-    { label: "Total questions (voice)", value: fmtNum(s.total_questions, 0) },
-    {
-      label: "Avg mic tap → speaker",
-      value: fmtMs(s.avg_mic_to_speaker_voice_ms),
-      highlight: true,
-    },
-    {
-      label: "Min / max mic → speaker",
-      value: `${fmtMs(s.min_mic_to_speaker_voice_ms)} / ${fmtMs(s.max_mic_to_speaker_voice_ms)}`,
-      highlight: true,
-    },
-    {
-      label: "Avg time to first voice",
-      value: fmtMs(s.avg_time_to_first_voice_ms),
-    },
-    {
-      label: "Min / max time to first voice",
-      value: `${fmtMs(s.min_time_to_first_voice_ms)} / ${fmtMs(s.max_time_to_first_voice_ms)}`,
-    },
-    { label: "Avg speech-to-text", value: fmtMs(s.avg_stt_latency_ms) },
-    { label: "Avg RAG latency", value: fmtMs(s.avg_rag_latency_ms) },
-    {
-      label: "Avg WebRTC voice",
-      value: fmtMs(s.avg_webrtc_first_voice_ms),
-    },
-    { label: "Avg server voice-turn", value: fmtMs(s.avg_total_ms) },
-    { label: "Min / max latency", value: `${fmtMs(s.min_total_ms)} / ${fmtMs(s.max_total_ms)}` },
-    {
-      label: "Min / max STT",
-      value: `${fmtMs(s.min_stt_latency_ms)} / ${fmtMs(s.max_stt_latency_ms)}`,
-    },
-    {
-      label: "Min / max RAG latency",
-      value: `${fmtMs(s.min_rag_latency_ms)} / ${fmtMs(s.max_rag_latency_ms)}`,
-    },
-    {
-      label: "Min / max WebRTC voice",
-      value: `${fmtMs(s.min_webrtc_first_voice_ms)} / ${fmtMs(s.max_webrtc_first_voice_ms)}`,
-    },
     { label: "Prompt tokens (sum)", value: fmtNum(s.sum_prompt_tokens, 0) },
     { label: "Completion tokens (sum)", value: fmtNum(s.sum_completion_tokens, 0) },
     { label: "Total tokens (sum)", value: fmtNum(s.sum_total_tokens, 0) },
-    { label: "Avg heard / answer chars", value: `${fmtNum(s.avg_heard_chars, 1)} / ${fmtNum(s.avg_answer_chars, 1)}` },
+    {
+      label: "Avg heard / answer chars",
+      value: `${fmtNum(s.avg_heard_chars, 1)} / ${fmtNum(s.avg_answer_chars, 1)}`,
+    },
+    {
+      label: "First / last event (UTC)",
+      value: `${fmtTs(s.first_event_ts)} → ${fmtTs(s.last_event_ts)}`,
+      wide: true,
+    },
   ];
 });
 
-const recentMicToSpeakerBars = computed(() => {
-  const rows = latestChartRows(
-    recent.value,
-    24,
-    (r) =>
-      r.mic_to_speaker_voice_ms != null && !Number.isNaN(Number(r.mic_to_speaker_voice_ms))
-  );
-  const maxVal = Math.max(1, ...rows.map((r) => Number(r.mic_to_speaker_voice_ms || 0)));
-  return rows.map((r) => ({
-    id: r.id,
-    label: `#${r.id}`,
-    ms: Number(r.mic_to_speaker_voice_ms || 0),
-    pct: Math.max(3, (Number(r.mic_to_speaker_voice_ms || 0) / maxVal) * 100),
-  }));
-});
-
-const recentTimeToFirstVoiceBars = computed(() => {
-  const rows = latestChartRows(
-    recent.value,
-    24,
-    (r) =>
-      r.time_to_first_voice_ms != null && !Number.isNaN(Number(r.time_to_first_voice_ms))
-  );
-  const maxVal = Math.max(1, ...rows.map((r) => Number(r.time_to_first_voice_ms || 0)));
-  return rows.map((r) => ({
-    id: r.id,
-    label: `#${r.id}`,
-    ms: Number(r.time_to_first_voice_ms || 0),
-    pct: Math.max(3, (Number(r.time_to_first_voice_ms || 0) / maxVal) * 100),
-  }));
-});
-
-const recentLatencyBars = computed(() => {
-  const rows = latestChartRows(recent.value);
-  const maxVal = Math.max(1, ...rows.map((r) => Number(r.total_request_ms || 0)));
-  return rows.map((r) => ({
-    id: r.id,
-    label: `#${r.id}`,
-    ms: Number(r.total_request_ms || 0),
-    pct: Math.max(3, (Number(r.total_request_ms || 0) / maxVal) * 100),
-  }));
-});
-
-const recentSttLatencyBars = computed(() => {
-  const rows = latestChartRows(
-    recent.value,
-    24,
-    (r) => r.stt_latency_ms != null && !Number.isNaN(Number(r.stt_latency_ms))
-  );
-  const maxVal = Math.max(1, ...rows.map((r) => Number(r.stt_latency_ms || 0)));
-  return rows.map((r) => ({
-    id: r.id,
-    label: `#${r.id}`,
-    ms: Number(r.stt_latency_ms || 0),
-    pct: Math.max(3, (Number(r.stt_latency_ms || 0) / maxVal) * 100),
-  }));
-});
-
-const recentRagLatencyBars = computed(() => {
-  const rows = latestChartRows(
-    recent.value,
-    24,
-    (r) => r.rag_latency_ms != null && !Number.isNaN(Number(r.rag_latency_ms))
-  );
-  const maxVal = Math.max(1, ...rows.map((r) => Number(r.rag_latency_ms || 0)));
-  return rows.map((r) => ({
-    id: r.id,
-    label: `#${r.id}`,
-    ms: Number(r.rag_latency_ms || 0),
-    pct: Math.max(3, (Number(r.rag_latency_ms || 0) / maxVal) * 100),
-  }));
-});
-
-const recentWebrtcVoiceBars = computed(() => {
-  const rows = latestChartRows(
-    recent.value,
-    24,
-    (r) =>
-      r.webrtc_first_voice_ms != null && !Number.isNaN(Number(r.webrtc_first_voice_ms))
-  );
-  const maxVal = Math.max(1, ...rows.map((r) => Number(r.webrtc_first_voice_ms || 0)));
-  return rows.map((r) => ({
-    id: r.id,
-    label: `#${r.id}`,
-    ms: Number(r.webrtc_first_voice_ms || 0),
-    pct: Math.max(3, (Number(r.webrtc_first_voice_ms || 0) / maxVal) * 100),
-  }));
-});
+function tableCell(row, col) {
+  if (col.key === "id") return row.id;
+  if (col.key === "ts") return fmtTs(row.ts);
+  if (col.key === "human_dispatched") {
+    return row.human_dispatched === 1 ? "yes" : row.human_dispatched === 0 ? "no" : "—";
+  }
+  if (col.key === "prompt_tokens") {
+    return `${row.prompt_tokens ?? "—"} / ${row.completion_tokens ?? "—"}`;
+  }
+  if (col.key === "heard_chars") {
+    return `${row.heard_chars} / ${row.answer_chars}`;
+  }
+  return fmtMs(row[col.key]);
+}
 
 const recentTokenBars = computed(() => {
   const rows = latestChartRows(recent.value);
@@ -328,188 +418,145 @@ async function submitReset() {
 
     <p v-if="err" class="dash__err" role="alert">{{ err }}</p>
 
-    <section v-if="!err && summary" class="viz-grid">
-      <article class="viz-card viz-card--ttfv">
-        <h2 class="viz-card__title">Mic tap → speaker audio</h2>
-        <p class="viz-card__sub">
-          From mic tap until avatar audio plays on speakers (full perceived wait)
+    <section v-if="!err && summary" class="pipeline-section">
+      <header class="pipeline-section__head">
+        <h2 class="pipeline-section__title">Voice pipeline</h2>
+        <p class="pipeline-section__sub">
+          Unique metrics, mic tap → lip-sync avatar; steps ⑧–⑩ after server voice-turn completes
         </p>
-        <p v-if="!recentMicToSpeakerBars.length" class="viz-card__empty">
-          No samples yet — complete a spoken turn on Live with TTS.
-        </p>
-        <div v-else class="bars">
-          <div
-            v-for="b in recentMicToSpeakerBars"
-            :key="`m-${b.id}`"
-            class="bar-row"
-            :title="`${b.label}: ${fmtMs(b.ms)}`"
-          >
-            <span class="bar-row__label">{{ b.label }}</span>
-            <div class="bar-row__track bar-row__track--speaker">
-              <div class="bar-row__fill bar-row__fill--speaker" :style="{ width: `${b.pct}%` }" />
+      </header>
+
+      <div class="viz-grid viz-grid--pipeline">
+        <article
+          v-for="chart in pipelineCharts"
+          :key="chart.id"
+          class="viz-card"
+          :class="{
+            'viz-card--hero': chart.hero,
+            'viz-card--gap': chart.highlight,
+            'viz-card--end': chart.id === 'ttfv',
+          }"
+        >
+          <div class="viz-card__head">
+            <span class="viz-card__step">{{ chart.step }}</span>
+            <h3 class="viz-card__title">{{ chart.title }}</h3>
+          </div>
+          <p v-if="chart.sub" class="viz-card__sub">{{ chart.sub }}</p>
+          <p v-if="!chart.bars.length && chart.empty" class="viz-card__empty">
+            No samples — {{ chart.empty }}
+          </p>
+          <p v-else-if="!chart.bars.length" class="viz-card__empty">No samples yet.</p>
+          <div v-else class="bars bars--compact">
+            <div
+              v-for="b in chart.bars"
+              :key="`${chart.id}-${b.id}`"
+              class="bar-row"
+              :title="`${b.label}: ${fmtMs(b.ms)}`"
+            >
+              <span class="bar-row__label">{{ b.label }}</span>
+              <div
+                class="bar-row__track"
+                :class="chart.track !== 'default' ? `bar-row__track--${chart.track}` : null"
+              >
+                <div
+                  class="bar-row__fill"
+                  :class="chart.track !== 'default' ? `bar-row__fill--${chart.track}` : null"
+                  :style="{ width: `${b.pct}%` }"
+                />
+              </div>
+              <span class="bar-row__value">{{ fmtMs(b.ms) }}</span>
             </div>
-            <span class="bar-row__value">{{ fmtMs(b.ms) }}</span>
           </div>
-        </div>
-      </article>
-      <article class="viz-card">
-        <h2 class="viz-card__title">Time to first voice (sum)</h2>
-        <p class="viz-card__sub">
-          STT + RAG stream (or server voice-turn) + WebRTC (request → audio)
-        </p>
-        <p v-if="!recentTimeToFirstVoiceBars.length" class="viz-card__empty">
-          No samples yet — complete a spoken turn on Live with TTS.
-        </p>
-        <div v-else class="bars">
-          <div
-            v-for="b in recentTimeToFirstVoiceBars"
-            :key="`v-${b.id}`"
-            class="bar-row"
-            :title="`${b.label}: ${fmtMs(b.ms)}`"
-          >
-            <span class="bar-row__label">{{ b.label }}</span>
-            <div class="bar-row__track bar-row__track--ttfv">
-              <div class="bar-row__fill bar-row__fill--ttfv" :style="{ width: `${b.pct}%` }" />
-            </div>
-            <span class="bar-row__value">{{ fmtMs(b.ms) }}</span>
-          </div>
-        </div>
-      </article>
-      <article class="viz-card">
-        <h2 class="viz-card__title">Server voice-turn latency</h2>
-        <div class="bars">
-          <div v-for="b in recentLatencyBars" :key="`l-${b.id}`" class="bar-row" :title="`${b.label}: ${fmtMs(b.ms)}`">
-            <span class="bar-row__label">{{ b.label }}</span>
-            <div class="bar-row__track"><div class="bar-row__fill" :style="{ width: `${b.pct}%` }" /></div>
-            <span class="bar-row__value">{{ fmtMs(b.ms) }}</span>
-          </div>
-        </div>
-      </article>
-      <article class="viz-card">
-        <h2 class="viz-card__title">Speech-to-text (mic → transcript)</h2>
-        <p v-if="!recentSttLatencyBars.length" class="viz-card__empty">
-          No samples yet — use the mic on the Live page.
-        </p>
-        <div v-else class="bars">
-          <div
-            v-for="b in recentSttLatencyBars"
-            :key="`s-${b.id}`"
-            class="bar-row"
-            :title="`${b.label}: ${fmtMs(b.ms)}`"
-          >
-            <span class="bar-row__label">{{ b.label }}</span>
-            <div class="bar-row__track bar-row__track--stt">
-              <div class="bar-row__fill bar-row__fill--stt" :style="{ width: `${b.pct}%` }" />
-            </div>
-            <span class="bar-row__value">{{ fmtMs(b.ms) }}</span>
-          </div>
-        </div>
-      </article>
-      <article class="viz-card">
-        <h2 class="viz-card__title">RAG latency (stream request → response)</h2>
-        <p v-if="!recentRagLatencyBars.length" class="viz-card__empty">
-          No samples yet — voice turns using RAG_GENERATE_STREAM_URL only.
-        </p>
-        <div v-else class="bars">
-          <div
-            v-for="b in recentRagLatencyBars"
-            :key="`r-${b.id}`"
-            class="bar-row"
-            :title="`${b.label}: ${fmtMs(b.ms)}`"
-          >
-            <span class="bar-row__label">{{ b.label }}</span>
-            <div class="bar-row__track bar-row__track--rag">
-              <div class="bar-row__fill bar-row__fill--rag" :style="{ width: `${b.pct}%` }" />
-            </div>
-            <span class="bar-row__value">{{ fmtMs(b.ms) }}</span>
-          </div>
-        </div>
-      </article>
-      <article class="viz-card">
-        <h2 class="viz-card__title">First WebRTC voice (request → audio)</h2>
-        <p v-if="!recentWebrtcVoiceBars.length" class="viz-card__empty">
-          No samples yet — speak on Live after a voice-turn with TTS.
-        </p>
-        <div v-else class="bars">
-          <div
-            v-for="b in recentWebrtcVoiceBars"
-            :key="`w-${b.id}`"
-            class="bar-row"
-            :title="`${b.label}: ${fmtMs(b.ms)}`"
-          >
-            <span class="bar-row__label">{{ b.label }}</span>
-            <div class="bar-row__track bar-row__track--webrtc">
-              <div class="bar-row__fill bar-row__fill--webrtc" :style="{ width: `${b.pct}%` }" />
-            </div>
-            <span class="bar-row__value">{{ fmtMs(b.ms) }}</span>
-          </div>
-        </div>
-      </article>
-      <article class="viz-card">
-        <h2 class="viz-card__title">Recent token usage</h2>
-        <div class="bars">
-          <div v-for="b in recentTokenBars" :key="`t-${b.id}`" class="bar-row" :title="`${b.label}: ${fmtNum(b.total)}`">
-            <span class="bar-row__label">{{ b.label }}</span>
-            <div class="bar-row__track bar-row__track--tokens"><div class="bar-row__fill bar-row__fill--tokens" :style="{ width: `${b.pct}%` }" /></div>
-            <span class="bar-row__value">{{ fmtNum(b.total) }}</span>
-          </div>
-        </div>
-      </article>
+        </article>
+      </div>
+
+      <div class="dash__grid dash__grid--pipeline">
+        <article
+          v-for="(c, i) in pipelineCards"
+          :key="`p-${i}`"
+          class="card card--compact"
+          :class="{ 'card--highlight': c.highlight }"
+        >
+          <h2 class="card__label">{{ c.label }}</h2>
+          <p class="card__value">{{ c.value }}</p>
+        </article>
+      </div>
     </section>
 
-    <div v-if="!err && summary" class="dash__grid">
-      <article
-        v-for="(c, i) in cards"
-        :key="i"
-        class="card"
-        :class="{ 'card--highlight': c.highlight }"
-      >
-        <h2 class="card__label">{{ c.label }}</h2>
-        <p class="card__value">{{ c.value }}</p>
-      </article>
-      <article class="card card--wide">
-        <h2 class="card__label">First / last event (UTC)</h2>
-        <p class="card__value card__value--small">
-          {{ fmtTs(summary.first_event_ts) }} → {{ fmtTs(summary.last_event_ts) }}
-        </p>
-      </article>
-    </div>
+    <section v-if="!err && summary" class="secondary-section">
+      <h2 class="secondary-section__title">Tokens &amp; usage</h2>
+      <div class="viz-grid viz-grid--secondary">
+        <article class="viz-card viz-card--compact">
+          <h3 class="viz-card__title">Recent token usage</h3>
+          <div v-if="recentTokenBars.length" class="bars bars--compact">
+            <div
+              v-for="b in recentTokenBars"
+              :key="`t-${b.id}`"
+              class="bar-row"
+              :title="`${b.label}: ${fmtNum(b.total)}`"
+            >
+              <span class="bar-row__label">{{ b.label }}</span>
+              <div class="bar-row__track bar-row__track--tokens">
+                <div class="bar-row__fill bar-row__fill--tokens" :style="{ width: `${b.pct}%` }" />
+              </div>
+              <span class="bar-row__value">{{ fmtNum(b.total) }}</span>
+            </div>
+          </div>
+          <p v-else class="viz-card__empty">No token data yet.</p>
+        </article>
+      </div>
+      <div class="dash__grid dash__grid--secondary">
+        <article
+          v-for="(c, i) in secondaryCards"
+          :key="`s-${i}`"
+          class="card card--compact"
+          :class="{ 'card--wide': c.wide }"
+        >
+          <h2 class="card__label">{{ c.label }}</h2>
+          <p class="card__value" :class="{ 'card__value--small': c.wide }">{{ c.value }}</p>
+        </article>
+      </div>
+    </section>
 
     <section v-if="!err" class="table-section">
       <h2 class="table-section__title">Recent voice turns</h2>
+      <p class="table-section__sub">Columns follow pipeline order (mic tap → lip sync video)</p>
       <div class="table-wrap">
-        <table class="table">
+        <table class="table table--pipeline">
           <thead>
             <tr>
-              <th>#</th>
-              <th>Time (UTC)</th>
-              <th>Mic → speaker</th>
-              <th>Time to first voice</th>
-              <th>Speech-to-text</th>
-              <th>RAG latency</th>
-              <th>WebRTC voice</th>
-              <th>Server turn</th>
-              <th>Tokens (p / c)</th>
-              <th>Heard / answer chars</th>
+              <th
+                v-for="col in tableColumns"
+                :key="col.key"
+                :class="{
+                  mono: col.mono,
+                  'table__th--sticky': col.sticky,
+                  'table__th--pipe': col.pipeline,
+                }"
+              >
+                {{ col.label }}
+              </th>
             </tr>
           </thead>
           <tbody>
             <tr v-for="row in recentTableRows" :key="row.id">
-              <td>{{ row.id }}</td>
-              <td class="mono">{{ fmtTs(row.ts) }}</td>
-              <td class="mono">{{ fmtMs(row.mic_to_speaker_voice_ms) }}</td>
-              <td class="mono">{{ fmtMs(row.time_to_first_voice_ms) }}</td>
-              <td class="mono">{{ fmtMs(row.stt_latency_ms) }}</td>
-              <td class="mono">{{ fmtMs(row.rag_latency_ms) }}</td>
-              <td class="mono">{{ fmtMs(row.webrtc_first_voice_ms) }}</td>
-              <td class="mono">{{ fmtMs(row.total_request_ms) }}</td>
-              <td class="mono">
-                {{ row.prompt_tokens ?? "—" }} / {{ row.completion_tokens ?? "—" }}
+              <td
+                v-for="col in tableColumns"
+                :key="`${row.id}-${col.key}`"
+                :class="{
+                  mono: col.mono,
+                  'table__td--sticky': col.sticky,
+                  'table__td--pipe': col.pipeline,
+                  'table__td--hero': col.hero,
+                }"
+              >
+                {{ tableCell(row, col) }}
               </td>
-              <td class="mono">{{ row.heard_chars }} / {{ row.answer_chars }}</td>
             </tr>
             <tr v-if="!recentTableRows.length && !loading">
-              <td colspan="10" class="table__empty">No data yet — use the mic on the Live page.</td>
+              <td :colspan="tableColumns.length" class="table__empty">
+                No data yet — use the mic on the Live page.
+              </td>
             </tr>
           </tbody>
         </table>
@@ -540,10 +587,13 @@ async function submitReset() {
 .dash {
   flex: 1;
   min-height: 0;
-  overflow: auto;
-  padding: clamp(1rem, 2.5vw, 2.5rem);
-  max-width: 120rem;
+  width: 100%;
+  max-width: 100%;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: clamp(0.65rem, 2vw, 1.5rem);
   margin: 0 auto;
+  box-sizing: border-box;
   background:
     radial-gradient(120rem 40rem at 8% -12%, rgba(56, 189, 248, 0.14), transparent 58%),
     radial-gradient(100rem 40rem at 92% -10%, rgba(139, 92, 246, 0.16), transparent 55%),
@@ -649,34 +699,121 @@ async function submitReset() {
   margin: 0 0 1rem;
 }
 
+.pipeline-section {
+  margin-bottom: clamp(1rem, 2vh, 1.5rem);
+}
+
+.pipeline-section__head {
+  margin-bottom: 0.75rem;
+}
+
+.pipeline-section__title {
+  margin: 0;
+  font-size: clamp(1.05rem, 2vw, 1.25rem);
+  font-weight: 700;
+  color: #111827;
+}
+
+.pipeline-section__sub {
+  margin: 0.25rem 0 0;
+  font-size: 0.82rem;
+  color: #555;
+}
+
+.secondary-section {
+  margin-bottom: 1rem;
+}
+
+.secondary-section__title {
+  margin: 0 0 0.65rem;
+  font-size: 1rem;
+  font-weight: 700;
+  color: #374151;
+}
+
 .viz-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(22rem, 1fr));
-  gap: 1rem;
-  margin-bottom: 1rem;
+  gap: clamp(0.65rem, 1.5vw, 1rem);
+  margin-bottom: 0.75rem;
+}
+
+.viz-grid--pipeline {
+  grid-template-columns: 1fr;
+}
+
+@media (min-width: 540px) {
+  .viz-grid--pipeline {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (min-width: 900px) {
+  .viz-grid--pipeline {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (min-width: 1280px) {
+  .viz-grid--pipeline {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+.viz-grid--secondary {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 16rem), 1fr));
+  max-width: 28rem;
 }
 
 .viz-card {
   background: #fff;
   border: 1px solid rgba(0, 0, 0, 0.08);
-  border-radius: 14px;
-  padding: 1rem;
+  border-radius: 12px;
+  padding: clamp(0.65rem, 1.5vw, 0.9rem);
   box-shadow:
-    0 8px 22px rgba(2, 6, 23, 0.08),
+    0 6px 16px rgba(2, 6, 23, 0.06),
     inset 0 1px 0 rgba(255, 255, 255, 0.62);
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.viz-card--compact {
+  padding: 0.75rem;
+}
+
+.viz-card__head {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  margin-bottom: 0.35rem;
+}
+
+.viz-card__step {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.35rem;
+  height: 1.35rem;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 800;
+  color: #fff;
+  background: linear-gradient(135deg, #0891b2, #6366f1);
 }
 
 .viz-card__title {
-  margin: 0 0 0.75rem;
-  font-size: 0.95rem;
+  margin: 0;
+  font-size: clamp(0.82rem, 1.6vw, 0.92rem);
   font-weight: 700;
+  line-height: 1.25;
 }
 
 .viz-card__sub {
-  margin: -0.35rem 0 0.75rem;
-  font-size: 0.8rem;
+  margin: 0 0 0.5rem;
+  font-size: 0.72rem;
   color: #555;
-  line-height: 1.35;
+  line-height: 1.3;
 }
 
 .viz-card__empty {
@@ -685,29 +822,62 @@ async function submitReset() {
   color: #666;
 }
 
-.viz-card--ttfv {
-  grid-column: 1 / -1;
-  border-color: rgba(16, 185, 129, 0.35);
-  background: linear-gradient(180deg, rgba(236, 253, 245, 0.95), rgba(255, 255, 255, 0.94));
+.viz-card--hero {
+  border-color: rgba(8, 145, 178, 0.45);
+  background: linear-gradient(180deg, rgba(207, 250, 254, 0.92), rgba(255, 255, 255, 0.96));
+}
+
+@media (min-width: 540px) {
+  .viz-card--hero {
+    grid-column: span 2;
+  }
+}
+
+@media (min-width: 1280px) {
+  .viz-card--hero {
+    grid-column: span 2;
+  }
+
+  .viz-card--end {
+    border-color: rgba(124, 58, 237, 0.35);
+  }
+}
+
+.viz-card--gap {
+  border-color: rgba(217, 119, 6, 0.55);
+  background: linear-gradient(180deg, rgba(255, 251, 235, 0.95), rgba(255, 255, 255, 0.96));
+}
+
+@media (min-width: 540px) {
+  .viz-card--gap {
+    grid-column: span 2;
+  }
 }
 
 .bars {
   display: flex;
   flex-direction: column;
-  gap: 0.35rem;
-  max-height: 21rem;
+  gap: 0.28rem;
+  flex: 1;
+  min-height: 0;
+  max-height: min(10.5rem, 22vh);
   overflow: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.bars--compact {
+  max-height: min(9rem, 20vh);
 }
 
 .bar-row {
   display: grid;
-  grid-template-columns: 2.6rem 1fr 5.2rem;
+  grid-template-columns: 2.25rem minmax(0, 1fr) minmax(3.8rem, 4.6rem);
   align-items: center;
-  gap: 0.5rem;
+  gap: 0.35rem;
 }
 
 .bar-row__label {
-  font-size: 0.75rem;
+  font-size: 0.68rem;
   color: #666;
   font-variant-numeric: tabular-nums;
 }
@@ -729,6 +899,30 @@ async function submitReset() {
 
 .bar-row__fill--webrtc {
   background: linear-gradient(90deg, #10b981, #14b8a6);
+}
+
+.bar-row__track--tts {
+  background: #fce7f3;
+}
+
+.bar-row__fill--tts {
+  background: linear-gradient(90deg, #db2777, #ec4899);
+}
+
+.bar-row__track--lip {
+  background: #ede9fe;
+}
+
+.bar-row__fill--lip {
+  background: linear-gradient(90deg, #7c3aed, #a855f7);
+}
+
+.bar-row__track--lvs {
+  background: #ddd6fe;
+}
+
+.bar-row__fill--lvs {
+  background: linear-gradient(90deg, #5b21b6, #7c3aed, #8b5cf6);
 }
 
 .bar-row__track--stt {
@@ -774,27 +968,46 @@ async function submitReset() {
 }
 
 .bar-row__value {
-  font-size: 0.76rem;
+  font-size: 0.68rem;
   color: #333;
   text-align: right;
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .dash__grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
-  gap: 1rem;
-  margin-bottom: 2rem;
+  gap: clamp(0.5rem, 1.2vw, 0.75rem);
+  margin-bottom: 0.5rem;
+}
+
+.dash__grid--pipeline {
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 9.5rem), 1fr));
+}
+
+.dash__grid--secondary {
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 11rem), 1fr));
+  margin-bottom: 1.25rem;
 }
 
 .card {
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(255, 255, 255, 0.94));
   border: 1px solid rgba(0, 0, 0, 0.07);
-  border-radius: 14px;
-  padding: 1.1rem 1.25rem;
+  border-radius: 12px;
+  padding: clamp(0.55rem, 1.2vw, 0.85rem) clamp(0.65rem, 1.5vw, 1rem);
   box-shadow:
-    0 8px 22px rgba(2, 6, 23, 0.08),
+    0 6px 16px rgba(2, 6, 23, 0.06),
     inset 0 1px 0 rgba(255, 255, 255, 0.62);
+  min-width: 0;
+}
+
+.card--compact .card__label {
+  font-size: 0.68rem;
+  letter-spacing: 0.04em;
+}
+
+.card--compact .card__value {
+  font-size: clamp(0.95rem, 1.8vw, 1.2rem);
 }
 
 .card--wide {
@@ -802,12 +1015,12 @@ async function submitReset() {
 }
 
 .card--highlight {
-  border-color: rgba(16, 185, 129, 0.4);
-  background: linear-gradient(180deg, rgba(236, 253, 245, 0.98), rgba(255, 255, 255, 0.96));
+  border-color: rgba(8, 145, 178, 0.45);
+  background: linear-gradient(180deg, rgba(207, 250, 254, 0.98), rgba(255, 255, 255, 0.96));
 }
 
 .card--highlight .card__value {
-  color: #047857;
+  color: #0e7490;
 }
 
 .card__label {
@@ -832,29 +1045,42 @@ async function submitReset() {
   font-weight: 600;
 }
 
+.table-section {
+  margin-bottom: 1rem;
+}
+
 .table-section__title {
-  margin: 0 0 0.75rem;
-  font-size: 1.15rem;
+  margin: 0 0 0.25rem;
+  font-size: clamp(1rem, 2vw, 1.15rem);
   font-weight: 700;
+}
+
+.table-section__sub {
+  margin: 0 0 0.6rem;
+  font-size: 0.78rem;
+  color: #555;
 }
 
 .table-wrap {
   overflow: auto;
+  max-width: 100%;
   border: 1px solid rgba(0, 0, 0, 0.08);
   border-radius: 12px;
   background: rgba(255, 255, 255, 0.95);
-  box-shadow: 0 8px 20px rgba(2, 6, 23, 0.07);
+  box-shadow: 0 6px 16px rgba(2, 6, 23, 0.06);
+  -webkit-overflow-scrolling: touch;
 }
 
 .table {
   width: 100%;
+  min-width: 44rem;
   border-collapse: collapse;
-  font-size: clamp(0.8rem, 1.2vw, 0.95rem);
+  font-size: clamp(0.72rem, 1.1vw, 0.88rem);
 }
 
 .table th,
 .table td {
-  padding: 0.65rem 0.85rem;
+  padding: 0.45rem 0.55rem;
   text-align: left;
   border-bottom: 1px solid rgba(0, 0, 0, 0.06);
 }
@@ -864,6 +1090,48 @@ async function submitReset() {
   font-weight: 600;
   color: #333;
   white-space: nowrap;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+
+.table__th--sticky,
+.table__td--sticky {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  background: inherit;
+}
+
+.table__th--sticky {
+  z-index: 3;
+  background: #f0f4f8;
+}
+
+.table__td--sticky {
+  background: #fff;
+}
+
+.table tbody tr:hover .table__td--sticky {
+  background: #f0fdfa;
+}
+
+.table__th--pipe,
+.table__td--pipe {
+  background: rgba(236, 253, 245, 0.35);
+}
+
+.table__th--pipe {
+  background: #ecfdf5;
+}
+
+.table__td--hero {
+  font-weight: 700;
+  color: #0e7490;
+}
+
+.table tbody tr:hover .table__td--hero {
+  color: #047857;
 }
 
 .table tbody tr:hover {
@@ -902,9 +1170,23 @@ async function submitReset() {
 }
 
 .reset-zone {
-  margin-top: 2.5rem;
-  padding-top: 1.5rem;
+  margin-top: clamp(1rem, 3vh, 2rem);
+  padding-top: 1rem;
   border-top: 1px solid rgba(0, 0, 0, 0.1);
+}
+
+@media (max-width: 539px) {
+  .dash__head {
+    padding: 0.75rem 0.85rem;
+  }
+
+  .dash__live {
+    font-size: 0.8rem;
+  }
+
+  .viz-card--hero {
+    grid-column: 1 / -1;
+  }
 }
 
 .reset-zone__title {

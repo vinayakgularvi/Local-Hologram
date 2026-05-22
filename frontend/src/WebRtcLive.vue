@@ -312,17 +312,35 @@ const FINAL_RESULT_STOP_MS = Math.max(
   120,
   Number.parseInt(import.meta.env.VITE_VOICE_FINAL_STOP_MS || "220", 10) || 220
 );
+/** First video currentTime bump (often stale frames — not lip-synced avatar yet). */
+const VIDEO_STREAM_TICK_SEC = 0.02;
+/** Min audio timeline advance after voice-turn before we count WebRTC audio as playing. */
+const WEBRTC_AUDIO_PLAY_MIN_DELTA_SEC = Math.max(
+  0.12,
+  Number.parseFloat(import.meta.env.VITE_WEBRTC_AUDIO_PLAY_MIN_DELTA_SEC || "0.35") || 0.35
+);
+/** Min timeline advance before we treat avatar as lip-synced and playing. */
+const LIP_SYNC_AVATAR_MIN_DELTA_SEC = Math.max(
+  0.08,
+  Number.parseFloat(import.meta.env.VITE_LIP_SYNC_AVATAR_MIN_DELTA_SEC || "0.15") || 0.15
+);
 let silenceTimer = null;
 let voiceSessionCancelled = false;
 let toneAudioCtx = null;
-/** @type {{ turnId: number, requestSentMs: number, baselineTime: number } | null} */
+/** @type {{ turnId: number, requestSentMs: number, baselineTime: number, videoBaselineTime: number } | null} */
 let webrtcTtfaPending = null;
 let webrtcTtfaTimeout = null;
 let webrtcTtfaPollId = null;
-/** Mic tap → recognition start (performance.now) for STT + mic→speaker latency. */
+/** @type {{ turnId: number, audioFirstMs: number, videoBaselineTime: number, audioBaselineTime: number, micTapStartMs: number, voiceTurnCompleteMs: number, videoStreamFirstAt: number | null, strictAudioAt: number | null, lipSyncAvatarAt: number | null, realPlaybackAt: number | null } | null} */
+let lipSyncPending = null;
+let lipSyncPollId = null;
+let lipSyncTimeout = null;
+/** Voice input request (recognition start) → final transcript (STT latency). */
+let voiceInputRequestMs = 0;
 let sttSessionStartMs = 0;
+let sttFinalTranscriptMs = 0;
 let micTapStartMs = 0;
-/** @type {{ turnId: number, sttMs: number | null, ragMs: number | null, micTapStartMs: number } | null} */
+/** @type {{ turnId: number, sttMs: number | null, ragMs: number | null, micTapStartMs: number, voiceTurnCompleteMs: number, clientVoiceTurnMs: number | null } | null} */
 let pendingVoiceAnalytics = null;
 
 const speechRecCtor = computed(() => {
@@ -466,6 +484,7 @@ async function connect() {
         };
         v.addEventListener("playing", onReady, { once: true });
         v.addEventListener("loadeddata", onReady, { once: true });
+        bindVideoPlaybackListener();
       } else if (evt.track.kind === "audio" && audioEl.value) {
         audioEl.value.srcObject = stream;
         bindWebRtcTtfaAudioListener();
@@ -513,26 +532,223 @@ function bindWebRtcTtfaAudioListener() {
   const audio = audioEl.value;
   if (!audio || audio.dataset.ttfaBound === "1") return;
   audio.dataset.ttfaBound = "1";
-  audio.addEventListener("playing", onWebRtcAudioPlayingForTtfa);
+  audio.addEventListener("playing", () => {
+    if (!webrtcTtfaPending) return;
+    onWebRtcAudioPlayingForTtfa();
+  });
+}
+
+function webRtcStrictAudioPlaying(baselineSec) {
+  const audio = audioEl.value;
+  if (!audio || audio.paused || audio.readyState < 2) return false;
+  const baseline = Number(baselineSec);
+  if (!Number.isFinite(baseline) || baseline < 0) return false;
+  return audio.currentTime > baseline + WEBRTC_AUDIO_PLAY_MIN_DELTA_SEC;
 }
 
 function onWebRtcAudioPlayingForTtfa() {
   if (!webrtcTtfaPending) return;
-  const { turnId, requestSentMs } = webrtcTtfaPending;
+  const { turnId, requestSentMs, videoBaselineTime, baselineTime } = webrtcTtfaPending;
+  if (!webRtcStrictAudioPlaying(baselineTime)) return;
   webrtcTtfaPending = null;
   if (webrtcTtfaTimeout != null) {
     window.clearTimeout(webrtcTtfaTimeout);
     webrtcTtfaTimeout = null;
   }
+  if (webrtcTtfaPollId != null) {
+    window.clearInterval(webrtcTtfaPollId);
+    webrtcTtfaPollId = null;
+  }
   const now = performance.now();
-  const webrtcMs = now - requestSentMs;
+  const ttsMs = now - requestSentMs;
   const pending =
     pendingVoiceAnalytics && pendingVoiceAnalytics.turnId === turnId
       ? pendingVoiceAnalytics
       : null;
-  const micToSpeakerMs =
-    pending && pending.micTapStartMs > 0 ? Math.max(0, now - pending.micTapStartMs) : null;
-  void reportWebrtcFirstVoiceMs(turnId, webrtcMs, micToSpeakerMs);
+  const micTap =
+    pending && pending.micTapStartMs > 0
+      ? pending.micTapStartMs
+      : micTapStartMs > 0
+        ? micTapStartMs
+        : 0;
+  const micToFirstAudioMs =
+    micTap > 0 ? Math.max(0, now - micTap) : null;
+  const clientVoiceTurnMs =
+    pending && pending.clientVoiceTurnMs != null ? pending.clientVoiceTurnMs : null;
+  void reportWebrtcFirstVoiceMs(turnId, ttsMs, {
+    micToFirstAudioMs,
+    clientVoiceTurnMs,
+  });
+  scheduleLipSyncLatency(
+    turnId,
+    now,
+    videoBaselineTime,
+    micTap,
+    requestSentMs,
+    baselineTime
+  );
+}
+
+function clearLipSyncPending() {
+  lipSyncPending = null;
+  if (lipSyncPollId != null) {
+    window.clearInterval(lipSyncPollId);
+    lipSyncPollId = null;
+  }
+  if (lipSyncTimeout != null) {
+    window.clearTimeout(lipSyncTimeout);
+    lipSyncTimeout = null;
+  }
+}
+
+function bindVideoPlaybackListener() {
+  const v = videoEl.value;
+  if (!v || v.dataset.playbackTtfaBound === "1") return;
+  v.dataset.playbackTtfaBound = "1";
+  v.addEventListener("playing", () => {
+    tryMarkLipSyncAvatar(performance.now());
+  });
+}
+
+function videoDeltaSec() {
+  if (!lipSyncPending || !videoEl.value) return 0;
+  return Math.max(0, videoEl.value.currentTime - lipSyncPending.videoBaselineTime);
+}
+
+function tryMarkStrictWebRtcAudio(now) {
+  if (!lipSyncPending || lipSyncPending.strictAudioAt != null) return false;
+  if (!webRtcStrictAudioPlaying(lipSyncPending.audioBaselineTime)) return false;
+  lipSyncPending.strictAudioAt = now;
+  return true;
+}
+
+/** Real playback = audible audio + lip-sync video; use the later timestamp. */
+function tryCompleteRealWebRtcPlayback(now) {
+  if (!lipSyncPending || lipSyncPending.realPlaybackAt != null) return false;
+  const { strictAudioAt, lipSyncAvatarAt } = lipSyncPending;
+  if (!strictAudioAt || !lipSyncAvatarAt) return false;
+  lipSyncPending.realPlaybackAt = Math.max(strictAudioAt, lipSyncAvatarAt);
+  return true;
+}
+
+/** Earliest video timeline tick (may still be old frames). */
+function tryMarkVideoStreamFirst(now) {
+  if (!lipSyncPending || lipSyncPending.videoStreamFirstAt != null) return;
+  const video = videoEl.value;
+  if (!video || video.paused || video.readyState < 2) return;
+  if (videoDeltaSec() <= VIDEO_STREAM_TICK_SEC) return;
+  lipSyncPending.videoStreamFirstAt = now;
+}
+
+/**
+ * Lip-synced avatar actually playing: enough new video timeline + decoded frames.
+ * This is later than the first 20ms tick — captures the gap users still feel.
+ */
+function tryMarkLipSyncAvatar(now) {
+  if (!lipSyncPending || lipSyncPending.lipSyncAvatarAt != null) return false;
+  const video = videoEl.value;
+  if (!video || video.paused || video.readyState < 3) return false;
+  if (videoDeltaSec() < LIP_SYNC_AVATAR_MIN_DELTA_SEC) return false;
+  tryMarkVideoStreamFirst(now);
+  lipSyncPending.lipSyncAvatarAt = now;
+  return true;
+}
+
+function scheduleLipSyncLatency(
+  turnId,
+  audioFirstMs,
+  videoBaselineTime,
+  micTapStartMs = 0,
+  voiceTurnCompleteMs = 0,
+  audioBaselineAtComplete = 0
+) {
+  clearLipSyncPending();
+  if (!turnId || !Number.isFinite(audioFirstMs)) return;
+  bindVideoPlaybackListener();
+  const v = videoEl.value;
+  const baseline =
+    Number.isFinite(videoBaselineTime) && videoBaselineTime >= 0
+      ? videoBaselineTime
+      : v && Number.isFinite(v.currentTime)
+        ? v.currentTime
+        : 0;
+  const audioBaseline =
+    Number.isFinite(audioBaselineAtComplete) && audioBaselineAtComplete >= 0
+      ? audioBaselineAtComplete
+      : 0;
+  lipSyncPending = {
+    turnId,
+    audioFirstMs,
+    videoBaselineTime: baseline,
+    audioBaselineTime: audioBaseline,
+    micTapStartMs: Number.isFinite(micTapStartMs) && micTapStartMs > 0 ? micTapStartMs : 0,
+    voiceTurnCompleteMs:
+      Number.isFinite(voiceTurnCompleteMs) && voiceTurnCompleteMs > 0
+        ? voiceTurnCompleteMs
+        : 0,
+    videoStreamFirstAt: null,
+    strictAudioAt: null,
+    lipSyncAvatarAt: null,
+    realPlaybackAt: null,
+  };
+  lipSyncPollId = window.setInterval(() => {
+    if (!lipSyncPending || !videoEl.value) return;
+    const now = performance.now();
+    tryMarkVideoStreamFirst(now);
+    tryMarkStrictWebRtcAudio(now);
+    tryMarkLipSyncAvatar(now);
+    if (tryCompleteRealWebRtcPlayback(now)) {
+      onLipSyncVideoReady();
+    }
+  }, 16);
+  lipSyncTimeout = window.setTimeout(() => {
+    if (lipSyncPending?.realPlaybackAt != null) {
+      onLipSyncVideoReady();
+    } else if (lipSyncPending?.lipSyncAvatarAt != null || lipSyncPending?.strictAudioAt != null) {
+      onLipSyncVideoReady();
+    } else {
+      clearLipSyncPending();
+      clearMicTapTiming();
+    }
+  }, 120000);
+}
+
+function onLipSyncVideoReady() {
+  if (!lipSyncPending) return;
+  const p = lipSyncPending;
+  clearLipSyncPending();
+  clearMicTapTiming();
+  const {
+    turnId,
+    audioFirstMs,
+    micTapStartMs,
+    voiceTurnCompleteMs,
+    strictAudioAt,
+    lipSyncAvatarAt,
+    videoStreamFirstAt,
+    realPlaybackAt,
+  } = p;
+  const avatarAt = lipSyncAvatarAt ?? performance.now();
+  const streamFirstAt = videoStreamFirstAt ?? avatarAt;
+  const strictAudio = strictAudioAt ?? audioFirstMs;
+  const lipMs = Math.max(0, avatarAt - strictAudio);
+  const micToLipMs = micTapStartMs > 0 ? Math.max(0, avatarAt - micTapStartMs) : null;
+  const anchorMs = voiceTurnCompleteMs > 0 ? voiceTurnCompleteMs : 0;
+  const videoStreamFirstMs =
+    anchorMs > 0 ? Math.max(0, streamFirstAt - anchorMs) : null;
+  const lipSyncAvatarPlayMs = anchorMs > 0 ? Math.max(0, avatarAt - anchorMs) : null;
+  const webrtcRealPlaybackMs =
+    anchorMs > 0 && realPlaybackAt != null
+      ? Math.max(0, realPlaybackAt - anchorMs)
+      : null;
+  const streamStartToAvatarMs = Math.max(0, avatarAt - streamFirstAt);
+  void reportLipSyncLatencyMs(turnId, lipMs, {
+    micToLipSyncMs: micToLipMs,
+    videoStreamFirstMs,
+    lipSyncAvatarPlayMs,
+    streamStartToAvatarMs,
+    webrtcRealPlaybackMs,
+  });
 }
 
 function clearWebRtcTtfaPending() {
@@ -545,6 +761,7 @@ function clearWebRtcTtfaPending() {
     window.clearInterval(webrtcTtfaPollId);
     webrtcTtfaPollId = null;
   }
+  clearLipSyncPending();
 }
 
 function scheduleWebRtcTtfa(turnId, requestSentMs) {
@@ -553,16 +770,20 @@ function scheduleWebRtcTtfa(turnId, requestSentMs) {
   bindWebRtcTtfaAudioListener();
   const audio = audioEl.value;
   const baselineTime = audio && Number.isFinite(audio.currentTime) ? audio.currentTime : 0;
-  webrtcTtfaPending = { turnId, requestSentMs, baselineTime };
+  const video = videoEl.value;
+  const videoBaselineTime =
+    video && Number.isFinite(video.currentTime) ? video.currentTime : 0;
+  webrtcTtfaPending = { turnId, requestSentMs, baselineTime, videoBaselineTime };
   webrtcTtfaPollId = window.setInterval(() => {
     if (!webrtcTtfaPending || !audioEl.value) return;
     const a = audioEl.value;
-    if (!a.paused && a.currentTime > webrtcTtfaPending.baselineTime + 0.06) {
+    if (webRtcStrictAudioPlaying(webrtcTtfaPending.baselineTime)) {
       onWebRtcAudioPlayingForTtfa();
     }
-  }, 40);
+  }, 16);
   webrtcTtfaTimeout = window.setTimeout(() => {
     clearWebRtcTtfaPending();
+    clearMicTapTiming();
   }, 120000);
 }
 
@@ -576,31 +797,39 @@ function computeTimeToFirstVoiceMs(webrtcMs, sttMs, ragMs) {
 
 function clearMicTapTiming() {
   micTapStartMs = 0;
+  voiceInputRequestMs = 0;
   sttSessionStartMs = 0;
+  sttFinalTranscriptMs = 0;
 }
 
-async function reportWebrtcFirstVoiceMs(turnId, webrtcMs, micToSpeakerMs = null) {
+async function reportWebrtcFirstVoiceMs(turnId, ttsMs, extra = {}) {
   const pending =
     pendingVoiceAnalytics && pendingVoiceAnalytics.turnId === turnId
       ? pendingVoiceAnalytics
       : null;
+  const roundedTts = Math.round(ttsMs * 10) / 10;
   const timeToFirstVoice = computeTimeToFirstVoiceMs(
-    webrtcMs,
+    roundedTts,
     pending?.sttMs,
     pending?.ragMs
   );
   pendingVoiceAnalytics = null;
-  clearMicTapTiming();
   try {
     const body = {
       turn_id: turnId,
-      webrtc_first_voice_ms: Math.round(webrtcMs * 10) / 10,
+      webrtc_first_voice_ms: roundedTts,
+      tts_latency_ms: roundedTts,
     };
     if (timeToFirstVoice != null) {
       body.time_to_first_voice_ms = timeToFirstVoice;
     }
-    if (micToSpeakerMs != null && Number.isFinite(micToSpeakerMs) && micToSpeakerMs >= 0) {
-      body.mic_to_speaker_voice_ms = Math.round(micToSpeakerMs * 10) / 10;
+    const micAudio = extra.micToFirstAudioMs;
+    if (micAudio != null && Number.isFinite(micAudio) && micAudio >= 0) {
+      body.mic_to_first_audio_ms = Math.round(micAudio * 10) / 10;
+    }
+    const clientVt = extra.clientVoiceTurnMs ?? pending?.clientVoiceTurnMs;
+    if (clientVt != null && Number.isFinite(clientVt) && clientVt >= 0) {
+      body.client_voice_turn_ms = Math.round(clientVt * 10) / 10;
     }
     const res = await fetch(signalingUrl("/api/analytics/webrtc-first-voice"), {
       method: "POST",
@@ -615,28 +844,69 @@ async function reportWebrtcFirstVoiceMs(turnId, webrtcMs, micToSpeakerMs = null)
   }
 }
 
-async function postHuman(text) {
-  const t = text.trim();
-  if (!t) return;
-  webrtcError.value = "";
+async function reportLipSyncLatencyMs(turnId, lipSyncMs, extra = {}) {
   try {
-    const res = await fetch(signalingUrl("/human"), {
+    const body = {
+      turn_id: turnId,
+      lip_sync_latency_ms: Math.round(lipSyncMs * 10) / 10,
+    };
+    const micLip = extra.micToLipSyncMs;
+    if (micLip != null && Number.isFinite(micLip) && micLip >= 0) {
+      body.mic_to_lip_sync_ms = Math.round(micLip * 10) / 10;
+    }
+    const streamFirst = extra.videoStreamFirstMs;
+    if (streamFirst != null && Number.isFinite(streamFirst) && streamFirst >= 0) {
+      body.video_stream_first_ms = Math.round(streamFirst * 10) / 10;
+    }
+    if (extra.lipSyncAvatarPlayMs != null && Number.isFinite(extra.lipSyncAvatarPlayMs)) {
+      body.lip_sync_avatar_play_ms = Math.round(extra.lipSyncAvatarPlayMs * 10) / 10;
+    }
+    if (extra.streamStartToAvatarMs != null && Number.isFinite(extra.streamStartToAvatarMs)) {
+      body.stream_start_to_avatar_ms = Math.round(extra.streamStartToAvatarMs * 10) / 10;
+    }
+    const realPb = extra.webrtcRealPlaybackMs;
+    if (realPb != null && Number.isFinite(realPb) && realPb >= 0) {
+      body.webrtc_real_playback_ms = Math.round(realPb * 10) / 10;
+    }
+    const res = await fetch(signalingUrl("/api/analytics/lip-sync-latency"), {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        text: t,
-        type: "echo",
-        interrupt: true,
-        sessionid: String(sessionId.value),
-      }),
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify(body),
     });
     if (!res.ok) {
-      const body = await res.text();
-      throw new Error(body.slice(0, 400) || `Send failed (${res.status})`);
+      console.warn("[analytics] lip-sync-latency failed", res.status);
     }
   } catch (e) {
-    webrtcError.value = e instanceof Error ? e.message : String(e);
+    console.warn("[analytics] lip-sync-latency", e);
   }
+}
+
+/** Queue TTS on LiveTalking; do not await (avatar starts generating while UI updates). */
+function postHuman(text) {
+  const t = text.trim();
+  if (!t) return;
+  const sid = String(sessionId.value || "").trim();
+  if (!sid) return;
+  void fetch(signalingUrl("/human"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    keepalive: true,
+    body: JSON.stringify({
+      text: t,
+      type: "echo",
+      interrupt: true,
+      sessionid: sid,
+    }),
+  })
+    .then(async (res) => {
+      if (!res.ok) {
+        const body = await res.text();
+        throw new Error(body.slice(0, 400) || `Send failed (${res.status})`);
+      }
+    })
+    .catch((e) => {
+      webrtcError.value = e instanceof Error ? e.message : String(e);
+    });
 }
 
 function clearSilenceTimer() {
@@ -721,10 +991,17 @@ function playMicTone(kind) {
   }
 }
 
-/** Mic recognition start → final transcript ready (includes speaking + browser finalize). */
+/** Voice input request → first final transcript (excludes post-transcript stop delay). */
 function computeSttLatencyMs() {
-  if (sttSessionStartMs > 0) {
-    return Math.max(0, performance.now() - sttSessionStartMs);
+  const endMs = sttFinalTranscriptMs > 0 ? sttFinalTranscriptMs : performance.now();
+  const startMs =
+    sttSessionStartMs > 0
+      ? sttSessionStartMs
+      : voiceInputRequestMs > 0
+        ? voiceInputRequestMs
+        : 0;
+  if (startMs > 0) {
+    return Math.max(0, endMs - startMs);
   }
   return null;
 }
@@ -737,7 +1014,9 @@ async function runVoicePipeline(userText, sttLatencyMs = null) {
   clearWebRtcTtfaPending();
   pendingVoiceAnalytics = null;
   const requestSentMs = performance.now();
+  const sid = String(sessionId.value || "").trim();
   const payload = { text: t };
+  if (sid) payload.sessionid = sid;
   if (sttLatencyMs != null && Number.isFinite(sttLatencyMs) && sttLatencyMs >= 0) {
     payload.stt_latency_ms = Math.round(sttLatencyMs * 10) / 10;
   }
@@ -752,12 +1031,52 @@ async function runVoicePipeline(userText, sttLatencyMs = null) {
       throw new Error(body.slice(0, 400) || `Ollama step failed (${res.status})`);
     }
     const data = await res.json();
-    console.log("[voice-turn] response", data);
+    const voiceTurnCompleteMs = performance.now();
+    const clientVoiceTurnMs = Math.max(0, voiceTurnCompleteMs - requestSentMs);
     const answer = String(data.answer || "").trim();
     let speakText = String(data.speak_text ?? "").trim();
     if (!speakText) {
       speakText = stripReceiptForSpeech(answer);
     }
+    const spoken = speakText ? stripReceiptForSpeech(speakText) : "";
+    const humanDispatched = Boolean(data.human_dispatched);
+    console.info("[voice-turn] complete — audio comes from LiveTalking /human + WebRTC, not this response", {
+      human_dispatched: humanDispatched,
+      speak_chars: spoken.length,
+      total_request_ms: data.total_request_ms,
+      sessionid: sid || null,
+    });
+
+    if (spoken) {
+      if (!humanDispatched) {
+        if (!sid || sid === "0") {
+          console.warn("[voice-turn] no valid WebRTC sessionid — /human not sent; connect hologram first");
+        } else {
+          postHuman(spoken);
+        }
+      }
+      const turnId = Number(data.analytics_turn_id);
+      const ragStreamMs = Number(data.rag?.rag_latency_ms);
+      const serverMs = Number(data.total_request_ms);
+      let middleMs = null;
+      if (Number.isFinite(ragStreamMs)) {
+        middleMs = ragStreamMs;
+      } else if (Number.isFinite(serverMs)) {
+        middleMs = serverMs;
+      }
+      if (Number.isFinite(turnId) && turnId > 0) {
+        pendingVoiceAnalytics = {
+          turnId,
+          sttMs: Number.isFinite(sttLatencyMs) ? sttLatencyMs : null,
+          ragMs: middleMs,
+          micTapStartMs: micTapStartMs > 0 ? micTapStartMs : 0,
+          voiceTurnCompleteMs,
+          clientVoiceTurnMs: Math.round(clientVoiceTurnMs * 10) / 10,
+        };
+        scheduleWebRtcTtfa(turnId, voiceTurnCompleteMs);
+      }
+    }
+
     let receipt = data.receipt && typeof data.receipt === "object" ? data.receipt : null;
     if (!receipt?.items?.length && answer) {
       receipt = tryParseReceiptFromAnswer(answer);
@@ -785,29 +1104,7 @@ async function runVoicePipeline(userText, sttLatencyMs = null) {
     if (!speakText && !receipt?.items?.length && orderNum == null && !hasShowImage) {
       throw new Error("Model returned an empty reply.");
     }
-    const turnId = Number(data.analytics_turn_id);
-    const ragStreamMs = Number(data.rag?.rag_latency_ms);
-    const serverMs = Number(data.total_request_ms);
-    let middleMs = null;
-    if (Number.isFinite(ragStreamMs)) {
-      middleMs = ragStreamMs;
-    } else if (Number.isFinite(serverMs)) {
-      middleMs = serverMs;
-    }
-    if (Number.isFinite(turnId) && turnId > 0) {
-      pendingVoiceAnalytics = {
-        turnId,
-        sttMs: Number.isFinite(sttLatencyMs) ? sttLatencyMs : null,
-        ragMs: middleMs,
-        micTapStartMs: micTapStartMs > 0 ? micTapStartMs : 0,
-      };
-    }
-    if (speakText) {
-      if (Number.isFinite(turnId) && turnId > 0) {
-        scheduleWebRtcTtfa(turnId, requestSentMs);
-      }
-      await postHuman(stripReceiptForSpeech(speakText));
-    } else {
+    if (!spoken) {
       clearWebRtcTtfaPending();
       pendingVoiceAnalytics = null;
       clearMicTapTiming();
@@ -888,10 +1185,17 @@ function toggleMic() {
     }
     interimTranscript.value = interim;
     if (sawFinal) {
+      if (sttFinalTranscriptMs <= 0) {
+        sttFinalTranscriptMs = performance.now();
+      }
       scheduleStopAfter(FINAL_RESULT_STOP_MS);
     } else if (hasText) {
       scheduleSilenceStop();
     }
+  };
+
+  recInstance.onstart = () => {
+    sttSessionStartMs = performance.now();
   };
 
   recInstance.onspeechstart = () => {
@@ -934,7 +1238,9 @@ function toggleMic() {
   try {
     const tapMs = performance.now();
     micTapStartMs = tapMs;
-    sttSessionStartMs = tapMs;
+    voiceInputRequestMs = tapMs;
+    sttSessionStartMs = 0;
+    sttFinalTranscriptMs = 0;
     recInstance.start();
     micListening.value = true;
   } catch (e) {
