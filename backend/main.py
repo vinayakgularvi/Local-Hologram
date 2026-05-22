@@ -224,6 +224,27 @@ VOICE_DISPATCH_HUMAN = os.environ.get("VOICE_DISPATCH_HUMAN", "1").strip().lower
     "yes",
 )
 HUMAN_DISPATCH_TIMEOUT_SEC = max(5.0, float(_env_first_int("HUMAN_DISPATCH_TIMEOUT_SEC", default=90)))
+TRANSCRIBE_API_URL = os.environ.get(
+    "TRANSCRIBE_API_URL",
+    "http://10.29.145.124:8000/api/transcribe",
+).strip()
+TRANSCRIBE_TIMEOUT_SEC = max(5.0, float(_env_first_int("TRANSCRIBE_TIMEOUT_SEC", default=120)))
+TRANSCRIBE_MAX_UPLOAD_BYTES = max(
+    256 * 1024,
+    _env_first_int("TRANSCRIBE_MAX_UPLOAD_MB", default=12) * 1024 * 1024,
+)
+TRANSCRIBE_MODEL_ID = os.environ.get(
+    "TRANSCRIBE_MODEL_ID",
+    "distil-whisper/distil-large-v3",
+).strip()
+TRANSCRIBE_MODE = os.environ.get("TRANSCRIBE_MODE", "sequential").strip() or "sequential"
+TRANSCRIBE_TASK = os.environ.get("TRANSCRIBE_TASK", "transcribe").strip() or "transcribe"
+TRANSCRIBE_BATCH_SIZE = max(1, _env_first_int("TRANSCRIBE_BATCH_SIZE", default=8))
+TRANSCRIBE_NUM_BEAMS = max(1, _env_first_int("TRANSCRIBE_NUM_BEAMS", default=1))
+TRANSCRIBE_MAX_NEW_TOKENS = max(16, _env_first_int("TRANSCRIBE_MAX_NEW_TOKENS", default=128))
+TRANSCRIBE_TEMPERATURE = os.environ.get("TRANSCRIBE_TEMPERATURE", "0").strip() or "0"
+TRANSCRIBE_TIMESTAMP = os.environ.get("TRANSCRIBE_TIMESTAMP", "none").strip() or "none"
+TRANSCRIBE_DEFAULT_LANGUAGE = os.environ.get("TRANSCRIBE_DEFAULT_LANGUAGE", "english").strip() or "english"
 HOLOGRAM_UPLOAD_TIMEOUT_SEC = max(60.0, float(_env_first_int("HOLOGRAM_UPLOAD_TIMEOUT_SEC", default=600)))
 HOLOGRAM_PREPARE_TIMEOUT_SEC = max(120.0, float(_env_first_int("HOLOGRAM_PREPARE_TIMEOUT_SEC", default=900)))
 _HOLOGRAM_ASSET_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
@@ -1564,6 +1585,8 @@ async def health():
         "rt_target_sec": LIPSYNC_RT_TARGET_SEC,
         "rt_min_chars": LIPSYNC_RT_MIN_CHARS,
         "webrtc_signaling_proxy": bool(WEBRTC_SIGNALING_BASE),
+        "transcribe_configured": bool(TRANSCRIBE_API_URL),
+        "transcribe_model_id": TRANSCRIBE_MODEL_ID if TRANSCRIBE_API_URL else None,
         "avatar_api_base": AVATAR_API_BASE,
         "rag": rag_info,
         "sharepoint": {
@@ -1590,7 +1613,96 @@ async def health():
 @app.get("/api/webrtc")
 async def webrtc_proxy_status():
     """Whether POST /offer, /human, /record are forwarded to WEBRTC_SIGNALING_BASE."""
-    return {"signaling_proxy_configured": bool(WEBRTC_SIGNALING_BASE)}
+    return {
+        "signaling_proxy_configured": bool(WEBRTC_SIGNALING_BASE),
+        "transcribe_configured": bool(TRANSCRIBE_API_URL),
+    }
+
+
+@app.post("/api/transcribe")
+async def api_transcribe(
+    file: UploadFile = File(...),
+    language: str = Form(""),
+    model_id: str = Form(""),
+    mode: str = Form(""),
+    task: str = Form(""),
+    batch_size: str = Form(""),
+    num_beams: str = Form(""),
+    max_new_tokens: str = Form(""),
+    temperature: str = Form(""),
+    timestamp: str = Form(""),
+    stride_length_s: str = Form("0"),
+    chunk_length_s: str = Form("0"),
+):
+    """
+    Proxy mic audio to the Whisper transcribe service (multipart), e.g. POST /api/transcribe on Ollama host.
+    """
+    if not TRANSCRIBE_API_URL:
+        raise HTTPException(
+            status_code=503,
+            detail="TRANSCRIBE_API_URL is not set in .env.",
+        )
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty audio upload.")
+    if len(raw) > TRANSCRIBE_MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Audio too large (max {TRANSCRIBE_MAX_UPLOAD_BYTES // (1024 * 1024)} MB).",
+        )
+    lang = (language or TRANSCRIBE_DEFAULT_LANGUAGE).strip() or TRANSCRIBE_DEFAULT_LANGUAGE
+
+    def _form_int(raw: str, default: int) -> str:
+        s = (raw or "").strip()
+        if not s:
+            return str(default)
+        try:
+            return str(int(s))
+        except ValueError:
+            return str(default)
+
+    form: dict[str, str] = {
+        "stride_length_s": stride_length_s,
+        "mode": (mode or TRANSCRIBE_MODE).strip() or TRANSCRIBE_MODE,
+        "task": (task or TRANSCRIBE_TASK).strip() or TRANSCRIBE_TASK,
+        "batch_size": _form_int(batch_size, TRANSCRIBE_BATCH_SIZE),
+        "num_beams": _form_int(num_beams, TRANSCRIBE_NUM_BEAMS),
+        "chunk_length_s": chunk_length_s,
+        "model_id": (model_id or TRANSCRIBE_MODEL_ID).strip() or TRANSCRIBE_MODEL_ID,
+        "temperature": (temperature or TRANSCRIBE_TEMPERATURE).strip() or TRANSCRIBE_TEMPERATURE,
+        "max_new_tokens": _form_int(max_new_tokens, TRANSCRIBE_MAX_NEW_TOKENS),
+        "timestamp": (timestamp or TRANSCRIBE_TIMESTAMP).strip() or TRANSCRIBE_TIMESTAMP,
+        "language": lang,
+    }
+    filename = file.filename or "mic.webm"
+    content_type = file.content_type or "application/octet-stream"
+    files = {"file": (filename, raw, content_type)}
+    timeout = httpx.Timeout(TRANSCRIBE_TIMEOUT_SEC, connect=15.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.post(TRANSCRIBE_API_URL, data=form, files=files)
+    except httpx.TimeoutException as e:
+        raise HTTPException(status_code=504, detail="Transcribe service timed out.") from e
+    except httpx.RequestError as e:
+        logger.warning("Transcribe proxy request failed: %s", e)
+        raise HTTPException(status_code=502, detail=f"Transcribe service unreachable: {e}") from e
+    if r.status_code >= 400:
+        raise HTTPException(
+            status_code=r.status_code,
+            detail=r.text[:500] or "Transcribe service error",
+        )
+    try:
+        payload = r.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail="Transcribe returned non-JSON.") from e
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail="Transcribe returned unexpected JSON.")
+    text = str(payload.get("text") or "").strip()
+    return {
+        "text": text,
+        "metadata": payload.get("metadata"),
+        "chunks": payload.get("chunks"),
+    }
 
 
 def _livetalking_base() -> str:
@@ -1970,7 +2082,7 @@ class VoiceTurnBody(BaseModel):
         None,
         ge=0,
         le=600_000,
-        description="Browser speech-to-text: voice input request (recognition start) → final transcript ready (ms).",
+        description="Transcribe API round-trip: POST /api/transcribe request → response (ms).",
     )
 
 

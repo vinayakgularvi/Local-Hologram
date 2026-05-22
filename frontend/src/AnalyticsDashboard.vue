@@ -149,11 +149,11 @@ const PIPELINE_STEPS = [
   {
     id: "stt",
     step: 3,
-    title: "Speech-to-text",
-    sub: "Voice input request → final transcript",
+    title: "Transcribe API",
+    sub: "POST /api/transcribe request → response latency",
     field: "stt_latency_ms",
     track: "stt",
-    empty: "Use the mic on the Live page.",
+    empty: "Complete a spoken turn with server transcribe enabled.",
   },
   {
     id: "cvt",

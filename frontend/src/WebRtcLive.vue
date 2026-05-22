@@ -16,7 +16,21 @@ const audioEl = ref(null);
 let pc = null;
 
 let recInstance = null;
+/** @type {MediaRecorder | null} */
+let mediaRecorder = null;
+/** @type {MediaStream | null} */
+let micCaptureStream = null;
+/** @type {BlobPart[]} */
+let micRecordedChunks = [];
+/** @type {number | null} */
+let micMaxRecordTimer = null;
+/** @type {number | null} */
+let micSilenceRaf = null;
+let micLastSoundMs = 0;
+let micRecordStartedMs = 0;
+let micHasDetectedSpeech = false;
 
+const transcribeConfigured = ref(false);
 const micListening = ref(false);
 const voiceThinking = ref(false);
 const mediaVisible = ref(false);
@@ -78,6 +92,7 @@ const liveBill = ref(null);
 /** Shown at top of stage when <orderdone> is present; live bill is cleared. */
 const orderPlacedMessage = ref("");
 let orderPlacedHideTimer = null;
+let captionHideTimer = null;
 
 /** Holuminex Cafe menu (transparent panel on hologram stage). */
 const CAFE_MENU = [
@@ -312,6 +327,52 @@ const FINAL_RESULT_STOP_MS = Math.max(
   120,
   Number.parseInt(import.meta.env.VITE_VOICE_FINAL_STOP_MS || "220", 10) || 220
 );
+const MIC_MAX_RECORD_MS = Math.max(
+  5000,
+  Number.parseInt(import.meta.env.VITE_MIC_MAX_RECORD_MS || "45000", 10) || 45000
+);
+const MIC_MIN_RECORD_BEFORE_SILENCE_MS = Math.max(
+  600,
+  Number.parseInt(import.meta.env.VITE_MIC_MIN_RECORD_MS || "800", 10) || 800
+);
+/** Shorter recordings are not sent to transcribe (avoids tap-to-cancel hallucinations). */
+const MIC_MIN_TRANSCRIBE_MS = Math.max(
+  700,
+  Number.parseInt(import.meta.env.VITE_MIC_MIN_TRANSCRIBE_MS || "900", 10) || 900
+);
+const MIC_MIN_TRANSCRIBE_BYTES = Math.max(
+  1200,
+  Number.parseInt(import.meta.env.VITE_MIC_MIN_TRANSCRIBE_BYTES || "2400", 10) || 2400
+);
+const MIC_SILENCE_RMS_THRESHOLD = Math.max(
+  0.008,
+  Number.parseFloat(import.meta.env.VITE_MIC_SILENCE_RMS || "0.014") || 0.014
+);
+/** Whisper often returns these on silence / very short cancel taps. */
+const PHANTOM_TRANSCRIPT_RE =
+  /^(thank\s*you|thanks|thank\s*you\.|thanks\.|ok|okay|bye|goodbye|you|the|\.+)$/i;
+/** How long the avatar caption stays visible after transcript text appears. */
+const CAPTION_HIDE_MS = Math.max(
+  800,
+  Number.parseInt(import.meta.env.VITE_CAPTION_HIDE_MS || "2000", 10) || 2000
+);
+/** Mic on/off beep length (ms) — tap, record start, record stop. */
+const MIC_TONE_TAP_MS = Math.max(
+  40,
+  Number.parseInt(import.meta.env.VITE_MIC_TONE_TAP_MS || "80", 10) || 80
+);
+const MIC_TONE_ON_MS = Math.max(
+  120,
+  Number.parseInt(import.meta.env.VITE_MIC_TONE_ON_MS || "380", 10) || 380
+);
+const MIC_TONE_OFF_MS = Math.max(
+  120,
+  Number.parseInt(import.meta.env.VITE_MIC_TONE_OFF_MS || "340", 10) || 340
+);
+const MIC_PULSE_SEC = Math.max(
+  0.8,
+  Number.parseFloat(import.meta.env.VITE_MIC_PULSE_SEC || "2.2") || 2.2
+);
 /** First video currentTime bump (often stale frames — not lip-synced avatar yet). */
 const VIDEO_STREAM_TICK_SEC = 0.02;
 /** Min audio timeline advance after voice-turn before we count WebRTC audio as playing. */
@@ -348,7 +409,10 @@ const speechRecCtor = computed(() => {
   return window.SpeechRecognition || window.webkitSpeechRecognition || null;
 });
 
-const micAvailable = computed(() => !!speechRecCtor.value);
+const micAvailable = computed(
+  () => transcribeConfigured.value || !!speechRecCtor.value
+);
+const useServerTranscribe = computed(() => transcribeConfigured.value);
 
 function resolveMicLang() {
   if (selectedMicLang.value !== "auto") return selectedMicLang.value;
@@ -384,9 +448,11 @@ fetch(signalingUrl("/api/webrtc"))
   .then((r) => r.json())
   .then((d) => {
     proxyConfigured.value = Boolean(d.signaling_proxy_configured);
+    transcribeConfigured.value = Boolean(d.transcribe_configured);
   })
   .catch(() => {
     proxyConfigured.value = false;
+    transcribeConfigured.value = false;
   });
 
 function waitIceGatheringFast(conn) {
@@ -916,11 +982,129 @@ function clearSilenceTimer() {
   }
 }
 
+function stopMicSilenceMonitor() {
+  if (micSilenceRaf != null) {
+    cancelAnimationFrame(micSilenceRaf);
+    micSilenceRaf = null;
+  }
+}
+
+function releaseMicCapture() {
+  stopMicSilenceMonitor();
+  if (micMaxRecordTimer != null) {
+    window.clearTimeout(micMaxRecordTimer);
+    micMaxRecordTimer = null;
+  }
+  if (micCaptureStream) {
+    for (const track of micCaptureStream.getTracks()) {
+      track.stop();
+    }
+    micCaptureStream = null;
+  }
+  mediaRecorder = null;
+  micRecordedChunks = [];
+}
+
+function micRecordDurationMs() {
+  return micRecordStartedMs > 0 ? Math.max(0, performance.now() - micRecordStartedMs) : 0;
+}
+
+function isPhantomTranscript(text, blob, recordMs) {
+  const t = String(text || "").trim();
+  if (!t) return true;
+  if (recordMs > 0 && recordMs < MIC_MIN_TRANSCRIBE_MS) return true;
+  if (blob && blob.size > 0 && blob.size < MIC_MIN_TRANSCRIBE_BYTES) return true;
+  if (PHANTOM_TRANSCRIPT_RE.test(t)) return true;
+  if (t.length <= 12 && recordMs > 0 && recordMs < MIC_MIN_RECORD_BEFORE_SILENCE_MS * 2) {
+    return true;
+  }
+  return false;
+}
+
+/** Mic tap to cancel: stop capture without transcribe or voice-turn. */
+function abortMicCapture() {
+  voiceSessionCancelled = true;
+  clearSilenceTimer();
+  stopMicSilenceMonitor();
+  if (micMaxRecordTimer != null) {
+    window.clearTimeout(micMaxRecordTimer);
+    micMaxRecordTimer = null;
+  }
+  micRecordedChunks = [];
+  if (mediaRecorder) {
+    mediaRecorder.onstop = null;
+    if (mediaRecorder.state !== "inactive") {
+      try {
+        mediaRecorder.stop();
+      } catch {
+        /* ignore */
+      }
+    }
+    mediaRecorder = null;
+  }
+  releaseMicCapture();
+  micListening.value = false;
+  playMicTone("off");
+  clearCaptionHideTimer();
+  finalTranscript.value = "";
+  interimTranscript.value = "";
+  clearMicTapTiming();
+  voiceSessionCancelled = false;
+}
+
+function transcribeLanguageForTag(tag) {
+  const raw = String(tag || "en-US").trim();
+  const t =
+    raw.toLowerCase() === "auto" && typeof navigator !== "undefined" && navigator.language
+      ? navigator.language.toLowerCase()
+      : raw.toLowerCase();
+  if (t.startsWith("zh") || t.startsWith("yue") || t.startsWith("wuu") || t.startsWith("nan")) {
+    return "chinese";
+  }
+  if (t.startsWith("ja")) return "japanese";
+  if (t.startsWith("ko")) return "korean";
+  if (t.startsWith("ru")) return "russian";
+  if (t.startsWith("it")) return "italian";
+  if (t.startsWith("es")) return "spanish";
+  if (t.startsWith("fr")) return "french";
+  if (t.startsWith("de")) return "german";
+  return "english";
+}
+
+async function transcribeMicBlob(blob) {
+  const fd = new FormData();
+  const ext = blob.type.includes("webm") ? "webm" : blob.type.includes("ogg") ? "ogg" : "wav";
+  fd.append("file", blob, `mic.${ext}`);
+  fd.append("language", transcribeLanguageForTag(resolveMicLang()));
+  const reqStartMs = performance.now();
+  const res = await fetch(signalingUrl("/api/transcribe"), {
+    method: "POST",
+    headers: { Accept: "application/json" },
+    body: fd,
+  });
+  const latencyMs = Math.max(0, performance.now() - reqStartMs);
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(body.slice(0, 400) || `Transcribe failed (${res.status})`);
+  }
+  const data = await res.json();
+  return {
+    text: String(data.text || "").trim(),
+    latencyMs: Math.round(latencyMs * 10) / 10,
+  };
+}
+
 function scheduleStopAfter(delayMs) {
   clearSilenceTimer();
   silenceTimer = window.setTimeout(() => {
     silenceTimer = null;
-    if (recInstance) {
+    if (mediaRecorder && mediaRecorder.state !== "inactive") {
+      try {
+        mediaRecorder.stop();
+      } catch {
+        /* ignore */
+      }
+    } else if (recInstance) {
       try {
         recInstance.stop();
       } catch {
@@ -944,25 +1128,27 @@ function playMicTone(kind) {
     const osc = toneAudioCtx.createOscillator();
     const gain = toneAudioCtx.createGain();
     osc.type = kind === "tap" ? "square" : "triangle";
+    const durSec =
+      kind === "tap"
+        ? MIC_TONE_TAP_MS / 1000
+        : kind === "on"
+          ? MIC_TONE_ON_MS / 1000
+          : MIC_TONE_OFF_MS / 1000;
+    const attack = Math.min(0.02, durSec * 0.12);
+    const releaseStart = Math.max(attack + 0.02, durSec * 0.55);
+    const stopAt = now + durSec;
     if (kind === "tap") {
       osc.frequency.setValueAtTime(1200, now);
-      gain.gain.setValueAtTime(0.0001, now);
-      gain.gain.exponentialRampToValueAtTime(0.32, now + 0.006);
-      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.055);
-      osc.stop(now + 0.065);
     } else if (kind === "on") {
       osc.frequency.setValueAtTime(980, now);
-      gain.gain.setValueAtTime(0.0001, now);
-      gain.gain.exponentialRampToValueAtTime(0.24, now + 0.01);
-      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.14);
-      osc.stop(now + 0.16);
     } else {
       osc.frequency.setValueAtTime(620, now);
-      gain.gain.setValueAtTime(0.0001, now);
-      gain.gain.exponentialRampToValueAtTime(0.2, now + 0.01);
-      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.12);
-      osc.stop(now + 0.14);
     }
+    const peak = kind === "tap" ? 0.32 : kind === "on" ? 0.24 : 0.2;
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.exponentialRampToValueAtTime(peak, now + attack);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + releaseStart);
+    osc.stop(stopAt);
     osc.connect(gain);
     gain.connect(toneAudioCtx.destination);
     osc.start(now);
@@ -991,7 +1177,7 @@ function playMicTone(kind) {
   }
 }
 
-/** Voice input request → first final transcript (excludes post-transcript stop delay). */
+/** Browser speech recognition only (not used for server /api/transcribe). */
 function computeSttLatencyMs() {
   const endMs = sttFinalTranscriptMs > 0 ? sttFinalTranscriptMs : performance.now();
   const startMs =
@@ -1120,11 +1306,40 @@ async function runVoicePipeline(userText, sttLatencyMs = null) {
 }
 
 function stopMicInternal({ cancel }) {
-  voiceSessionCancelled = cancel;
   if (cancel) {
+    if (mediaRecorder) {
+      abortMicCapture();
+      return;
+    }
+    voiceSessionCancelled = true;
     clearMicTapTiming();
+    clearSilenceTimer();
+    if (recInstance) {
+      try {
+        recInstance.stop();
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
+    releaseMicCapture();
+    micListening.value = false;
+    finalTranscript.value = "";
+    interimTranscript.value = "";
+    voiceSessionCancelled = false;
+    return;
   }
+  voiceSessionCancelled = false;
   clearSilenceTimer();
+  if (mediaRecorder && mediaRecorder.state !== "inactive") {
+    try {
+      mediaRecorder.stop();
+    } catch {
+      releaseMicCapture();
+      micListening.value = false;
+    }
+    return;
+  }
   if (recInstance) {
     try {
       recInstance.stop();
@@ -1132,6 +1347,7 @@ function stopMicInternal({ cancel }) {
       /* ignore */
     }
   } else {
+    releaseMicCapture();
     micListening.value = false;
     if (cancel) {
       finalTranscript.value = "";
@@ -1140,17 +1356,138 @@ function stopMicInternal({ cancel }) {
   }
 }
 
+function startMicSilenceMonitor(analyser) {
+  stopMicSilenceMonitor();
+  micHasDetectedSpeech = false;
+  micLastSoundMs = performance.now();
+  const buf = new Uint8Array(analyser.fftSize);
+  const tick = () => {
+    if (!micListening.value || !mediaRecorder) return;
+    analyser.getByteTimeDomainData(buf);
+    let sum = 0;
+    for (let i = 0; i < buf.length; i++) {
+      const v = (buf[i] - 128) / 128;
+      sum += v * v;
+    }
+    const rms = Math.sqrt(sum / buf.length);
+    if (rms > MIC_SILENCE_RMS_THRESHOLD) {
+      micHasDetectedSpeech = true;
+      micLastSoundMs = performance.now();
+    } else if (
+      micHasDetectedSpeech &&
+      performance.now() - micLastSoundMs >= SILENCE_MS &&
+      performance.now() - micRecordStartedMs >= MIC_MIN_RECORD_BEFORE_SILENCE_MS
+    ) {
+      stopMicInternal({ cancel: false });
+      return;
+    }
+    micSilenceRaf = requestAnimationFrame(tick);
+  };
+  micSilenceRaf = requestAnimationFrame(tick);
+}
+
+async function onMediaRecorderStop() {
+  if (voiceSessionCancelled) {
+    abortMicCapture();
+    return;
+  }
+  micListening.value = false;
+  playMicTone("off");
+  const recordMs = micRecordDurationMs();
+  const mimeType = mediaRecorder?.mimeType || "audio/webm";
+  const blob = new Blob(micRecordedChunks, { type: mimeType });
+  releaseMicCapture();
+  if (!blob.size || recordMs < MIC_MIN_TRANSCRIBE_MS || blob.size < MIC_MIN_TRANSCRIBE_BYTES) {
+    clearMicTapTiming();
+    return;
+  }
+  try {
+    const { text, latencyMs } = await transcribeMicBlob(blob);
+    if (text && !isPhantomTranscript(text, blob, recordMs)) {
+      showCaptionThenHide(text);
+      void runVoicePipeline(text, latencyMs);
+    } else {
+      finalTranscript.value = "";
+      interimTranscript.value = "";
+      clearMicTapTiming();
+    }
+  } catch (e) {
+    finalTranscript.value = "";
+    interimTranscript.value = "";
+    webrtcError.value = e instanceof Error ? e.message : String(e);
+    clearMicTapTiming();
+  }
+}
+
+async function startServerMicCapture() {
+  const tapMs = performance.now();
+  micTapStartMs = tapMs;
+  voiceInputRequestMs = tapMs;
+  sttSessionStartMs = tapMs;
+  sttFinalTranscriptMs = 0;
+  voiceSessionCancelled = false;
+  clearCaptionHideTimer();
+  finalTranscript.value = "";
+  interimTranscript.value = "";
+  micCaptureStream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      channelCount: 1,
+    },
+  });
+  const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+    ? "audio/webm;codecs=opus"
+    : MediaRecorder.isTypeSupported("audio/webm")
+      ? "audio/webm"
+      : "";
+  mediaRecorder = mime
+    ? new MediaRecorder(micCaptureStream, { mimeType: mime })
+    : new MediaRecorder(micCaptureStream);
+  micRecordedChunks = [];
+  mediaRecorder.ondataavailable = (ev) => {
+    if (ev.data?.size) micRecordedChunks.push(ev.data);
+  };
+  mediaRecorder.onstop = () => {
+    void onMediaRecorderStop();
+  };
+  mediaRecorder.onerror = () => {
+    webrtcError.value = "Microphone recording failed.";
+    stopMicInternal({ cancel: true });
+  };
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const source = ctx.createMediaStreamSource(micCaptureStream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 2048;
+    source.connect(analyser);
+    micRecordStartedMs = performance.now();
+    mediaRecorder.start(250);
+    micListening.value = true;
+    playMicTone("on");
+    startMicSilenceMonitor(analyser);
+    micMaxRecordTimer = window.setTimeout(() => {
+      micMaxRecordTimer = null;
+      if (micListening.value) stopMicInternal({ cancel: false });
+    }, MIC_MAX_RECORD_MS);
+  } catch (e) {
+    releaseMicCapture();
+    throw e;
+  }
+}
+
 function toggleMic() {
   webrtcError.value = "";
   clearFeaturedMenuImage();
   pendingVoiceAnalytics = null;
+  clearCaptionHideTimer();
   clearMicTapTiming();
   if (!started.value) {
     webrtcError.value = "Connecting… try again in a moment.";
     return;
   }
-  if (!speechRecCtor.value) {
-    webrtcError.value = "Voice input needs a Chromium-based browser.";
+  if (!micAvailable.value) {
+    webrtcError.value = "Voice input is not available.";
     return;
   }
   if (micListening.value) {
@@ -1158,7 +1495,23 @@ function toggleMic() {
     return;
   }
 
+  if (useServerTranscribe.value) {
+    void startServerMicCapture().catch((e) => {
+      webrtcError.value = e instanceof Error ? e.message : String(e);
+      releaseMicCapture();
+      micListening.value = false;
+      clearMicTapTiming();
+    });
+    return;
+  }
+
+  if (!speechRecCtor.value) {
+    webrtcError.value = "Voice input needs a Chromium-based browser.";
+    return;
+  }
+
   voiceSessionCancelled = false;
+  clearCaptionHideTimer();
   const SR = speechRecCtor.value;
   recInstance = new SR();
   recInstance.lang = resolveMicLang();
@@ -1225,12 +1578,12 @@ function toggleMic() {
       return;
     }
     const combined = `${finalTranscript.value} ${interimTranscript.value}`.trim();
-    finalTranscript.value = "";
-    interimTranscript.value = "";
-    if (combined) {
-      const sttMs = computeSttLatencyMs();
-      void runVoicePipeline(combined, sttMs);
+    if (combined && !isPhantomTranscript(combined, null, micRecordDurationMs())) {
+      showCaptionThenHide(combined);
+      void runVoicePipeline(combined, null);
     } else {
+      finalTranscript.value = "";
+      interimTranscript.value = "";
       clearMicTapTiming();
     }
   };
@@ -1243,6 +1596,7 @@ function toggleMic() {
     sttFinalTranscriptMs = 0;
     recInstance.start();
     micListening.value = true;
+    playMicTone("on");
   } catch (e) {
     webrtcError.value = e instanceof Error ? e.message : String(e);
     recInstance = null;
@@ -1254,8 +1608,45 @@ function onMicPointerDown() {
   playMicTone("tap");
 }
 
+function clearCaptionHideTimer() {
+  if (captionHideTimer != null) {
+    window.clearTimeout(captionHideTimer);
+    captionHideTimer = null;
+  }
+}
+
+/** Show heard/transcribed text on the avatar caption, then clear after a short delay. */
+function showCaptionThenHide(text) {
+  clearCaptionHideTimer();
+  const t = String(text || "").trim();
+  if (!t) {
+    finalTranscript.value = "";
+    interimTranscript.value = "";
+    return;
+  }
+  finalTranscript.value = t;
+  interimTranscript.value = "";
+  captionHideTimer = window.setTimeout(() => {
+    captionHideTimer = null;
+    finalTranscript.value = "";
+    interimTranscript.value = "";
+  }, CAPTION_HIDE_MS);
+}
+
+const CAPTION_STATUS_PHRASES = new Set([
+  "listening…",
+  "listening...",
+  "transcribing…",
+  "transcribing...",
+  "recording…",
+  "recording...",
+]);
+
 const liveCaption = computed(() => {
-  return `${finalTranscript.value} ${interimTranscript.value}`.trim();
+  const parts = [finalTranscript.value, interimTranscript.value]
+    .map((s) => String(s || "").trim())
+    .filter((s) => s && !CAPTION_STATUS_PHRASES.has(s.toLowerCase()));
+  return parts.join(" ").trim();
 });
 
 function stripReceiptForSpeech(raw) {
@@ -1330,6 +1721,8 @@ onUnmounted(() => {
     window.clearTimeout(orderPlacedHideTimer);
     orderPlacedHideTimer = null;
   }
+  clearCaptionHideTimer();
+  stopMicInternal({ cancel: true });
   clearWebRtcTtfaPending();
   disconnect();
 });
@@ -1538,12 +1931,15 @@ onUnmounted(() => {
           type="button"
           class="mic-fab"
           :class="{ 'mic-fab--on': micListening }"
+          :style="micListening ? { '--mic-pulse-sec': `${MIC_PULSE_SEC}s` } : undefined"
           :disabled="!started || !micAvailable"
           :aria-pressed="micListening"
           :aria-label="micListening ? 'Listening — tap to cancel' : 'Microphone off — tap to speak'"
           :title="
             !micAvailable
               ? 'Voice input unavailable'
+              : micListening && useServerTranscribe
+                ? 'Recording… tap to cancel'
               : micListening
                 ? 'Listening… tap to cancel'
                 : 'Tap to speak'
@@ -2497,7 +2893,7 @@ onUnmounted(() => {
   box-shadow:
     0 0 0 max(2px, 0.1cqw) rgba(0, 200, 200, 0.35),
     0 clamp(3px, 0.2cqw, 8px) clamp(14px, 0.85cqw, 24px) rgba(0, 180, 180, 0.15);
-  animation: mic-pulse 1.4s ease-in-out infinite;
+  animation: mic-pulse var(--mic-pulse-sec, 2.2s) ease-in-out infinite;
 }
 
 @keyframes mic-pulse {
