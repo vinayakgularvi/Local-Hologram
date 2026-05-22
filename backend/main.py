@@ -1816,7 +1816,8 @@ def _build_voice_llm_prompt(user_text: str) -> tuple[str, dict[str, Any], list[d
     chroma_results: list[dict[str, Any]] = []
     user_block = (
         f"User said:\n{user_text}\n\n"
-        "Assistant (spoken reply only, no markdown):"
+        "Assistant (spoken reply first, no dish names that match a following <show_image> tag; "
+        "optional <show_image>…</show_image> at end for UI only):"
     )
     if not VOICE_RAG_ENABLED:
         return f"{VOICE_OLLAMA_INSTRUCTION}\n\n{user_block}", rag_meta, chroma_results
@@ -1843,7 +1844,7 @@ def _build_voice_llm_prompt(user_text: str) -> tuple[str, dict[str, Any], list[d
 
     parts: list[str] = []
     for i, hit in enumerate(chroma_results, 1):
-        chunk_text = (hit.get("text") or "").strip()
+        chunk_text = strip_show_image_markup((hit.get("text") or "").strip())
         if not chunk_text:
             continue
         fn = (hit.get("metadata") or {}).get("filename", "document")
@@ -1872,7 +1873,7 @@ def _build_voice_rag_stream_conversation(user_text: str, chroma_results: list[di
     """Messages for POST RAG_GENERATE_STREAM_URL (Chroma excerpts + user utterance)."""
     parts: list[str] = []
     for r in chroma_results:
-        t = (r.get("text") or "").strip()
+        t = strip_show_image_markup((r.get("text") or "").strip())
         if t:
             parts.append(t)
     context = "\n\n---\n\n".join(parts)
@@ -1881,6 +1882,7 @@ def _build_voice_rag_stream_conversation(user_text: str, chroma_results: list[di
     system_blocks = [
         VOICE_OLLAMA_INSTRUCTION.strip(),
         "Reply in a short spoken style suitable for text-to-speech. No markdown.",
+        _VOICE_SHOW_IMAGE_UI_HINT,
     ]
     if context.strip():
         system_blocks.append(
@@ -1899,6 +1901,45 @@ class VoiceTurnBody(BaseModel):
 _RECEIPT_BLOCK_RE = re.compile(r"<receipt>\s*([\s\S]*?)\s*</receipt>", re.IGNORECASE)
 _ORDERDONE_BLOCK_RE = re.compile(r"<orderdone>\s*(.*?)\s*</orderdone>", re.IGNORECASE | re.DOTALL)
 _SHOW_IMAGE_BLOCK_RE = re.compile(r"<show_image>\s*([\s\S]*?)\s*</show_image>", re.IGNORECASE)
+# Unclosed tag (model/stream truncation) — still remove from TTS-bound text.
+_SHOW_IMAGE_LOOSE_RE = re.compile(r"<show_image>[\s\S]*?(?:</show_image>|$)", re.IGNORECASE)
+
+_VOICE_SHOW_IMAGE_UI_HINT = (
+    "Spoken part: short plain sentences only. Never read tag names, JSON, or menu item titles aloud. "
+    "Do not say the dish names that you put in <show_image> (e.g. do not say 'Sourdough Chicken Sandwich' "
+    "if that name is only inside the tag). Use generic phrases like 'here it is' or 'take a look'. "
+    "After the spoken lines, append one silent UI-only block: "
+    '<show_image>{"items":[{"name":"Exact menu item name"}]}</show_image> '
+    "(exact names inside the tag only, for images; omit the tag if no image is needed)."
+)
+
+
+def strip_show_image_markup(text: str) -> str:
+    """Remove <show_image> blocks from text bound for LiveTalking /human (TTS)."""
+    if not text or not isinstance(text, str):
+        return ""
+    out = _SHOW_IMAGE_BLOCK_RE.sub("", text)
+    out = _SHOW_IMAGE_LOOSE_RE.sub("", out)
+    return out.strip()
+
+
+def strip_show_image_item_names_from_speech(
+    speak_text: str, show_image: dict[str, Any] | None
+) -> str:
+    """Remove menu titles from TTS when the same names are shown via <show_image> UI."""
+    if not speak_text or not _show_image_has_items(show_image):
+        return speak_text
+    out = speak_text
+    for it in show_image.get("items") or []:
+        if not isinstance(it, dict):
+            continue
+        name = str(it.get("name") or "").strip()
+        if len(name) < 3:
+            continue
+        out = re.sub(re.escape(name), "", out, flags=re.IGNORECASE)
+    out = re.sub(r"\s{2,}", " ", out)
+    out = re.sub(r"\s+([,.!?])", r"\1", out)
+    return out.strip()
 
 
 def _parse_order_done_number(inner: str) -> int:
@@ -1940,9 +1981,25 @@ def split_voice_answer_receipt(raw: str) -> tuple[str, dict[str, Any] | None, in
         order_done = _parse_order_done_number(m.group(1) or "")
     speak = _RECEIPT_BLOCK_RE.sub("", text)
     speak = _ORDERDONE_BLOCK_RE.sub("", speak)
-    speak = _SHOW_IMAGE_BLOCK_RE.sub("", speak).strip()
+    speak = strip_show_image_markup(speak)
     receipt: dict[str, Any] | None = {"items": merged_items} if merged_items else None
     return speak, receipt, order_done
+
+
+def normalize_show_image_payload(payload: Any) -> dict[str, Any] | None:
+    """Normalize API/stream object or string into {items: [{name}]}."""
+    if payload is None:
+        return None
+    if isinstance(payload, str):
+        return _parse_show_image_inner(payload.strip())
+    if isinstance(payload, dict) and isinstance(payload.get("items"), list):
+        items = [
+            {"name": str(it.get("name", "")).strip()}
+            for it in payload["items"]
+            if isinstance(it, dict) and str(it.get("name", "")).strip()
+        ]
+        return {"items": items} if items else None
+    return None
 
 
 def _parse_show_image_inner(inner: str) -> dict[str, Any] | None:
@@ -2006,11 +2063,18 @@ async def voice_turn(body: VoiceTurnBody):
     t0 = time.perf_counter()
     ollama_metrics: dict[str, Any] = {}
     use_rag_stream = bool(RAG_GENERATE_STREAM_URL) and _rag_generate_stream_url_valid(RAG_GENERATE_STREAM_URL)
+    stream_show_image: dict[str, Any] | None = None
     if use_rag_stream:
         rag_meta["llm"] = "rag_generate_stream"
         conversation = _build_voice_rag_stream_conversation(user_text, chroma_hits)
         try:
-            answer = await _collect_rag_generate_stream(RAG_GENERATE_STREAM_URL, conversation)
+            stream_result = await _collect_rag_generate_stream(
+                RAG_GENERATE_STREAM_URL,
+                conversation,
+                voice_turn=True,
+            )
+            answer = stream_result[0]
+            stream_show_image = stream_result[1]
         except HTTPException:
             raise
         except Exception as e:
@@ -2019,10 +2083,15 @@ async def voice_turn(body: VoiceTurnBody):
     else:
         rag_meta["llm"] = "ollama"
         answer = await ollama_generate(prompt, ollama_metrics, max_tokens=VOICE_MAX_TOKENS)
+        stream_show_image = None
     if not (answer or "").strip():
         raise HTTPException(status_code=502, detail="Model returned an empty reply.")
+    show_image = parse_show_image_from_answer(answer) or normalize_show_image_payload(
+        stream_show_image
+    )
     speak_text, receipt, order_done_num = split_voice_answer_receipt(answer)
-    show_image = parse_show_image_from_answer(answer)
+    speak_text = strip_show_image_markup(speak_text)
+    speak_text = strip_show_image_item_names_from_speech(speak_text, show_image)
     if (
         not speak_text.strip()
         and not (receipt and receipt.get("items"))
@@ -2180,15 +2249,32 @@ def _build_rag_generate_conversation(query: str, results: list[dict[str, Any]]) 
     return conv
 
 
-async def _collect_rag_generate_stream(url: str, conversation: list[dict[str, str]]) -> str:
-    payload = {"conversation": conversation}
+async def _collect_rag_generate_stream(
+    url: str,
+    conversation: list[dict[str, str]],
+    *,
+    voice_turn: bool = False,
+) -> str | tuple[str, dict[str, Any] | None]:
+    payload: dict[str, Any] = {"conversation": conversation}
+    if voice_turn:
+        payload["for_voice_tts"] = True
     headers = {
         "Content-Type": "application/json",
         "Accept": "text/event-stream, application/json, text/plain, */*",
     }
     timeout = httpx.Timeout(RAG_GENERATE_STREAM_TIMEOUT_SEC, connect=15.0)
     pieces: list[str] = []
+    stream_show_image: dict[str, Any] | None = None
     total = 0
+
+    def _note_stream_show_image(data: dict[str, Any]) -> None:
+        nonlocal stream_show_image
+        if not voice_turn:
+            return
+        si = data.get("show_image")
+        norm = normalize_show_image_payload(si)
+        if norm:
+            stream_show_image = norm
 
     async def _append(s: str) -> bool:
         nonlocal total
@@ -2216,6 +2302,7 @@ async def _collect_rag_generate_stream(url: str, conversation: list[dict[str, st
                 except (json.JSONDecodeError, UnicodeDecodeError) as e:
                     raise HTTPException(status_code=502, detail=f"RAG generate: invalid JSON body: {e}") from e
                 if isinstance(obj, dict):
+                    _note_stream_show_image(obj)
                     t = _rag_stream_json_text_piece(obj)
                     if t:
                         await _append(t)
@@ -2224,7 +2311,8 @@ async def _collect_rag_generate_stream(url: str, conversation: list[dict[str, st
                         pass
                 elif isinstance(obj, str):
                     await _append(obj)
-                return "".join(pieces).strip()
+                out = "".join(pieces).strip()
+                return (out, stream_show_image) if voice_turn else out
 
             async for raw in response.aiter_lines():
                 if total > RAG_GENERATE_STREAM_MAX_CHARS:
@@ -2251,11 +2339,13 @@ async def _collect_rag_generate_stream(url: str, conversation: list[dict[str, st
                     continue
                 if data.get("error"):
                     raise HTTPException(status_code=502, detail=str(data.get("error")))
+                _note_stream_show_image(data)
                 piece = _rag_stream_json_text_piece(data)
                 if piece and not await _append(piece):
                     break
 
-    return "".join(pieces).strip()
+    out = "".join(pieces).strip()
+    return (out, stream_show_image) if voice_turn else out
 
 
 @app.get("/api/rag/status")

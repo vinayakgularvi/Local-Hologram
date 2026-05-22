@@ -280,9 +280,14 @@ function applyShowImageFromVoiceTurn(data) {
     return;
   }
   const payload =
-    normalizeShowImagePayload(data?.show_image) || parseShowImageFromAnswer(data?.answer);
+    normalizeShowImagePayload(data?.show_image) ||
+    parseShowImageFromAnswer(data?.answer) ||
+    parseShowImageFromAnswer(String(data?.speak_text || ""));
   const images = resolveMenuImagesFromPayload(payload);
   featuredMenuImages.value = images;
+  if (payload?.items?.length && !images.length) {
+    console.warn("[show_image] no menu PNG for items:", payload.items.map((it) => it.name));
+  }
 }
 
 function clearFeaturedMenuImage() {
@@ -650,7 +655,7 @@ async function runVoicePipeline(userText) {
       throw new Error("Model returned an empty reply.");
     }
     if (speakText) {
-      await postHuman(speakText);
+      await postHuman(stripReceiptForSpeech(speakText));
     }
   } catch (e) {
     webrtcError.value = e instanceof Error ? e.message : String(e);
@@ -980,14 +985,13 @@ onUnmounted(() => {
                 <img
                   class="menu-featured__img"
                   :src="img.src"
-                  :alt="img.label"
+                  alt=""
                   width="480"
                   height="480"
                   loading="lazy"
                   decoding="async"
                 />
               </div>
-              <p v-if="featuredMenuImages.length > 1" class="menu-featured__caption">{{ img.label }}</p>
             </article>
           </div>
         </div>
