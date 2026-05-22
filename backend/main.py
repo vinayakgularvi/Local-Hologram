@@ -29,7 +29,14 @@ from fastapi.staticfiles import StaticFiles
 from gradio_client import Client, handle_file
 from pydantic import BaseModel, Field
 
-from analytics_store import clear_all, get_recent_voice_turns, get_summary, init_db, record_voice_turn
+from analytics_store import (
+    clear_all,
+    get_recent_voice_turns,
+    get_summary,
+    init_db,
+    record_voice_turn,
+    update_voice_turn_webrtc_first_voice,
+)
 from avatar_assets_store import (
     get_audio as livetalking_db_get_audio,
     get_video as livetalking_db_get_video,
@@ -1896,6 +1903,12 @@ def _build_voice_rag_stream_conversation(user_text: str, chroma_results: list[di
 
 class VoiceTurnBody(BaseModel):
     text: str = Field(..., min_length=1, max_length=8000)
+    stt_latency_ms: float | None = Field(
+        None,
+        ge=0,
+        le=600_000,
+        description="Browser speech-to-text: mic recognition start → final transcript ready (ms).",
+    )
 
 
 _RECEIPT_BLOCK_RE = re.compile(r"<receipt>\s*([\s\S]*?)\s*</receipt>", re.IGNORECASE)
@@ -2064,9 +2077,11 @@ async def voice_turn(body: VoiceTurnBody):
     ollama_metrics: dict[str, Any] = {}
     use_rag_stream = bool(RAG_GENERATE_STREAM_URL) and _rag_generate_stream_url_valid(RAG_GENERATE_STREAM_URL)
     stream_show_image: dict[str, Any] | None = None
+    rag_latency_ms: float | None = None
     if use_rag_stream:
         rag_meta["llm"] = "rag_generate_stream"
         conversation = _build_voice_rag_stream_conversation(user_text, chroma_hits)
+        t_rag = time.perf_counter()
         try:
             stream_result = await _collect_rag_generate_stream(
                 RAG_GENERATE_STREAM_URL,
@@ -2080,6 +2095,9 @@ async def voice_turn(body: VoiceTurnBody):
         except Exception as e:
             logger.warning("RAG generate stream (voice-turn) failed: %s", e)
             raise HTTPException(status_code=502, detail=f"RAG generate stream failed: {e}") from e
+        finally:
+            rag_latency_ms = (time.perf_counter() - t_rag) * 1000.0
+        rag_meta["rag_latency_ms"] = round(rag_latency_ms, 1)
     else:
         rag_meta["llm"] = "ollama"
         answer = await ollama_generate(prompt, ollama_metrics, max_tokens=VOICE_MAX_TOKENS)
@@ -2100,20 +2118,23 @@ async def voice_turn(body: VoiceTurnBody):
     ):
         raise HTTPException(status_code=502, detail="Model returned an empty reply.")
     total_ms = (time.perf_counter() - t0) * 1000.0
+    analytics_turn_id: int | None = None
     if os.environ.get("ANALYTICS_DISABLE", "").strip().lower() not in (
         "1",
         "true",
         "yes",
     ):
-        record_voice_turn(
+        stt_ms = body.stt_latency_ms
+        if stt_ms is not None and (stt_ms < 0 or stt_ms > 600_000):
+            stt_ms = None
+        analytics_turn_id = record_voice_turn(
             heard_chars=len(user_text),
             answer_chars=len(speak_text),
             total_request_ms=total_ms,
-            ollama_wall_ms=total_ms,
+            rag_latency_ms=rag_latency_ms,
+            stt_latency_ms=stt_ms,
             prompt_tokens=ollama_metrics.get("prompt_eval_count"),
             completion_tokens=ollama_metrics.get("eval_count"),
-            ollama_total_duration_ns=ollama_metrics.get("total_duration_ns"),
-            ollama_load_duration_ns=ollama_metrics.get("load_duration_ns"),
         )
         await _publish_analytics_snapshot()
     return {
@@ -2124,12 +2145,14 @@ async def voice_turn(body: VoiceTurnBody):
         "order_done": ({"number": int(order_done_num)} if order_done_num is not None else None),
         "heard": user_text,
         "rag": rag_meta,
+        "analytics_turn_id": analytics_turn_id,
+        "total_request_ms": round(total_ms, 1),
     }
 
 
 @app.get("/api/analytics/summary")
 async def analytics_summary():
-    """Aggregates for dashboard (voice /mic → Ollama turns)."""
+    """Aggregates for dashboard (voice / mic → RAG stream or Ollama)."""
     s = get_summary()
     return {"kind": "voice_turns", **s}
 
@@ -2137,6 +2160,39 @@ async def analytics_summary():
 @app.get("/api/analytics/voice-turns")
 async def analytics_voice_turns(limit: int = 50):
     return {"items": get_recent_voice_turns(limit)}
+
+
+class WebrtcFirstVoiceBody(BaseModel):
+    """WebRTC audio timing and optional combined mic→first-voice (STT + RAG + WebRTC)."""
+
+    turn_id: int = Field(..., ge=1)
+    webrtc_first_voice_ms: float = Field(..., ge=0, le=600_000)
+    time_to_first_voice_ms: float | None = Field(None, ge=0, le=600_000)
+    mic_to_speaker_voice_ms: float | None = Field(
+        None,
+        ge=0,
+        le=600_000,
+        description="Mic tap → first avatar audio on speakers (browser).",
+    )
+
+
+@app.post("/api/analytics/webrtc-first-voice")
+async def analytics_webrtc_first_voice(body: WebrtcFirstVoiceBody):
+    if os.environ.get("ANALYTICS_DISABLE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return {"ok": False, "reason": "analytics_disabled"}
+    updated = update_voice_turn_webrtc_first_voice(
+        body.turn_id,
+        body.webrtc_first_voice_ms,
+        time_to_first_voice_ms=body.time_to_first_voice_ms,
+        mic_to_speaker_voice_ms=body.mic_to_speaker_voice_ms,
+    )
+    if updated:
+        await _publish_analytics_snapshot()
+    return {"ok": updated, "turn_id": body.turn_id}
 
 
 @app.get("/api/analytics/stream")
