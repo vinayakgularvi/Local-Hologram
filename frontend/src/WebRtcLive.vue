@@ -145,7 +145,7 @@ const CAFE_MENU = [
         id: "sourdough-chicken-sandwich",
         name: "Sourdough Chicken Sandwich",
         desc: "Crispy chicken, lettuce, tomato, onion, cheese, toasted sourdough",
-        price: 16.0,
+        price: 18.0,
       },
       { id: "veg-sandwich", name: "Veg Sandwich", price: 12.0 },
     ],
