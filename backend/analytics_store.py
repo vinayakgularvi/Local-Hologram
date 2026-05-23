@@ -31,6 +31,10 @@ def _ensure_voice_turn_columns(cx: sqlite3.Connection) -> None:
         cx.execute("ALTER TABLE voice_turns ADD COLUMN rag_latency_ms REAL")
     if "stt_latency_ms" not in cols:
         cx.execute("ALTER TABLE voice_turns ADD COLUMN stt_latency_ms REAL")
+    if "stt_first_chunk_latency_ms" not in cols:
+        cx.execute("ALTER TABLE voice_turns ADD COLUMN stt_first_chunk_latency_ms REAL")
+    if "stt_chunk_count" not in cols:
+        cx.execute("ALTER TABLE voice_turns ADD COLUMN stt_chunk_count INTEGER")
     if "time_to_first_voice_ms" not in cols:
         cx.execute("ALTER TABLE voice_turns ADD COLUMN time_to_first_voice_ms REAL")
     if "mic_to_speaker_voice_ms" not in cols:
@@ -148,6 +152,8 @@ def record_voice_turn(
     total_request_ms: float,
     rag_latency_ms: float | None = None,
     stt_latency_ms: float | None = None,
+    stt_first_chunk_latency_ms: float | None = None,
+    stt_chunk_count: int | None = None,
     prompt_tokens: int | None = None,
     completion_tokens: int | None = None,
 ) -> int:
@@ -159,8 +165,9 @@ def record_voice_turn(
                 INSERT INTO voice_turns (
                     ts, heard_chars, answer_chars, total_request_ms, ollama_wall_ms,
                     prompt_tokens, completion_tokens, ollama_total_duration_ns, ollama_load_duration_ns,
-                    webrtc_first_voice_ms, rag_latency_ms, stt_latency_ms
-                ) VALUES (?, ?, ?, ?, 0, ?, ?, NULL, NULL, NULL, ?, ?)
+                    webrtc_first_voice_ms, rag_latency_ms, stt_latency_ms,
+                    stt_first_chunk_latency_ms, stt_chunk_count
+                ) VALUES (?, ?, ?, ?, 0, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?)
                 """,
                 (
                     _utc_now_iso(),
@@ -171,6 +178,8 @@ def record_voice_turn(
                     completion_tokens,
                     rag_latency_ms,
                     stt_latency_ms,
+                    stt_first_chunk_latency_ms,
+                    stt_chunk_count,
                 ),
             )
             cx.commit()
@@ -367,6 +376,9 @@ def get_summary() -> dict[str, Any]:
                 AVG(stt_latency_ms) AS avg_stt_latency_ms,
                 MIN(stt_latency_ms) AS min_stt_latency_ms,
                 MAX(stt_latency_ms) AS max_stt_latency_ms,
+                AVG(stt_first_chunk_latency_ms) AS avg_stt_first_chunk_latency_ms,
+                MIN(stt_first_chunk_latency_ms) AS min_stt_first_chunk_latency_ms,
+                MAX(stt_first_chunk_latency_ms) AS max_stt_first_chunk_latency_ms,
                 AVG(time_to_first_voice_ms) AS avg_time_to_first_voice_ms,
                 MIN(time_to_first_voice_ms) AS min_time_to_first_voice_ms,
                 MAX(time_to_first_voice_ms) AS max_time_to_first_voice_ms,
@@ -449,6 +461,9 @@ def _empty_summary() -> dict[str, Any]:
         "avg_stt_latency_ms": None,
         "min_stt_latency_ms": None,
         "max_stt_latency_ms": None,
+        "avg_stt_first_chunk_latency_ms": None,
+        "min_stt_first_chunk_latency_ms": None,
+        "max_stt_first_chunk_latency_ms": None,
         "avg_time_to_first_voice_ms": None,
         "min_time_to_first_voice_ms": None,
         "max_time_to_first_voice_ms": None,
@@ -511,7 +526,8 @@ def get_recent_voice_turns(limit: int = 50) -> list[dict[str, Any]]:
             """
             SELECT id, ts, heard_chars, answer_chars, total_request_ms,
                    prompt_tokens, completion_tokens, webrtc_first_voice_ms, rag_latency_ms,
-                   stt_latency_ms, time_to_first_voice_ms, mic_to_speaker_voice_ms,
+                   stt_latency_ms, stt_first_chunk_latency_ms, stt_chunk_count,
+                   time_to_first_voice_ms, mic_to_speaker_voice_ms,
                    tts_latency_ms, lip_sync_latency_ms, mic_to_lip_sync_ms,
                    lip_sync_to_video_stream_ms, mic_to_first_audio_ms,
                    client_voice_turn_ms, human_dispatch_ms, human_dispatched,

@@ -237,7 +237,9 @@ TRANSCRIBE_MODEL_ID = os.environ.get(
     "TRANSCRIBE_MODEL_ID",
     "distil-whisper/distil-large-v3",
 ).strip()
-TRANSCRIBE_MODE = os.environ.get("TRANSCRIBE_MODE", "sequential").strip() or "sequential"
+TRANSCRIBE_MODE = os.environ.get("TRANSCRIBE_MODE", "chunked").strip().lower() or "chunked"
+if TRANSCRIBE_MODE not in ("sequential", "chunked"):
+    TRANSCRIBE_MODE = "chunked"
 TRANSCRIBE_TASK = os.environ.get("TRANSCRIBE_TASK", "transcribe").strip() or "transcribe"
 TRANSCRIBE_BATCH_SIZE = max(1, _env_first_int("TRANSCRIBE_BATCH_SIZE", default=8))
 TRANSCRIBE_NUM_BEAMS = max(1, _env_first_int("TRANSCRIBE_NUM_BEAMS", default=1))
@@ -245,6 +247,8 @@ TRANSCRIBE_MAX_NEW_TOKENS = max(16, _env_first_int("TRANSCRIBE_MAX_NEW_TOKENS", 
 TRANSCRIBE_TEMPERATURE = os.environ.get("TRANSCRIBE_TEMPERATURE", "0").strip() or "0"
 TRANSCRIBE_TIMESTAMP = os.environ.get("TRANSCRIBE_TIMESTAMP", "none").strip() or "none"
 TRANSCRIBE_DEFAULT_LANGUAGE = os.environ.get("TRANSCRIBE_DEFAULT_LANGUAGE", "english").strip() or "english"
+TRANSCRIBE_CHUNK_LENGTH_S = os.environ.get("TRANSCRIBE_CHUNK_LENGTH_S", "10").strip() or "10"
+TRANSCRIBE_STRIDE_LENGTH_S = os.environ.get("TRANSCRIBE_STRIDE_LENGTH_S", "0").strip() or "0"
 HOLOGRAM_UPLOAD_TIMEOUT_SEC = max(60.0, float(_env_first_int("HOLOGRAM_UPLOAD_TIMEOUT_SEC", default=600)))
 HOLOGRAM_PREPARE_TIMEOUT_SEC = max(120.0, float(_env_first_int("HOLOGRAM_PREPARE_TIMEOUT_SEC", default=900)))
 _HOLOGRAM_ASSET_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
@@ -1587,6 +1591,10 @@ async def health():
         "webrtc_signaling_proxy": bool(WEBRTC_SIGNALING_BASE),
         "transcribe_configured": bool(TRANSCRIBE_API_URL),
         "transcribe_model_id": TRANSCRIBE_MODEL_ID if TRANSCRIBE_API_URL else None,
+        "transcribe_mode": TRANSCRIBE_MODE if TRANSCRIBE_API_URL else None,
+        "transcribe_chunk_length_s": int(float(TRANSCRIBE_CHUNK_LENGTH_S))
+        if TRANSCRIBE_API_URL and TRANSCRIBE_MODE == "chunked"
+        else None,
         "avatar_api_base": AVATAR_API_BASE,
         "rag": rag_info,
         "sharepoint": {
@@ -1610,12 +1618,27 @@ async def health():
     }
 
 
+def _transcribe_chunk_length_s(raw: str, mode: str) -> str:
+    """Whisper API uses chunk_length_s only when mode=chunked (default 10s for mic latency)."""
+    resolved_mode = (mode or TRANSCRIBE_MODE).strip().lower() or TRANSCRIBE_MODE
+    if resolved_mode != "chunked":
+        return "0"
+    s = (raw or "").strip()
+    if s and s != "0":
+        return s
+    return TRANSCRIBE_CHUNK_LENGTH_S if TRANSCRIBE_CHUNK_LENGTH_S not in ("", "0") else "10"
+
+
 @app.get("/api/webrtc")
 async def webrtc_proxy_status():
     """Whether POST /offer, /human, /record are forwarded to WEBRTC_SIGNALING_BASE."""
     return {
         "signaling_proxy_configured": bool(WEBRTC_SIGNALING_BASE),
         "transcribe_configured": bool(TRANSCRIBE_API_URL),
+        "transcribe_mode": TRANSCRIBE_MODE if TRANSCRIBE_API_URL else None,
+        "transcribe_chunk_length_s": int(float(TRANSCRIBE_CHUNK_LENGTH_S))
+        if TRANSCRIBE_API_URL and TRANSCRIBE_MODE == "chunked"
+        else None,
     }
 
 
@@ -1662,12 +1685,12 @@ async def api_transcribe(
             return str(default)
 
     form: dict[str, str] = {
-        "stride_length_s": stride_length_s,
-        "mode": (mode or TRANSCRIBE_MODE).strip() or TRANSCRIBE_MODE,
+        "stride_length_s": (stride_length_s or "").strip() or TRANSCRIBE_STRIDE_LENGTH_S,
+        "mode": (mode or TRANSCRIBE_MODE).strip().lower() or TRANSCRIBE_MODE,
         "task": (task or TRANSCRIBE_TASK).strip() or TRANSCRIBE_TASK,
         "batch_size": _form_int(batch_size, TRANSCRIBE_BATCH_SIZE),
         "num_beams": _form_int(num_beams, TRANSCRIBE_NUM_BEAMS),
-        "chunk_length_s": chunk_length_s,
+        "chunk_length_s": _transcribe_chunk_length_s(chunk_length_s, mode),
         "model_id": (model_id or TRANSCRIBE_MODEL_ID).strip() or TRANSCRIBE_MODEL_ID,
         "temperature": (temperature or TRANSCRIBE_TEMPERATURE).strip() or TRANSCRIBE_TEMPERATURE,
         "max_new_tokens": _form_int(max_new_tokens, TRANSCRIBE_MAX_NEW_TOKENS),
@@ -1678,6 +1701,7 @@ async def api_transcribe(
     content_type = file.content_type or "application/octet-stream"
     files = {"file": (filename, raw, content_type)}
     timeout = httpx.Timeout(TRANSCRIBE_TIMEOUT_SEC, connect=15.0)
+    t0 = time.perf_counter()
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             r = await client.post(TRANSCRIBE_API_URL, data=form, files=files)
@@ -1698,10 +1722,12 @@ async def api_transcribe(
     if not isinstance(payload, dict):
         raise HTTPException(status_code=502, detail="Transcribe returned unexpected JSON.")
     text = str(payload.get("text") or "").strip()
+    proxy_ms = round((time.perf_counter() - t0) * 1000.0, 1)
     return {
         "text": text,
         "metadata": payload.get("metadata"),
         "chunks": payload.get("chunks"),
+        "latency_ms": proxy_ms,
     }
 
 
@@ -2082,7 +2108,19 @@ class VoiceTurnBody(BaseModel):
         None,
         ge=0,
         le=600_000,
-        description="Transcribe API round-trip: POST /api/transcribe request → response (ms).",
+        description="Final transcribe API round-trip: POST /api/transcribe request → response (ms).",
+    )
+    stt_first_chunk_latency_ms: float | None = Field(
+        None,
+        ge=0,
+        le=600_000,
+        description="Mic tap → first live chunked partial transcript (ms).",
+    )
+    stt_chunk_count: int | None = Field(
+        None,
+        ge=0,
+        le=10_000,
+        description="Number of live transcribe chunk requests during recording.",
     )
 
 
@@ -2303,12 +2341,20 @@ async def voice_turn(body: VoiceTurnBody):
         stt_ms = body.stt_latency_ms
         if stt_ms is not None and (stt_ms < 0 or stt_ms > 600_000):
             stt_ms = None
+        stt_first_ms = body.stt_first_chunk_latency_ms
+        if stt_first_ms is not None and (stt_first_ms < 0 or stt_first_ms > 600_000):
+            stt_first_ms = None
+        stt_chunks = body.stt_chunk_count
+        if stt_chunks is not None and (stt_chunks < 0 or stt_chunks > 10_000):
+            stt_chunks = None
         analytics_turn_id = record_voice_turn(
             heard_chars=len(user_text),
             answer_chars=speak_len,
             total_request_ms=total_ms,
             rag_latency_ms=rag_latency_ms,
             stt_latency_ms=stt_ms,
+            stt_first_chunk_latency_ms=stt_first_ms,
+            stt_chunk_count=stt_chunks,
             prompt_tokens=ollama_metrics.get("prompt_eval_count"),
             completion_tokens=ollama_metrics.get("eval_count"),
         )

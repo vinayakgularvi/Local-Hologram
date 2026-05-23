@@ -29,6 +29,16 @@ let micSilenceRaf = null;
 let micLastSoundMs = 0;
 let micRecordStartedMs = 0;
 let micHasDetectedSpeech = false;
+/** @type {number | null} */
+let liveTranscribeTimer = null;
+let liveTranscribeInFlight = false;
+let liveTranscribeSeq = 0;
+let liveTranscriptText = "";
+let sttFirstChunkLatencyMs = null;
+let sttChunkCount = 0;
+let lastLiveTranscribeBytes = 0;
+let lastLiveTranscribeAtMs = 0;
+let lastLiveTranscribeApiMs = null;
 
 const transcribeConfigured = ref(false);
 const micListening = ref(false);
@@ -348,6 +358,35 @@ const MIC_SILENCE_RMS_THRESHOLD = Math.max(
   0.008,
   Number.parseFloat(import.meta.env.VITE_MIC_SILENCE_RMS || "0.014") || 0.014
 );
+/** Live chunked transcribe: poll interval while recording (0 = disabled). */
+const TRANSCRIBE_LIVE_CHUNK_MS = Math.max(
+  0,
+  Number.parseInt(import.meta.env.VITE_TRANSCRIBE_LIVE_CHUNK_MS || "2500", 10) || 2500
+);
+const TRANSCRIBE_LIVE_MIN_MS = Math.max(
+  800,
+  Number.parseInt(import.meta.env.VITE_TRANSCRIBE_LIVE_MIN_MS || "1500", 10) || 1500
+);
+const TRANSCRIBE_LIVE_MIN_BYTES = Math.max(
+  2000,
+  Number.parseInt(import.meta.env.VITE_TRANSCRIBE_LIVE_MIN_BYTES || "8000", 10) || 8000
+);
+const TRANSCRIBE_CHUNK_LENGTH_S = Math.max(
+  0,
+  Number.parseInt(import.meta.env.VITE_TRANSCRIBE_CHUNK_LENGTH_S || "10", 10) || 10
+);
+/** Smaller Whisper windows for live partial requests (mode=chunked). */
+const TRANSCRIBE_LIVE_CHUNK_LENGTH_S = Math.max(
+  0,
+  Number.parseInt(import.meta.env.VITE_TRANSCRIBE_LIVE_CHUNK_LENGTH_S || "5", 10) || 5
+);
+const TRANSCRIBE_MODE = (() => {
+  const m = String(import.meta.env.VITE_TRANSCRIBE_MODE || "chunked").trim().toLowerCase();
+  return m === "sequential" ? "sequential" : "chunked";
+})();
+const TRANSCRIBE_LIVE_ENABLED =
+  TRANSCRIBE_LIVE_CHUNK_MS > 0 &&
+  String(import.meta.env.VITE_TRANSCRIBE_LIVE_ENABLED ?? "1").trim().toLowerCase() !== "0";
 /** Whisper often returns these on silence / very short cancel taps. */
 const PHANTOM_TRANSCRIPT_RE =
   /^(thank\s*you|thanks|thank\s*you\.|thanks\.|ok|okay|bye|goodbye|you|the|\.+)$/i;
@@ -1009,6 +1048,106 @@ function micRecordDurationMs() {
   return micRecordStartedMs > 0 ? Math.max(0, performance.now() - micRecordStartedMs) : 0;
 }
 
+function resetLiveTranscribeState() {
+  liveTranscriptText = "";
+  sttFirstChunkLatencyMs = null;
+  sttChunkCount = 0;
+  lastLiveTranscribeBytes = 0;
+  lastLiveTranscribeAtMs = 0;
+  lastLiveTranscribeApiMs = null;
+  liveTranscribeSeq++;
+  liveTranscribeInFlight = false;
+}
+
+function stopLiveTranscribeLoop() {
+  if (liveTranscribeTimer != null) {
+    window.clearInterval(liveTranscribeTimer);
+    liveTranscribeTimer = null;
+  }
+}
+
+function buildMicBlobSoFar() {
+  const mimeType = mediaRecorder?.mimeType || "audio/webm";
+  return new Blob(micRecordedChunks, { type: mimeType });
+}
+
+function flushMicRecorderData() {
+  if (mediaRecorder?.state === "recording") {
+    try {
+      mediaRecorder.requestData();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+async function tickLiveTranscribe() {
+  if (
+    !TRANSCRIBE_LIVE_ENABLED ||
+    !micListening.value ||
+    voiceSessionCancelled ||
+    !mediaRecorder ||
+    liveTranscribeInFlight
+  ) {
+    return;
+  }
+  const recordMs = micRecordDurationMs();
+  if (!micHasDetectedSpeech || recordMs < TRANSCRIBE_LIVE_MIN_MS) return;
+  flushMicRecorderData();
+  const blob = buildMicBlobSoFar();
+  if (blob.size < TRANSCRIBE_LIVE_MIN_BYTES) return;
+  const now = performance.now();
+  if (
+    blob.size <= lastLiveTranscribeBytes &&
+    now - lastLiveTranscribeAtMs < TRANSCRIBE_LIVE_CHUNK_MS * 0.85
+  ) {
+    return;
+  }
+  liveTranscribeInFlight = true;
+  const seq = liveTranscribeSeq;
+  try {
+    const { text, latencyMs } = await transcribeMicBlob(blob, { live: true });
+    if (seq !== liveTranscribeSeq || voiceSessionCancelled || !micListening.value) return;
+    sttChunkCount += 1;
+    lastLiveTranscribeBytes = blob.size;
+    lastLiveTranscribeAtMs = performance.now();
+    lastLiveTranscribeApiMs = latencyMs;
+    if (text && !isPhantomTranscript(text, blob, recordMs)) {
+      liveTranscriptText = text;
+      interimTranscript.value = text;
+      if (sttFirstChunkLatencyMs == null && micTapStartMs > 0) {
+        sttFirstChunkLatencyMs =
+          Math.round((performance.now() - micTapStartMs) * 10) / 10;
+      }
+      console.info("[live-transcribe chunk]", {
+        chunk: sttChunkCount,
+        api_ms: latencyMs,
+        chars: text.length,
+      });
+    }
+  } catch (e) {
+    console.warn("[live-transcribe chunk]", e);
+  } finally {
+    liveTranscribeInFlight = false;
+  }
+}
+
+function startLiveTranscribeLoop() {
+  stopLiveTranscribeLoop();
+  if (!TRANSCRIBE_LIVE_ENABLED) return;
+  liveTranscribeTimer = window.setInterval(() => {
+    void tickLiveTranscribe();
+  }, TRANSCRIBE_LIVE_CHUNK_MS);
+}
+
+function normalizeSttMetrics(stt) {
+  if (stt == null) return {};
+  if (typeof stt === "number") {
+    return Number.isFinite(stt) && stt >= 0 ? { finalApiMs: stt } : {};
+  }
+  return stt && typeof stt === "object" ? stt : {};
+}
+
 function isPhantomTranscript(text, blob, recordMs) {
   const t = String(text || "").trim();
   if (!t) return true;
@@ -1026,6 +1165,8 @@ function abortMicCapture() {
   voiceSessionCancelled = true;
   clearSilenceTimer();
   stopMicSilenceMonitor();
+  stopLiveTranscribeLoop();
+  resetLiveTranscribeState();
   if (micMaxRecordTimer != null) {
     window.clearTimeout(micMaxRecordTimer);
     micMaxRecordTimer = null;
@@ -1071,11 +1212,24 @@ function transcribeLanguageForTag(tag) {
   return "english";
 }
 
-async function transcribeMicBlob(blob) {
+function resolveTranscribeChunkLengthS(opts = {}) {
+  if (TRANSCRIBE_MODE !== "chunked") return null;
+  if (opts.live && TRANSCRIBE_LIVE_CHUNK_LENGTH_S > 0) {
+    return TRANSCRIBE_LIVE_CHUNK_LENGTH_S;
+  }
+  return TRANSCRIBE_CHUNK_LENGTH_S > 0 ? TRANSCRIBE_CHUNK_LENGTH_S : 10;
+}
+
+async function transcribeMicBlob(blob, opts = {}) {
   const fd = new FormData();
   const ext = blob.type.includes("webm") ? "webm" : blob.type.includes("ogg") ? "ogg" : "wav";
   fd.append("file", blob, `mic.${ext}`);
   fd.append("language", transcribeLanguageForTag(resolveMicLang()));
+  fd.append("mode", TRANSCRIBE_MODE);
+  const chunkLen = resolveTranscribeChunkLengthS(opts);
+  if (chunkLen != null) {
+    fd.append("chunk_length_s", String(chunkLen));
+  }
   const reqStartMs = performance.now();
   const res = await fetch(signalingUrl("/api/transcribe"), {
     method: "POST",
@@ -1088,9 +1242,14 @@ async function transcribeMicBlob(blob) {
     throw new Error(body.slice(0, 400) || `Transcribe failed (${res.status})`);
   }
   const data = await res.json();
+  const serverMs = Number(data.latency_ms);
   return {
     text: String(data.text || "").trim(),
-    latencyMs: Math.round(latencyMs * 10) / 10,
+    latencyMs:
+      Number.isFinite(serverMs) && serverMs >= 0
+        ? Math.round(serverMs * 10) / 10
+        : Math.round(latencyMs * 10) / 10,
+    chunks: Array.isArray(data.chunks) ? data.chunks : [],
   };
 }
 
@@ -1192,9 +1351,11 @@ function computeSttLatencyMs() {
   return null;
 }
 
-async function runVoicePipeline(userText, sttLatencyMs = null) {
+async function runVoicePipeline(userText, stt = null) {
   const t = userText.trim();
   if (!t) return;
+  const sttMetrics = normalizeSttMetrics(stt);
+  const sttLatencyMs = sttMetrics.finalApiMs;
   voiceThinking.value = true;
   webrtcError.value = "";
   clearWebRtcTtfaPending();
@@ -1205,6 +1366,20 @@ async function runVoicePipeline(userText, sttLatencyMs = null) {
   if (sid) payload.sessionid = sid;
   if (sttLatencyMs != null && Number.isFinite(sttLatencyMs) && sttLatencyMs >= 0) {
     payload.stt_latency_ms = Math.round(sttLatencyMs * 10) / 10;
+  }
+  if (
+    sttMetrics.firstChunkMs != null &&
+    Number.isFinite(sttMetrics.firstChunkMs) &&
+    sttMetrics.firstChunkMs >= 0
+  ) {
+    payload.stt_first_chunk_latency_ms = Math.round(sttMetrics.firstChunkMs * 10) / 10;
+  }
+  if (
+    sttMetrics.chunkCount != null &&
+    Number.isFinite(sttMetrics.chunkCount) &&
+    sttMetrics.chunkCount >= 0
+  ) {
+    payload.stt_chunk_count = Math.round(sttMetrics.chunkCount);
   }
   try {
     const res = await fetch(signalingUrl("/api/voice-turn"), {
@@ -1391,21 +1566,51 @@ async function onMediaRecorderStop() {
     abortMicCapture();
     return;
   }
+  stopLiveTranscribeLoop();
   micListening.value = false;
   playMicTone("off");
   const recordMs = micRecordDurationMs();
   const mimeType = mediaRecorder?.mimeType || "audio/webm";
   const blob = new Blob(micRecordedChunks, { type: mimeType });
+  const savedFirstChunkMs = sttFirstChunkLatencyMs;
+  const savedChunkCount = sttChunkCount;
   releaseMicCapture();
   if (!blob.size || recordMs < MIC_MIN_TRANSCRIBE_MS || blob.size < MIC_MIN_TRANSCRIBE_BYTES) {
+    resetLiveTranscribeState();
     clearMicTapTiming();
     return;
   }
   try {
-    const { text, latencyMs } = await transcribeMicBlob(blob);
+    if (liveTranscribeInFlight) {
+      await new Promise((r) => window.setTimeout(r, 120));
+    }
+    const sinceLiveMs = performance.now() - lastLiveTranscribeAtMs;
+    const canReuseLive =
+      liveTranscriptText &&
+      sinceLiveMs < 800 &&
+      lastLiveTranscribeBytes >= blob.size * 0.9 &&
+      lastLiveTranscribeApiMs != null &&
+      !isPhantomTranscript(liveTranscriptText, blob, recordMs);
+    let text = "";
+    let latencyMs = null;
+    let finalChunkCount = savedChunkCount;
+    if (canReuseLive) {
+      text = liveTranscriptText;
+      latencyMs = lastLiveTranscribeApiMs;
+      finalChunkCount = savedChunkCount;
+    } else {
+      const result = await transcribeMicBlob(blob);
+      text = result.text;
+      latencyMs = result.latencyMs;
+      finalChunkCount = savedChunkCount + 1;
+    }
     if (text && !isPhantomTranscript(text, blob, recordMs)) {
       showCaptionThenHide(text);
-      void runVoicePipeline(text, latencyMs);
+      void runVoicePipeline(text, {
+        finalApiMs: latencyMs,
+        firstChunkMs: savedFirstChunkMs,
+        chunkCount: finalChunkCount,
+      });
     } else {
       finalTranscript.value = "";
       interimTranscript.value = "";
@@ -1416,6 +1621,8 @@ async function onMediaRecorderStop() {
     interimTranscript.value = "";
     webrtcError.value = e instanceof Error ? e.message : String(e);
     clearMicTapTiming();
+  } finally {
+    resetLiveTranscribeState();
   }
 }
 
@@ -1427,6 +1634,7 @@ async function startServerMicCapture() {
   sttFinalTranscriptMs = 0;
   voiceSessionCancelled = false;
   clearCaptionHideTimer();
+  resetLiveTranscribeState();
   finalTranscript.value = "";
   interimTranscript.value = "";
   micCaptureStream = await navigator.mediaDevices.getUserMedia({
@@ -1466,6 +1674,7 @@ async function startServerMicCapture() {
     micListening.value = true;
     playMicTone("on");
     startMicSilenceMonitor(analyser);
+    startLiveTranscribeLoop();
     micMaxRecordTimer = window.setTimeout(() => {
       micMaxRecordTimer = null;
       if (micListening.value) stopMicInternal({ cancel: false });
