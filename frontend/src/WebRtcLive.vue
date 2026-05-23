@@ -431,7 +431,7 @@ let toneAudioCtx = null;
 let webrtcTtfaPending = null;
 let webrtcTtfaTimeout = null;
 let webrtcTtfaPollId = null;
-/** @type {{ turnId: number, audioFirstMs: number, videoBaselineTime: number, audioBaselineTime: number, micTapStartMs: number, voiceTurnCompleteMs: number, videoStreamFirstAt: number | null, strictAudioAt: number | null, lipSyncAvatarAt: number | null, realPlaybackAt: number | null } | null} */
+/** @type {{ turnId: number, audioFirstMs: number, videoBaselineTime: number, audioBaselineTime: number, micTapStartMs: number, voiceTurnCompleteMs: number, sttTranscriptReadyMs: number, videoStreamFirstAt: number | null, strictAudioAt: number | null, lipSyncAvatarAt: number | null, realPlaybackAt: number | null } | null} */
 let lipSyncPending = null;
 let lipSyncPollId = null;
 let lipSyncTimeout = null;
@@ -654,6 +654,7 @@ function webRtcStrictAudioPlaying(baselineSec) {
 function onWebRtcAudioPlayingForTtfa() {
   if (!webrtcTtfaPending) return;
   const { turnId, requestSentMs, videoBaselineTime, baselineTime } = webrtcTtfaPending;
+  if (!turnId || turnId <= 0) return;
   if (!webRtcStrictAudioPlaying(baselineTime)) return;
   webrtcTtfaPending = null;
   if (webrtcTtfaTimeout != null) {
@@ -791,6 +792,8 @@ function scheduleLipSyncLatency(
       Number.isFinite(voiceTurnCompleteMs) && voiceTurnCompleteMs > 0
         ? voiceTurnCompleteMs
         : 0,
+    sttTranscriptReadyMs:
+      sttFinalTranscriptMs > 0 ? sttFinalTranscriptMs : 0,
     videoStreamFirstAt: null,
     strictAudioAt: null,
     lipSyncAvatarAt: null,
@@ -832,12 +835,15 @@ function onLipSyncVideoReady() {
     lipSyncAvatarAt,
     videoStreamFirstAt,
     realPlaybackAt,
+    sttTranscriptReadyMs,
   } = p;
   const avatarAt = lipSyncAvatarAt ?? performance.now();
   const streamFirstAt = videoStreamFirstAt ?? avatarAt;
   const strictAudio = strictAudioAt ?? audioFirstMs;
   const lipMs = Math.max(0, avatarAt - strictAudio);
   const micToLipMs = micTapStartMs > 0 ? Math.max(0, avatarAt - micTapStartMs) : null;
+  const sttToLipSyncMs =
+    sttTranscriptReadyMs > 0 ? Math.max(0, avatarAt - sttTranscriptReadyMs) : null;
   const anchorMs = voiceTurnCompleteMs > 0 ? voiceTurnCompleteMs : 0;
   const videoStreamFirstMs =
     anchorMs > 0 ? Math.max(0, streamFirstAt - anchorMs) : null;
@@ -849,6 +855,7 @@ function onLipSyncVideoReady() {
   const streamStartToAvatarMs = Math.max(0, avatarAt - streamFirstAt);
   void reportLipSyncLatencyMs(turnId, lipMs, {
     micToLipSyncMs: micToLipMs,
+    sttToLipSyncMs,
     videoStreamFirstMs,
     lipSyncAvatarPlayMs,
     streamStartToAvatarMs,
@@ -872,6 +879,24 @@ function clearWebRtcTtfaPending() {
 function scheduleWebRtcTtfa(turnId, requestSentMs) {
   clearWebRtcTtfaPending();
   if (!turnId || !Number.isFinite(requestSentMs)) return;
+  _startWebRtcTtfaPoll(turnId, requestSentMs);
+}
+
+/** Start watching WebRTC audio before voice-turn JSON returns (stream /human may already be speaking). */
+function beginVoiceTurnTtfaWatch(requestSentMs) {
+  clearWebRtcTtfaPending();
+  if (!Number.isFinite(requestSentMs)) return;
+  _startWebRtcTtfaPoll(0, requestSentMs);
+}
+
+function attachVoiceTurnTtfaTurnId(turnId) {
+  if (!turnId || !webrtcTtfaPending) return;
+  if (webrtcTtfaPending.turnId === 0) {
+    webrtcTtfaPending.turnId = turnId;
+  }
+}
+
+function _startWebRtcTtfaPoll(turnId, requestSentMs) {
   bindWebRtcTtfaAudioListener();
   const audio = audioEl.value;
   const baselineTime = audio && Number.isFinite(audio.currentTime) ? audio.currentTime : 0;
@@ -881,7 +906,6 @@ function scheduleWebRtcTtfa(turnId, requestSentMs) {
   webrtcTtfaPending = { turnId, requestSentMs, baselineTime, videoBaselineTime };
   webrtcTtfaPollId = window.setInterval(() => {
     if (!webrtcTtfaPending || !audioEl.value) return;
-    const a = audioEl.value;
     if (webRtcStrictAudioPlaying(webrtcTtfaPending.baselineTime)) {
       onWebRtcAudioPlayingForTtfa();
     }
@@ -958,6 +982,10 @@ async function reportLipSyncLatencyMs(turnId, lipSyncMs, extra = {}) {
     const micLip = extra.micToLipSyncMs;
     if (micLip != null && Number.isFinite(micLip) && micLip >= 0) {
       body.mic_to_lip_sync_ms = Math.round(micLip * 10) / 10;
+    }
+    const sttLip = extra.sttToLipSyncMs;
+    if (sttLip != null && Number.isFinite(sttLip) && sttLip >= 0) {
+      body.stt_to_lip_sync_ms = Math.round(sttLip * 10) / 10;
     }
     const streamFirst = extra.videoStreamFirstMs;
     if (streamFirst != null && Number.isFinite(streamFirst) && streamFirst >= 0) {
@@ -1361,6 +1389,7 @@ async function runVoicePipeline(userText, stt = null) {
   clearWebRtcTtfaPending();
   pendingVoiceAnalytics = null;
   const requestSentMs = performance.now();
+  beginVoiceTurnTtfaWatch(requestSentMs);
   const sid = String(sessionId.value || "").trim();
   const payload = { text: t };
   if (sid) payload.sessionid = sid;
@@ -1403,6 +1432,9 @@ async function runVoicePipeline(userText, stt = null) {
     const humanDispatched = Boolean(data.human_dispatched);
     console.info("[voice-turn] complete — audio comes from LiveTalking /human + WebRTC, not this response", {
       human_dispatched: humanDispatched,
+      stream_human: Boolean(data.rag?.stream_human),
+      rag_first_sentence_ms: data.rag?.rag_first_sentence_ms,
+      human_sentence_count: data.rag?.human_sentence_count,
       speak_chars: spoken.length,
       total_request_ms: data.total_request_ms,
       sessionid: sid || null,
@@ -1426,6 +1458,7 @@ async function runVoicePipeline(userText, stt = null) {
         middleMs = serverMs;
       }
       if (Number.isFinite(turnId) && turnId > 0) {
+        attachVoiceTurnTtfaTurnId(turnId);
         pendingVoiceAnalytics = {
           turnId,
           sttMs: Number.isFinite(sttLatencyMs) ? sttLatencyMs : null,
@@ -1434,7 +1467,6 @@ async function runVoicePipeline(userText, stt = null) {
           voiceTurnCompleteMs,
           clientVoiceTurnMs: Math.round(clientVoiceTurnMs * 10) / 10,
         };
-        scheduleWebRtcTtfa(turnId, voiceTurnCompleteMs);
       }
     }
 
@@ -1605,6 +1637,7 @@ async function onMediaRecorderStop() {
       finalChunkCount = savedChunkCount + 1;
     }
     if (text && !isPhantomTranscript(text, blob, recordMs)) {
+      sttFinalTranscriptMs = performance.now();
       showCaptionThenHide(text);
       void runVoicePipeline(text, {
         finalApiMs: latencyMs,

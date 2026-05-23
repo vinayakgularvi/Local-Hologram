@@ -35,6 +35,8 @@ def _ensure_voice_turn_columns(cx: sqlite3.Connection) -> None:
         cx.execute("ALTER TABLE voice_turns ADD COLUMN stt_first_chunk_latency_ms REAL")
     if "stt_chunk_count" not in cols:
         cx.execute("ALTER TABLE voice_turns ADD COLUMN stt_chunk_count INTEGER")
+    if "stt_to_lip_sync_ms" not in cols:
+        cx.execute("ALTER TABLE voice_turns ADD COLUMN stt_to_lip_sync_ms REAL")
     if "time_to_first_voice_ms" not in cols:
         cx.execute("ALTER TABLE voice_turns ADD COLUMN time_to_first_voice_ms REAL")
     if "mic_to_speaker_voice_ms" not in cols:
@@ -300,6 +302,7 @@ def update_voice_turn_lip_sync_latency(
     stream_start_to_avatar_ms: float | None = None,
     video_stream_first_ms: float | None = None,
     webrtc_real_playback_ms: float | None = None,
+    stt_to_lip_sync_ms: float | None = None,
 ) -> bool:
     """Playback: early stream tick, lip-sync avatar play, and gap between them."""
     init_db()
@@ -314,6 +317,7 @@ def update_voice_turn_lip_sync_latency(
     stream_gap = _valid_ms(stream_start_to_avatar_ms)
     stream_first = _valid_ms(video_stream_first_ms)
     real_playback = _valid_ms(webrtc_real_playback_ms)
+    stt_lip = _valid_ms(stt_to_lip_sync_ms)
     with _lock:
         with _connect() as cx:
             row = cx.execute(
@@ -332,7 +336,7 @@ def update_voice_turn_lip_sync_latency(
                     lip_sync_to_video_stream_ms = ?, time_to_video_playback_ms = ?,
                     mic_to_video_playback_ms = ?, lip_sync_avatar_play_ms = ?,
                     stream_start_to_avatar_ms = ?, video_stream_first_ms = ?,
-                    webrtc_real_playback_ms = ?
+                    webrtc_real_playback_ms = ?, stt_to_lip_sync_ms = ?
                 WHERE id = ? AND lip_sync_latency_ms IS NULL
                 """,
                 (
@@ -345,6 +349,7 @@ def update_voice_turn_lip_sync_latency(
                     stream_gap,
                     stream_first,
                     real_playback,
+                    stt_lip,
                     int(turn_id),
                 ),
             )
@@ -379,6 +384,9 @@ def get_summary() -> dict[str, Any]:
                 AVG(stt_first_chunk_latency_ms) AS avg_stt_first_chunk_latency_ms,
                 MIN(stt_first_chunk_latency_ms) AS min_stt_first_chunk_latency_ms,
                 MAX(stt_first_chunk_latency_ms) AS max_stt_first_chunk_latency_ms,
+                AVG(stt_to_lip_sync_ms) AS avg_stt_to_lip_sync_ms,
+                MIN(stt_to_lip_sync_ms) AS min_stt_to_lip_sync_ms,
+                MAX(stt_to_lip_sync_ms) AS max_stt_to_lip_sync_ms,
                 AVG(time_to_first_voice_ms) AS avg_time_to_first_voice_ms,
                 MIN(time_to_first_voice_ms) AS min_time_to_first_voice_ms,
                 MAX(time_to_first_voice_ms) AS max_time_to_first_voice_ms,
@@ -464,6 +472,9 @@ def _empty_summary() -> dict[str, Any]:
         "avg_stt_first_chunk_latency_ms": None,
         "min_stt_first_chunk_latency_ms": None,
         "max_stt_first_chunk_latency_ms": None,
+        "avg_stt_to_lip_sync_ms": None,
+        "min_stt_to_lip_sync_ms": None,
+        "max_stt_to_lip_sync_ms": None,
         "avg_time_to_first_voice_ms": None,
         "min_time_to_first_voice_ms": None,
         "max_time_to_first_voice_ms": None,
@@ -526,7 +537,7 @@ def get_recent_voice_turns(limit: int = 50) -> list[dict[str, Any]]:
             """
             SELECT id, ts, heard_chars, answer_chars, total_request_ms,
                    prompt_tokens, completion_tokens, webrtc_first_voice_ms, rag_latency_ms,
-                   stt_latency_ms, stt_first_chunk_latency_ms, stt_chunk_count,
+                   stt_latency_ms, stt_first_chunk_latency_ms, stt_chunk_count, stt_to_lip_sync_ms,
                    time_to_first_voice_ms, mic_to_speaker_voice_ms,
                    tts_latency_ms, lip_sync_latency_ms, mic_to_lip_sync_ms,
                    lip_sync_to_video_stream_ms, mic_to_first_audio_ms,

@@ -165,8 +165,18 @@ const PIPELINE_STEPS = [
     empty: "Speak for a few seconds with live chunked transcribe enabled.",
   },
   {
-    id: "cvt",
+    id: "stt-lip",
     step: 5,
+    title: "Transcribe → lip-sync video",
+    sub: "Final transcribe response → avatar visibly lip-syncing",
+    field: "stt_to_lip_sync_ms",
+    track: "stt",
+    highlight: true,
+    empty: "Complete a spoken turn with server transcribe and avatar video.",
+  },
+  {
+    id: "cvt",
+    step: 6,
     title: "Client voice-turn",
     sub: "Transcript sent → voice-turn JSON",
     field: "client_voice_turn_ms",
@@ -175,7 +185,7 @@ const PIPELINE_STEPS = [
   },
   {
     id: "rag",
-    step: 6,
+    step: 7,
     title: "RAG latency",
     sub: "Stream request → response (when configured)",
     field: "rag_latency_ms",
@@ -184,7 +194,7 @@ const PIPELINE_STEPS = [
   },
   {
     id: "server",
-    step: 7,
+    step: 8,
     title: "Server voice-turn",
     sub: "API wall time (until JSON returned)",
     field: "total_request_ms",
@@ -193,7 +203,7 @@ const PIPELINE_STEPS = [
   },
   {
     id: "human",
-    step: 8,
+    step: 9,
     title: "Human dispatch",
     sub: "Server POST LiveTalking /human",
     field: "human_dispatch_ms",
@@ -202,7 +212,7 @@ const PIPELINE_STEPS = [
   },
   {
     id: "tts",
-    step: 9,
+    step: 10,
     title: "Server complete → WebRTC audio",
     sub: "Voice-turn JSON received → audible audio on stream",
     field: "tts_latency_ms",
@@ -211,7 +221,7 @@ const PIPELINE_STEPS = [
   },
   {
     id: "realpb",
-    step: 10,
+    step: 11,
     title: "Server complete → real WebRTC playback",
     sub: "Audible audio + lip-sync video (timestamp = later of the two)",
     field: "webrtc_real_playback_ms",
@@ -221,7 +231,7 @@ const PIPELINE_STEPS = [
   },
   {
     id: "avatar",
-    step: 11,
+    step: 12,
     title: "Server complete → lip-sync video",
     sub: "Voice-turn JSON received → avatar visibly playing",
     field: "lip_sync_avatar_play_ms",
@@ -231,7 +241,7 @@ const PIPELINE_STEPS = [
   },
   {
     id: "vfirst",
-    step: 12,
+    step: 13,
     title: "Video stream first tick",
     sub: "Early timeline bump (may be stale frames)",
     field: "video_stream_first_ms",
@@ -240,7 +250,7 @@ const PIPELINE_STEPS = [
   },
   {
     id: "gap",
-    step: 13,
+    step: 14,
     title: "Stream tick → avatar play",
     sub: "Gap after first tick until lip-synced avatar plays",
     field: "stream_start_to_avatar_ms",
@@ -249,7 +259,7 @@ const PIPELINE_STEPS = [
   },
   {
     id: "lip",
-    step: 14,
+    step: 15,
     title: "Audio → lip-sync video",
     sub: "First audio → lip-synced avatar playing",
     field: "lip_sync_latency_ms",
@@ -258,7 +268,7 @@ const PIPELINE_STEPS = [
   },
   {
     id: "ttfv",
-    step: 15,
+    step: 16,
     title: "Time to first voice",
     sub: "STT + RAG (or server) + WebRTC audio (sum)",
     field: "time_to_first_voice_ms",

@@ -12,6 +12,7 @@ import shutil
 import tempfile
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator
 from urllib.parse import urlparse
@@ -223,6 +224,13 @@ VOICE_DISPATCH_HUMAN = os.environ.get("VOICE_DISPATCH_HUMAN", "1").strip().lower
     "true",
     "yes",
 )
+# While reading RAG_GENERATE_STREAM_URL, dispatch each completed sentence to /human (lower TTS latency).
+VOICE_STREAM_HUMAN = os.environ.get("VOICE_STREAM_HUMAN", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+VOICE_STREAM_HUMAN_MIN_CHARS = max(2, _env_first_int("VOICE_STREAM_HUMAN_MIN_CHARS", default=4))
 HUMAN_DISPATCH_TIMEOUT_SEC = max(5.0, float(_env_first_int("HUMAN_DISPATCH_TIMEOUT_SEC", default=90)))
 TRANSCRIBE_API_URL = os.environ.get(
     "TRANSCRIBE_API_URL",
@@ -857,29 +865,144 @@ async def webrtc_human_proxy(request: Request) -> Response:
     return await _forward_webrtc_post("/human", request)
 
 
+@dataclass
+class _HumanDispatchItem:
+    text: str
+    interrupt: bool
+    analytics_turn_id: int | None
+    record_analytics: bool
+
+
+class _LiveTalkingHumanQueue:
+    """One FIFO worker per WebRTC session — LiveTalking /human must not overlap."""
+
+    _by_session: dict[str, _LiveTalkingHumanQueue] = {}
+
+    @classmethod
+    def for_session(cls, sessionid: str) -> _LiveTalkingHumanQueue:
+        sid = str(sessionid or "").strip()
+        if not sid:
+            raise ValueError("empty sessionid")
+        if sid not in cls._by_session:
+            cls._by_session[sid] = cls(sid)
+        return cls._by_session[sid]
+
+    def __init__(self, sessionid: str) -> None:
+        self.sessionid = sessionid
+        self._queue: asyncio.Queue[_HumanDispatchItem | None] = asyncio.Queue()
+        self._worker: asyncio.Task | None = None
+
+    def _ensure_worker(self) -> None:
+        if self._worker is None or self._worker.done():
+            self._worker = asyncio.create_task(self._run())
+
+    def _drop_pending(self) -> int:
+        dropped = 0
+        while True:
+            try:
+                self._queue.get_nowait()
+                dropped += 1
+                self._queue.task_done()
+            except asyncio.QueueEmpty:
+                break
+        return dropped
+
+    async def enqueue(
+        self,
+        text: str,
+        *,
+        interrupt: bool = False,
+        analytics_turn_id: int | None = None,
+        record_analytics: bool = True,
+    ) -> None:
+        speak = text.strip()
+        if not speak:
+            return
+        self._ensure_worker()
+        if interrupt:
+            dropped = self._drop_pending()
+            if dropped:
+                logger.info(
+                    "LiveTalking /human queue sessionid=%s cleared %d stale item(s) (interrupt)",
+                    self.sessionid,
+                    dropped,
+                )
+        await self._queue.put(
+            _HumanDispatchItem(
+                text=speak,
+                interrupt=interrupt,
+                analytics_turn_id=analytics_turn_id,
+                record_analytics=record_analytics,
+            )
+        )
+
+    async def drain(self) -> None:
+        if self._worker is None:
+            return
+        await self._queue.join()
+
+    async def _run(self) -> None:
+        while True:
+            item = await self._queue.get()
+            try:
+                if item is None:
+                    continue
+                await _dispatch_livetalking_human(
+                    item.text,
+                    self.sessionid,
+                    analytics_turn_id=item.analytics_turn_id,
+                    interrupt=item.interrupt,
+                    record_analytics=item.record_analytics,
+                )
+            finally:
+                self._queue.task_done()
+
+
+async def _enqueue_livetalking_human(
+    speak_text: str,
+    sessionid: str,
+    *,
+    analytics_turn_id: int | None = None,
+    interrupt: bool = True,
+    record_analytics: bool = True,
+) -> None:
+    sid = str(sessionid or "").strip()
+    if not sid or not speak_text.strip():
+        return
+    await _LiveTalkingHumanQueue.for_session(sid).enqueue(
+        speak_text,
+        interrupt=interrupt,
+        analytics_turn_id=analytics_turn_id,
+        record_analytics=record_analytics,
+    )
+
+
 async def _dispatch_livetalking_human(
     speak_text: str,
     sessionid: str,
     *,
     analytics_turn_id: int | None = None,
-) -> None:
-    """Fire TTS/lip-sync on LiveTalking without blocking the voice-turn HTTP response."""
+    interrupt: bool = True,
+    record_analytics: bool = True,
+) -> float | None:
+    """Fire TTS/lip-sync on LiveTalking. Returns POST round-trip ms, or None on skip/error."""
     if not WEBRTC_SIGNALING_BASE:
-        return
+        return None
     text = speak_text.strip()
     sid = str(sessionid or "").strip()
     if not text or not sid:
-        return
+        return None
     url = f"{WEBRTC_SIGNALING_BASE}/human"
     payload = {
         "text": text,
         "type": "echo",
-        "interrupt": True,
+        "interrupt": bool(interrupt),
         "sessionid": sid,
     }
     timeout = httpx.Timeout(HUMAN_DISPATCH_TIMEOUT_SEC, connect=8.0)
     t0 = time.perf_counter()
     status_code: int | None = None
+    ms: float | None = None
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             r = await client.post(url, json=payload)
@@ -895,14 +1018,22 @@ async def _dispatch_livetalking_human(
     finally:
         ms = (time.perf_counter() - t0) * 1000.0
         logger.info(
-            "LiveTalking /human finished sessionid=%s dispatch_ms=%.0f status=%s",
+            "LiveTalking /human finished sessionid=%s dispatch_ms=%.0f status=%s interrupt=%s chars=%d",
             sid,
             ms,
             status_code if status_code is not None else "error",
+            interrupt,
+            len(text),
         )
-        if analytics_turn_id is not None and analytics_turn_id > 0:
+        if (
+            record_analytics
+            and analytics_turn_id is not None
+            and analytics_turn_id > 0
+            and ms is not None
+        ):
             if update_voice_turn_human_dispatch_ms(int(analytics_turn_id), ms):
                 await _publish_analytics_snapshot()
+    return ms
 
 
 @app.post("/record")
@@ -2212,6 +2343,119 @@ def split_voice_answer_receipt(raw: str) -> tuple[str, dict[str, Any] | None, in
     return speak, receipt, order_done
 
 
+_VOICE_TAG_OPEN_RE = re.compile(r"<(show_image|receipt|orderdone)\b", re.IGNORECASE)
+_VOICE_TAG_CLOSE_RE = {
+    "show_image": re.compile(r"</show_image\s*>", re.IGNORECASE),
+    "receipt": re.compile(r"</receipt\s*>", re.IGNORECASE),
+    "orderdone": re.compile(r"</orderdone\s*>", re.IGNORECASE),
+}
+
+
+def _speakable_stream_prefix(buf: str) -> str:
+    """Text safe to scan for sentence ends (exclude region after an unclosed UI tag)."""
+    if not buf:
+        return ""
+    cut = len(buf)
+    for m in _VOICE_TAG_OPEN_RE.finditer(buf):
+        tag = m.group(1).lower()
+        close_re = _VOICE_TAG_CLOSE_RE.get(tag)
+        if not close_re:
+            continue
+        if not close_re.search(buf, m.end()):
+            cut = min(cut, m.start())
+    return buf[:cut]
+
+
+def _pop_complete_sentences(buf: str) -> tuple[list[str], str]:
+    """Split speakable prefix into finished sentences; return (sentences, remainder)."""
+    sentences: list[str] = []
+    rest = buf
+    while rest:
+        m = re.search(r'[.!?。！？]+["\']?', rest)
+        if not m:
+            break
+        end = m.end()
+        if end < len(rest) and not rest[end].isspace():
+            break
+        candidate = rest[:end].strip()
+        if len(candidate) < VOICE_STREAM_HUMAN_MIN_CHARS:
+            break
+        sentences.append(candidate)
+        rest = rest[end:].lstrip()
+    return sentences, rest
+
+
+def _prepare_stream_sentence_for_human(
+    sentence: str, show_image: dict[str, Any] | None
+) -> str:
+    s = strip_show_image_markup(sentence)
+    s = _RECEIPT_BLOCK_RE.sub("", s)
+    s = _ORDERDONE_BLOCK_RE.sub("", s)
+    s = strip_show_image_item_names_from_speech(s, show_image)
+    return s.strip()
+
+
+class _StreamHumanDispatcher:
+    """Dispatch completed sentences to LiveTalking while the LLM stream is still open."""
+
+    def __init__(self, sessionid: str, stream_start: float) -> None:
+        self.sessionid = sessionid
+        self.stream_start = stream_start
+        self.buffer = ""
+        self.sentence_count = 0
+        self.first_sentence_ms: float | None = None
+        self.first_dispatch_http_ms: float | None = None
+        self.show_image: dict[str, Any] | None = None
+
+    def set_show_image(self, payload: dict[str, Any] | None) -> None:
+        if payload:
+            self.show_image = payload
+
+    async def feed(self, piece: str) -> None:
+        if not piece:
+            return
+        self.buffer += piece
+        await self._flush_sentences(final=False)
+
+    async def finish(self) -> None:
+        await self._flush_sentences(final=True)
+        await _LiveTalkingHumanQueue.for_session(self.sessionid).drain()
+
+    async def _flush_sentences(self, *, final: bool) -> None:
+        prefix = _speakable_stream_prefix(self.buffer)
+        safe_tail = self.buffer[len(prefix) :]
+        sentences, remainder = _pop_complete_sentences(prefix)
+        self.buffer = remainder + safe_tail
+        for sentence in sentences:
+            await self._dispatch_one(sentence)
+        if final and self.buffer.strip():
+            tail = self.buffer.strip()
+            self.buffer = ""
+            await self._dispatch_one(tail)
+
+    async def _dispatch_one(self, raw_sentence: str) -> None:
+        speak = _prepare_stream_sentence_for_human(raw_sentence, self.show_image)
+        if len(speak) < VOICE_STREAM_HUMAN_MIN_CHARS:
+            return
+        interrupt = self.sentence_count == 0
+        if self.first_sentence_ms is None:
+            self.first_sentence_ms = (time.perf_counter() - self.stream_start) * 1000.0
+        self.sentence_count += 1
+        logger.info(
+            "voice-turn stream /human sentence #%d interrupt=%s chars=%d preview=%r",
+            self.sentence_count,
+            interrupt,
+            len(speak),
+            speak[:80],
+        )
+        await _enqueue_livetalking_human(
+            speak,
+            self.sessionid,
+            interrupt=interrupt,
+            record_analytics=False,
+        )
+
+
 def normalize_show_image_payload(payload: Any) -> dict[str, Any] | None:
     """Normalize API/stream object or string into {items: [{name}]}."""
     if payload is None:
@@ -2291,6 +2535,18 @@ async def voice_turn(body: VoiceTurnBody):
     use_rag_stream = bool(RAG_GENERATE_STREAM_URL) and _rag_generate_stream_url_valid(RAG_GENERATE_STREAM_URL)
     stream_show_image: dict[str, Any] | None = None
     rag_latency_ms: float | None = None
+    stream_human_meta: dict[str, Any] = {}
+    sid = (body.sessionid or "").strip()
+    stream_human_sessionid: str | None = None
+    if (
+        use_rag_stream
+        and VOICE_STREAM_HUMAN
+        and VOICE_DISPATCH_HUMAN
+        and WEBRTC_SIGNALING_BASE
+        and sid
+        and sid != "0"
+    ):
+        stream_human_sessionid = sid
     if use_rag_stream:
         rag_meta["llm"] = "rag_generate_stream"
         conversation = _build_voice_rag_stream_conversation(user_text, chroma_hits)
@@ -2300,9 +2556,12 @@ async def voice_turn(body: VoiceTurnBody):
                 RAG_GENERATE_STREAM_URL,
                 conversation,
                 voice_turn=True,
+                stream_human_sessionid=stream_human_sessionid,
             )
             answer = stream_result[0]
             stream_show_image = stream_result[1]
+            if len(stream_result) > 2 and isinstance(stream_result[2], dict):
+                stream_human_meta = stream_result[2]
         except HTTPException:
             raise
         except Exception as e:
@@ -2311,6 +2570,11 @@ async def voice_turn(body: VoiceTurnBody):
         finally:
             rag_latency_ms = (time.perf_counter() - t_rag) * 1000.0
         rag_meta["rag_latency_ms"] = round(rag_latency_ms, 1)
+        if stream_human_meta.get("rag_first_sentence_ms") is not None:
+            rag_meta["rag_first_sentence_ms"] = stream_human_meta["rag_first_sentence_ms"]
+        if stream_human_meta.get("stream_human"):
+            rag_meta["stream_human"] = True
+            rag_meta["human_sentence_count"] = stream_human_meta.get("human_sentence_count", 0)
     else:
         rag_meta["llm"] = "ollama"
         answer = await ollama_generate(prompt, ollama_metrics, max_tokens=VOICE_MAX_TOKENS)
@@ -2359,8 +2623,21 @@ async def voice_turn(body: VoiceTurnBody):
             completion_tokens=ollama_metrics.get("eval_count"),
         )
     human_dispatched = False
-    sid = (body.sessionid or "").strip()
-    if (
+    stream_human_used = (
+        bool(stream_human_meta.get("stream_human"))
+        and int(stream_human_meta.get("human_sentence_count") or 0) > 0
+    )
+    if stream_human_used:
+        human_dispatched = True
+        if analytics_turn_id is not None:
+            mark_voice_turn_human_dispatched(analytics_turn_id)
+        logger.info(
+            "voice-turn: stream /human dispatched %d sentence(s) sessionid=%s first_sentence_ms=%s",
+            int(stream_human_meta.get("human_sentence_count") or 0),
+            sid,
+            stream_human_meta.get("rag_first_sentence_ms"),
+        )
+    elif (
         VOICE_DISPATCH_HUMAN
         and WEBRTC_SIGNALING_BASE
         and speak_len > 0
@@ -2368,7 +2645,7 @@ async def voice_turn(body: VoiceTurnBody):
         and sid != "0"
     ):
         asyncio.create_task(
-            _dispatch_livetalking_human(
+            _enqueue_livetalking_human(
                 speak_text,
                 sid,
                 analytics_turn_id=analytics_turn_id,
@@ -2506,6 +2783,12 @@ class LipSyncLatencyBody(BaseModel):
         le=600_000,
         description="Server voice-turn complete → WebRTC audio playing with lip-synced avatar video.",
     )
+    stt_to_lip_sync_ms: float | None = Field(
+        None,
+        ge=0,
+        le=600_000,
+        description="Final transcribe response ready → lip-synced avatar visibly playing.",
+    )
 
 
 @app.post("/api/analytics/webrtc-first-voice")
@@ -2550,6 +2833,7 @@ async def analytics_lip_sync_latency(body: LipSyncLatencyBody):
         stream_start_to_avatar_ms=body.stream_start_to_avatar_ms,
         video_stream_first_ms=body.video_stream_first_ms,
         webrtc_real_playback_ms=body.webrtc_real_playback_ms,
+        stt_to_lip_sync_ms=body.stt_to_lip_sync_ms,
     )
     if updated:
         await _publish_analytics_snapshot()
@@ -2671,7 +2955,8 @@ async def _collect_rag_generate_stream(
     conversation: list[dict[str, str]],
     *,
     voice_turn: bool = False,
-) -> str | tuple[str, dict[str, Any] | None]:
+    stream_human_sessionid: str | None = None,
+) -> str | tuple[str, dict[str, Any] | None] | tuple[str, dict[str, Any] | None, dict[str, Any]]:
     payload: dict[str, Any] = {"conversation": conversation}
     if voice_turn:
         payload["for_voice_tts"] = True
@@ -2683,6 +2968,10 @@ async def _collect_rag_generate_stream(
     pieces: list[str] = []
     stream_show_image: dict[str, Any] | None = None
     total = 0
+    stream_start = time.perf_counter()
+    human_dispatcher: _StreamHumanDispatcher | None = None
+    if voice_turn and stream_human_sessionid:
+        human_dispatcher = _StreamHumanDispatcher(stream_human_sessionid, stream_start)
 
     def _note_stream_show_image(data: dict[str, Any]) -> None:
         nonlocal stream_show_image
@@ -2692,6 +2981,8 @@ async def _collect_rag_generate_stream(
         norm = normalize_show_image_payload(si)
         if norm:
             stream_show_image = norm
+            if human_dispatcher:
+                human_dispatcher.set_show_image(norm)
 
     async def _append(s: str) -> bool:
         nonlocal total
@@ -2701,6 +2992,8 @@ async def _collect_rag_generate_stream(
         if total > RAG_GENERATE_STREAM_MAX_CHARS:
             return False
         pieces.append(s)
+        if human_dispatcher:
+            await human_dispatcher.feed(s)
         return True
 
     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -2729,7 +3022,9 @@ async def _collect_rag_generate_stream(
                 elif isinstance(obj, str):
                     await _append(obj)
                 out = "".join(pieces).strip()
-                return (out, stream_show_image) if voice_turn else out
+                if human_dispatcher:
+                    await human_dispatcher.finish()
+                return _rag_stream_voice_result(out, stream_show_image, human_dispatcher, voice_turn)
 
             async for raw in response.aiter_lines():
                 if total > RAG_GENERATE_STREAM_MAX_CHARS:
@@ -2762,7 +3057,31 @@ async def _collect_rag_generate_stream(
                     break
 
     out = "".join(pieces).strip()
-    return (out, stream_show_image) if voice_turn else out
+    if human_dispatcher:
+        await human_dispatcher.finish()
+    return _rag_stream_voice_result(out, stream_show_image, human_dispatcher, voice_turn)
+
+
+def _rag_stream_voice_result(
+    answer: str,
+    stream_show_image: dict[str, Any] | None,
+    human_dispatcher: _StreamHumanDispatcher | None,
+    voice_turn: bool,
+) -> str | tuple[str, dict[str, Any] | None] | tuple[str, dict[str, Any] | None, dict[str, Any]]:
+    if not voice_turn:
+        return answer
+    meta: dict[str, Any] = {}
+    if human_dispatcher:
+        meta = {
+            "stream_human": True,
+            "human_sentence_count": human_dispatcher.sentence_count,
+            "rag_first_sentence_ms": (
+                round(human_dispatcher.first_sentence_ms, 1)
+                if human_dispatcher.first_sentence_ms is not None
+                else None
+            ),
+        }
+    return answer, stream_show_image, meta
 
 
 @app.get("/api/rag/status")
