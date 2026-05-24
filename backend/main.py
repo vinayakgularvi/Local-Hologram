@@ -913,6 +913,12 @@ async def webrtc_human_proxy(request: Request) -> Response:
     return await _forward_webrtc_post("/human", request)
 
 
+@app.post("/interrupt_talk")
+async def webrtc_interrupt_talk_proxy(request: Request) -> Response:
+    """Forward to LiveTalking interrupt_talk (stop current TTS / lip-sync for sessionid)."""
+    return await _forward_webrtc_post("/interrupt_talk", request)
+
+
 @dataclass
 class _HumanDispatchItem:
     text: str
@@ -1811,9 +1817,10 @@ def _transcribe_chunk_length_s(raw: str, mode: str) -> str:
 
 @app.get("/api/webrtc")
 async def webrtc_proxy_status():
-    """Whether POST /offer, /human, /record are forwarded to WEBRTC_SIGNALING_BASE."""
+    """Whether POST /offer, /human, /record, /interrupt_talk are forwarded to WEBRTC_SIGNALING_BASE."""
     return {
         "signaling_proxy_configured": bool(WEBRTC_SIGNALING_BASE),
+        "interrupt_talk_proxy": bool(WEBRTC_SIGNALING_BASE),
         "transcribe_configured": bool(TRANSCRIBE_API_URL),
         "transcribe_mode": TRANSCRIBE_MODE if TRANSCRIBE_API_URL else None,
         "transcribe_chunk_length_s": int(float(TRANSCRIBE_CHUNK_LENGTH_S))

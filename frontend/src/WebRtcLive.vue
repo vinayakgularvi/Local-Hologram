@@ -1360,11 +1360,53 @@ async function reportLipSyncLatencyMs(turnId, lipSyncMs, extra = {}) {
 }
 
 /** Queue TTS on LiveTalking; do not await (avatar starts generating while UI updates). */
+function liveTalkingSessionIdPayload() {
+  const sid = String(sessionId.value || "").trim();
+  if (!sid || sid === "0") return null;
+  const asNum = Number(sid);
+  if (Number.isFinite(asNum) && !Number.isNaN(asNum)) {
+    return { sessionid: asNum };
+  }
+  return { sessionid: sid };
+}
+
+/** Stop LiveTalking speech + local cached Q&A clip when user taps mic to interrupt. */
+async function interruptAvatarSpeech() {
+  stopCachedVideoQa();
+  clearAnswerPlaybackEndWatch();
+  clearWebRtcTtfaPending();
+  pendingVoiceAnalytics = null;
+
+  const payload = liveTalkingSessionIdPayload();
+  if (!payload) {
+    console.warn("[interrupt_talk] skipped — no WebRTC sessionid (connect hologram first)");
+    return false;
+  }
+
+  try {
+    const res = await fetch(signalingUrl("/interrupt_talk"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      console.warn("[interrupt_talk] failed", res.status, body.slice(0, 300));
+      return false;
+    }
+    console.info("[interrupt_talk] ok", payload);
+    return true;
+  } catch (e) {
+    console.warn("[interrupt_talk]", e);
+    return false;
+  }
+}
+
 function postHuman(text) {
   const t = text.trim();
   if (!t) return;
-  const sid = String(sessionId.value || "").trim();
-  if (!sid) return;
+  const payload = liveTalkingSessionIdPayload();
+  if (!payload) return;
   activateWebRtcStage();
   void fetch(signalingUrl("/human"), {
     method: "POST",
@@ -1374,7 +1416,7 @@ function postHuman(text) {
       text: t,
       type: "echo",
       interrupt: true,
-      sessionid: sid,
+      ...payload,
     }),
   })
     .then(async (res) => {
@@ -2107,12 +2149,10 @@ async function startServerMicCapture() {
   }
 }
 
-function toggleMic() {
+async function toggleMic() {
   webrtcError.value = "";
   clearFeaturedMenuImage();
-  pendingVoiceAnalytics = null;
   clearCaptionHideTimer();
-  clearMicTapTiming();
   if (!started.value) {
     webrtcError.value = "Connecting… try again in a moment.";
     return;
@@ -2125,6 +2165,10 @@ function toggleMic() {
     stopMicInternal({ cancel: true });
     return;
   }
+
+  pendingVoiceAnalytics = null;
+  clearMicTapTiming();
+  await interruptAvatarSpeech();
 
   if (useServerTranscribe.value) {
     void startServerMicCapture().catch((e) => {
