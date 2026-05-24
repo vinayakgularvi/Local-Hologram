@@ -21,7 +21,7 @@ export default defineConfig({
           if (path === "/favicon.ico") {
             req.url = "/favicon.svg";
           }
-          if (path === "/analytics" || path === "/analystics") {
+          if (path === "/analytics" || path === "/analystics" || path === "/video-rag") {
             req.url = "/";
           }
           next();

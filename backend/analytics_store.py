@@ -529,6 +529,32 @@ def _empty_summary() -> dict[str, Any]:
     }
 
 
+def get_voice_turn(turn_id: int) -> dict[str, Any] | None:
+    """Single voice-turn row by SQLite id (for MongoDB sync)."""
+    init_db()
+    tid = int(turn_id)
+    if tid < 1:
+        return None
+    with _connect() as cx:
+        row = cx.execute(
+            """
+            SELECT id, ts, heard_chars, answer_chars, total_request_ms,
+                   prompt_tokens, completion_tokens, webrtc_first_voice_ms, rag_latency_ms,
+                   stt_latency_ms, stt_first_chunk_latency_ms, stt_chunk_count, stt_to_lip_sync_ms,
+                   time_to_first_voice_ms, mic_to_speaker_voice_ms,
+                   tts_latency_ms, lip_sync_latency_ms, mic_to_lip_sync_ms,
+                   lip_sync_to_video_stream_ms, mic_to_first_audio_ms,
+                   client_voice_turn_ms, human_dispatch_ms, human_dispatched,
+                   time_to_audio_playback_ms, time_to_video_playback_ms, mic_to_video_playback_ms,
+                   lip_sync_avatar_play_ms, stream_start_to_avatar_ms, video_stream_first_ms,
+                   webrtc_real_playback_ms
+            FROM voice_turns WHERE id = ?
+            """,
+            (tid,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
 def get_recent_voice_turns(limit: int = 50) -> list[dict[str, Any]]:
     init_db()
     limit = max(1, min(limit, 500))

@@ -1,0 +1,156 @@
+"""High-confidence Video Q&A lookup for live avatar (skip LiveTalking when matched)."""
+
+from __future__ import annotations
+
+import math
+import os
+from typing import Any
+
+from hologram_trace import trace
+from video_qa_qdrant import (
+    _embed_text,
+    is_configured as qdrant_configured,
+    text_similarity,
+)
+from video_qa_store import get_item, search_items
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = (os.environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
+def is_voice_match_enabled() -> bool:
+    return _env_bool("VIDEO_QA_VOICE_MATCH", default=True) and qdrant_configured()
+
+
+def match_threshold() -> float:
+    raw = (os.environ.get("VIDEO_QA_MATCH_THRESHOLD") or "0.9").strip()
+    try:
+        v = float(raw)
+    except ValueError:
+        v = 0.9
+    return max(0.5, min(v, 0.999))
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na <= 0 or nb <= 0:
+        return 0.0
+    return max(0.0, min(1.0, dot / (na * nb)))
+
+
+def _embedding_similarity(text_a: str, text_b: str) -> float | None:
+    a = (text_a or "").strip()
+    b = (text_b or "").strip()
+    if not a or not b:
+        return None
+    try:
+        return _cosine_similarity(_embed_text(a), _embed_text(b))
+    except Exception as e:
+        trace(f"Video Q&A match: embedding compare failed ({type(e).__name__}: {e})")
+        return None
+
+
+def _combined_similarity(query: str, target: str, vector_score: float) -> float:
+    """Best of vector search score, text match, and embedding match."""
+    scores: list[float] = [float(vector_score or 0.0), text_similarity(query, target)]
+    emb = _embedding_similarity(query, target)
+    if emb is not None:
+        scores.append(emb)
+    return max(scores)
+
+
+def find_high_confidence_match(user_query: str) -> dict[str, Any] | None:
+    """
+    Search Qdrant first; if question and answer confidence are both >= threshold,
+    return the stored video Q&A entry (same clip for Q and A).
+    """
+    if not is_voice_match_enabled():
+        trace("Video Q&A match: SKIPPED (VIDEO_QA_VOICE_MATCH off or Qdrant not configured)")
+        return None
+    q = (user_query or "").strip()
+    if not q:
+        trace("Video Q&A match: SKIPPED (empty query)")
+        return None
+    threshold = match_threshold()
+    trace(f"Video Q&A match: START qdrant search threshold={threshold:.0%} query={q[:80]!r}")
+
+    hits = search_items(query=q, limit=5)
+    if not hits:
+        trace("Video Q&A match: NO hits from Qdrant → will use LiveTalking")
+        return None
+
+    trace(f"Video Q&A match: {len(hits)} candidate(s) from Qdrant")
+    for i, hit in enumerate(hits, start=1):
+        item_id = str(hit.get("id") or "").strip()
+        if not item_id:
+            trace(f"  [{i}] SKIP (missing id)")
+            continue
+
+        full = get_item(item_id) or hit
+        question = str(full.get("question") or hit.get("question") or "").strip()
+        answer = str(full.get("answer") or hit.get("answer") or "").strip()
+        if not answer:
+            trace(f"  [{i}] id={item_id} SKIP (no answer)")
+            continue
+
+        vector_score = float(hit.get("score") or 0.0)
+        search_method = str(hit.get("search_method") or "unknown")
+
+        question_score = _combined_similarity(q, question, vector_score) if question else vector_score
+
+        # Answer leg: user query vs answer text, or trust paired row when question matches strongly
+        answer_direct = _combined_similarity(q, answer, 0.0)
+        if question_score >= threshold:
+            answer_score = max(answer_direct, question_score, vector_score)
+        else:
+            answer_score = answer_direct
+
+        q_pct = question_score * 100
+        a_pct = answer_score * 100
+        t_pct = threshold * 100
+        ok = question_score >= threshold and answer_score >= threshold
+        trace(
+            f"  [{i}] id={item_id} via={search_method} vector={vector_score:.3f} "
+            f"question={q_pct:.1f}% answer={a_pct:.1f}% need>={t_pct:.0f}% "
+            f"stored_q={question[:40]!r}…"
+            f" → {'MATCH' if ok else 'below threshold'}"
+        )
+        if not ok:
+            continue
+
+        video_url = full.get("video_url") or hit.get("video_url") or f"/api/video-qa/{item_id}/video"
+        trace(
+            f"Video Q&A match: HIT id={item_id} → play cached video {video_url} "
+            f"(skip LiveTalking)"
+        )
+        return {
+            **full,
+            **hit,
+            "question": question,
+            "answer": answer,
+            "video_url": video_url,
+            "question_score": round(question_score, 4),
+            "answer_score": round(answer_score, 4),
+            "vector_score": round(vector_score, 4),
+            "match_threshold": threshold,
+            "search_method": search_method,
+            "playback_mode": "cached_video",
+        }
+
+    trace("Video Q&A match: no candidate met both scores → LiveTalking path")
+    return None
+
+
+def public_config() -> dict[str, Any]:
+    return {
+        "enabled": is_voice_match_enabled(),
+        "threshold": match_threshold(),
+    }

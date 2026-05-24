@@ -424,6 +424,7 @@ async function submitReset() {
         <nav class="dash__nav" aria-label="App sections">
           <router-link class="dash-link dash-link--ghost" to="/hologram">Live hologram</router-link>
           <router-link class="dash-link dash-link--ghost" to="/avatar">Avatar Studio</router-link>
+          <router-link class="dash-link dash-link--ghost" to="/video-rag">Video RAG</router-link>
         </nav>
       </div>
       <div class="dash__live">

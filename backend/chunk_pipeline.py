@@ -6,6 +6,7 @@ Requires ffmpeg and ffprobe on PATH (no pydub — compatible with Python 3.13+).
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -98,9 +99,41 @@ def ffmpeg_extract_video_segment(src: str, start: float, duration: float, out: s
         )
 
 
-def ffmpeg_trim_start(src: str, trim_sec: float, out: str) -> None:
+def ffmpeg_trim_start(src: str, trim_sec: float, out: str, *, accurate: bool = False) -> None:
     if trim_sec <= 0:
-        raise ValueError("trim_sec must be positive")
+        import shutil
+
+        shutil.copy2(src, out)
+        return
+    if accurate:
+        _run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                src,
+                "-ss",
+                f"{trim_sec:.4f}",
+                "-map",
+                "0",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "fast",
+                "-crf",
+                "23",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                out,
+            ]
+        )
+        return
     try:
         _run(
             [
@@ -201,6 +234,123 @@ def ffmpeg_concat_videos(paths: list[str], out: str) -> None:
             os.unlink(list_path)
         except OSError:
             pass
+
+
+_SILENCE_START_RE = re.compile(r"silence_start:\s*([\d.]+)")
+_SILENCE_END_RE = re.compile(r"silence_end:\s*([\d.]+)")
+_BLACK_START_RE = re.compile(r"black_start:\s*([\d.]+)")
+_BLACK_END_RE = re.compile(r"black_end:\s*([\d.]+)")
+
+
+def _silencedetect_trim_sec(
+    src: str,
+    *,
+    noise_db: float,
+    min_silence_sec: float,
+) -> float:
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-i",
+        src,
+        "-af",
+        f"silencedetect=noise={noise_db:.1f}dB:d={min_silence_sec:.3f}",
+        "-f",
+        "null",
+        "-",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    log = (proc.stderr or "") + (proc.stdout or "")
+    starts = [float(m.group(1)) for m in _SILENCE_START_RE.finditer(log)]
+    ends = [float(m.group(1)) for m in _SILENCE_END_RE.finditer(log)]
+    if not starts or not ends:
+        return 0.0
+    if starts[0] > 0.08:
+        return 0.0
+    return max(0.0, ends[0])
+
+
+def _blackdetect_trim_sec(src: str, *, min_black_sec: float) -> float:
+    """Leading black / near-black video (common on lip-sync clips with silent intro)."""
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-i",
+        src,
+        "-vf",
+        f"blackdetect=d={min_black_sec:.3f}:pix_th=0.12",
+        "-an",
+        "-f",
+        "null",
+        "-",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    log = (proc.stderr or "") + (proc.stdout or "")
+    starts = [float(m.group(1)) for m in _BLACK_START_RE.finditer(log)]
+    ends = [float(m.group(1)) for m in _BLACK_END_RE.finditer(log)]
+    if not starts or not ends:
+        return 0.0
+    if starts[0] > 0.08:
+        return 0.0
+    return max(0.0, ends[0])
+
+
+def ffmpeg_detect_leading_silence_trim_sec(
+    src: str,
+    *,
+    noise_db: float = -35.0,
+    min_silence_sec: float = 0.25,
+    max_trim_sec: float = 120.0,
+) -> float:
+    """
+    Return seconds to trim from the start when the video begins with silence and/or black frames.
+    Uses audio silencedetect and video blackdetect; returns the larger leading gap found.
+    """
+    audio_trim = _silencedetect_trim_sec(
+        src, noise_db=noise_db, min_silence_sec=min_silence_sec
+    )
+    # Slightly more sensitive pass for quiet room tone before speech.
+    if audio_trim <= 0.0 and noise_db > -55.0:
+        audio_trim = _silencedetect_trim_sec(
+            src, noise_db=noise_db - 10.0, min_silence_sec=min(0.12, min_silence_sec)
+        )
+    black_trim = _blackdetect_trim_sec(src, min_black_sec=min_silence_sec)
+    trim = max(audio_trim, black_trim)
+    if trim <= 0.0:
+        return 0.0
+    if trim > max_trim_sec:
+        trim = max_trim_sec
+    duration = ffprobe_duration_seconds(src)
+    if duration > 0 and duration - trim < 0.5:
+        return 0.0
+    return round(trim, 4)
+
+
+def ffmpeg_extract_audio_wav(
+    src: str,
+    out: str,
+    *,
+    start_sec: float = 0.0,
+    sample_rate: int = 16000,
+) -> None:
+    start_sec = max(0.0, start_sec)
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-ss",
+        f"{start_sec:.4f}",
+        "-i",
+        src,
+        "-vn",
+        "-acodec",
+        "pcm_s16le",
+        "-ar",
+        str(sample_rate),
+        "-ac",
+        "1",
+        out,
+    ]
+    _run(cmd)
 
 
 def run_chunked_lipsync(

@@ -22,7 +22,7 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import Request as StarletteRequest
@@ -40,6 +40,17 @@ from analytics_store import (
     update_voice_turn_human_dispatch_ms,
     update_voice_turn_lip_sync_latency,
     update_voice_turn_webrtc_first_voice,
+)
+from mongodb_analytics import (
+    public_config as mongodb_public_config,
+    schedule_record_avatar_turn,
+    schedule_sync_avatar_turn,
+)
+from mongodb_export_trigger import (
+    change_stream_enabled,
+    is_trigger_enabled as mongodb_export_trigger_enabled,
+    mongodb_export_change_stream_loop,
+    public_config as mongodb_export_trigger_config,
 )
 from avatar_assets_store import (
     get_audio as livetalking_db_get_audio,
@@ -101,6 +112,32 @@ from studio_integrations import (
 from studio_integrations import GDRIVE_CREDENTIALS_SAVED as STUDIO_GDRIVE_CREDENTIALS_PATH
 from studio_integrations import GCS_CREDENTIALS_SAVED as STUDIO_GCS_CREDENTIALS_PATH
 from studio_live_sync import is_master_enabled, set_master_enabled
+from video_qa_store import (
+    create_item as video_qa_create,
+    delete_item as video_qa_delete,
+    delete_items as video_qa_delete_items,
+    get_item as video_qa_get,
+    get_status as video_qa_get_status,
+    open_video as video_qa_open_video,
+    init_db as init_video_qa_db,
+    list_items as video_qa_list,
+    search_items as video_qa_search,
+    update_item as video_qa_update,
+)
+from video_qa_processor import process_item as video_qa_process_one, process_items as video_qa_process_batch
+from video_qa_ask import build_video_qa_conversation, pick_fallback_answer
+from video_qa_exports import (
+    get_job as video_qa_export_get,
+    get_status as video_qa_offline_exports_status,
+    init_export_db,
+    list_jobs as video_qa_export_list,
+    offline_exports_poll_loop,
+    refresh_job_status as video_qa_export_refresh,
+    schedule_poll,
+    submit_export_async,
+)
+from offline_exports_client import is_enabled as offline_exports_enabled
+from video_qa_match import find_high_confidence_match, public_config as video_qa_match_config
 
 _BACKEND_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _BACKEND_DIR.parent
@@ -728,8 +765,19 @@ async def _on_startup() -> None:
         )
     init_db()
     init_avatar_assets_db()
+    init_video_qa_db()
+    init_export_db()
     global _background_tasks
     _background_tasks = []
+    if offline_exports_enabled():
+        _background_tasks.append(asyncio.create_task(offline_exports_poll_loop()))
+    if mongodb_export_trigger_enabled():
+        log.info(
+            "MongoDB → offline-exports trigger on collection %s",
+            mongodb_export_trigger_config().get("collection"),
+        )
+    if change_stream_enabled():
+        _background_tasks.append(asyncio.create_task(mongodb_export_change_stream_loop()))
     # Always run idle loops so Studio can toggle live sync without restarting the API.
     _background_tasks.append(asyncio.create_task(_sharepoint_live_loop()))
     _background_tasks.append(asyncio.create_task(_google_drive_live_loop()))
@@ -1032,6 +1080,7 @@ async def _dispatch_livetalking_human(
             and ms is not None
         ):
             if update_voice_turn_human_dispatch_ms(int(analytics_turn_id), ms):
+                schedule_sync_avatar_turn(analytics_turn_id)
                 await _publish_analytics_snapshot()
     return ms
 
@@ -1770,6 +1819,7 @@ async def webrtc_proxy_status():
         "transcribe_chunk_length_s": int(float(TRANSCRIBE_CHUNK_LENGTH_S))
         if TRANSCRIBE_API_URL and TRANSCRIBE_MODE == "chunked"
         else None,
+        "video_qa_match": video_qa_match_config(),
     }
 
 
@@ -2267,7 +2317,8 @@ _VOICE_SHOW_IMAGE_UI_HINT = (
     "if that name is only inside the tag). Use generic phrases like 'here it is' or 'take a look'. "
     "After the spoken lines, append one silent UI-only block: "
     '<show_image>{"items":[{"name":"Exact menu item name"}]}</show_image> '
-    "(exact names inside the tag only, for images; omit the tag if no image is needed)."
+    "(use printed menu names when possible, e.g. Latte, Sourdough Chicken Sandwich, Indian Filter Coffee; "
+    "omit the tag if no image is needed)."
 )
 
 
@@ -2472,12 +2523,24 @@ def normalize_show_image_payload(payload: Any) -> dict[str, Any] | None:
     return None
 
 
+def _clean_show_image_inner(inner: str) -> str:
+    s = (inner or "").strip()
+    if s.startswith("```"):
+        lines = s.split("\n")
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        s = "\n".join(lines).strip()
+    return s
+
+
 def _parse_show_image_inner(inner: str) -> dict[str, Any] | None:
     """
     Parse <show_image> body: JSON {"items":[{"name":"..."}]} or plain item name.
     Tolerates doubled braces from templating: {{"items":[...]}}.
     """
-    s = (inner or "").strip()
+    s = _clean_show_image_inner(inner)
     if not s:
         return None
     candidates = [s]
@@ -2503,11 +2566,21 @@ def parse_show_image_from_answer(raw: str) -> dict[str, Any] | None:
     """Last <show_image>…</show_image> payload as {items: [{name}, …]}."""
     if not raw or not isinstance(raw, str):
         return None
+    text = raw.strip()
     last_inner: str | None = None
-    for m in _SHOW_IMAGE_BLOCK_RE.finditer(raw.strip()):
+    for m in _SHOW_IMAGE_BLOCK_RE.finditer(text):
         inner = (m.group(1) or "").strip()
         if inner:
             last_inner = inner
+    if last_inner is None:
+        loose = _SHOW_IMAGE_LOOSE_RE.search(text)
+        if loose:
+            inner = (loose.group(0) or "").strip()
+            if inner.lower().startswith("<show_image"):
+                inner = re.sub(r"^<show_image>\s*", "", inner, flags=re.IGNORECASE)
+                inner = re.sub(r"</show_image>\s*$", "", inner, flags=re.IGNORECASE).strip()
+            if inner:
+                last_inner = inner
     if last_inner is None:
         return None
     return _parse_show_image_inner(last_inner)
@@ -2523,20 +2596,134 @@ def _show_image_has_items(payload: dict[str, Any] | None) -> bool:
 @app.post("/api/voice-turn")
 async def voice_turn(body: VoiceTurnBody):
     """
-    Browser STT text → optional ChromaDB RAG → reply from RAG_GENERATE_STREAM_URL when set, else Ollama
-    → speak_text dispatched to LiveTalking /human from the API when sessionid is provided (else client POST /human).
+    Browser STT text → Video Q&A Qdrant (>= threshold) plays stored clip; else Chroma RAG + LLM + LiveTalking.
     """
     user_text = body.text.strip()
     if not user_text:
         raise HTTPException(status_code=400, detail="text is empty.")
-    prompt, rag_meta, chroma_hits = await asyncio.to_thread(_build_voice_llm_prompt, user_text)
+    sid = (body.sessionid or "").strip()
     t0 = time.perf_counter()
+
+    from hologram_trace import trace as hologram_trace
+
+    hologram_trace(
+        f"voice-turn: START sessionid={sid or '(none)'} text={user_text[:100]!r}"
+    )
+
+    video_hit = await asyncio.to_thread(find_high_confidence_match, user_text)
+    if video_hit:
+        hologram_trace(
+            f"voice-turn: CACHED VIDEO path id={video_hit.get('id')} "
+            f"q={video_hit.get('question_score')} a={video_hit.get('answer_score')}"
+        )
+        answer = str(video_hit.get("answer") or "").strip()
+        speak_text, receipt, order_done_num = split_voice_answer_receipt(answer)
+        speak_text = strip_show_image_markup(speak_text) or answer
+        show_image = parse_show_image_from_answer(answer)
+        if show_image:
+            hologram_trace(
+                "voice-turn: cached show_image="
+                f"{[it.get('name') for it in (show_image.get('items') or [])]}"
+            )
+        total_ms = (time.perf_counter() - t0) * 1000.0
+        rag_meta: dict[str, Any] = {
+            "used": True,
+            "video_qa_cache": True,
+            "video_qa_id": video_hit.get("id"),
+            "question_score": video_hit.get("question_score"),
+            "answer_score": video_hit.get("answer_score"),
+            "vector_score": video_hit.get("vector_score"),
+            "match_threshold": video_hit.get("match_threshold"),
+            "llm": "video_qa_cached",
+        }
+        analytics_turn_id: int | None = None
+        stt_ms = body.stt_latency_ms
+        if stt_ms is not None and (stt_ms < 0 or stt_ms > 600_000):
+            stt_ms = None
+        stt_first_ms = body.stt_first_chunk_latency_ms
+        if stt_first_ms is not None and (stt_first_ms < 0 or stt_first_ms > 600_000):
+            stt_first_ms = None
+        stt_chunks = body.stt_chunk_count
+        if stt_chunks is not None and (stt_chunks < 0 or stt_chunks > 10_000):
+            stt_chunks = None
+        if os.environ.get("ANALYTICS_DISABLE", "").strip().lower() not in (
+            "1",
+            "true",
+            "yes",
+        ):
+            analytics_turn_id = record_voice_turn(
+                heard_chars=len(user_text),
+                answer_chars=len(speak_text.strip()),
+                total_request_ms=total_ms,
+                rag_latency_ms=total_ms,
+                stt_latency_ms=stt_ms,
+                stt_first_chunk_latency_ms=stt_first_ms,
+                stt_chunk_count=stt_chunks,
+            )
+        if analytics_turn_id is not None:
+            await _publish_analytics_snapshot()
+        schedule_record_avatar_turn(
+            analytics_turn_id=analytics_turn_id,
+            sessionid=sid,
+            question=user_text,
+            answer=answer,
+            speak_text=speak_text,
+            rag=rag_meta,
+            human_dispatched=False,
+            total_request_ms=round(total_ms, 1),
+            analytics={
+                "heard_chars": len(user_text),
+                "answer_chars": len(speak_text.strip()),
+                "total_request_ms": round(total_ms, 1),
+                "rag_latency_ms": round(total_ms, 1),
+                "stt_latency_ms": stt_ms,
+                "stt_first_chunk_latency_ms": stt_first_ms,
+                "stt_chunk_count": stt_chunks,
+            },
+        )
+        hologram_trace(
+            f"voice-turn: DONE cached video total_ms={round(total_ms, 1)} "
+            f"human_dispatched=False"
+        )
+        logger.info(
+            "voice-turn: Video Q&A cache hit id=%s q_score=%s a_score=%s",
+            video_hit.get("id"),
+            video_hit.get("question_score"),
+            video_hit.get("answer_score"),
+        )
+        return {
+            "answer": answer,
+            "speak_text": speak_text,
+            "show_image": show_image,
+            "receipt": receipt,
+            "order_done": ({"number": int(order_done_num)} if order_done_num is not None else None),
+            "heard": user_text,
+            "rag": rag_meta,
+            "analytics_turn_id": analytics_turn_id,
+            "total_request_ms": round(total_ms, 1),
+            "human_dispatched": False,
+            "video_qa_cached": {
+                "id": video_hit.get("id"),
+                "question": video_hit.get("question") or user_text,
+                "answer": answer,
+                "video_url": video_hit.get("video_url"),
+                "question_score": video_hit.get("question_score"),
+                "answer_score": video_hit.get("answer_score"),
+                "vector_score": video_hit.get("vector_score"),
+            },
+        }
+
+    hologram_trace("voice-turn: LIVETALKING path (Qdrant miss or below threshold)")
+    prompt, rag_meta, chroma_hits = await asyncio.to_thread(_build_voice_llm_prompt, user_text)
     ollama_metrics: dict[str, Any] = {}
     use_rag_stream = bool(RAG_GENERATE_STREAM_URL) and _rag_generate_stream_url_valid(RAG_GENERATE_STREAM_URL)
+    hologram_trace(
+        f"voice-turn: LLM={'rag_generate_stream' if use_rag_stream else 'ollama'} "
+        f"chroma_chunks={len(chroma_hits) if chroma_hits else 0}"
+    )
     stream_show_image: dict[str, Any] | None = None
     rag_latency_ms: float | None = None
     stream_human_meta: dict[str, Any] = {}
-    sid = (body.sessionid or "").strip()
     stream_human_sessionid: str | None = None
     if (
         use_rag_stream
@@ -2584,6 +2771,11 @@ async def voice_turn(body: VoiceTurnBody):
     show_image = parse_show_image_from_answer(answer) or normalize_show_image_payload(
         stream_show_image
     )
+    if show_image:
+        from hologram_trace import trace as hologram_trace
+
+        names = [str(it.get("name", "")) for it in (show_image.get("items") or [])]
+        hologram_trace(f"voice-turn: show_image items={names}")
     speak_text, receipt, order_done_num = split_voice_answer_receipt(answer)
     speak_text = strip_show_image_markup(speak_text)
     speak_text = strip_show_image_item_names_from_speech(speak_text, show_image)
@@ -2597,20 +2789,20 @@ async def voice_turn(body: VoiceTurnBody):
     total_ms = (time.perf_counter() - t0) * 1000.0
     speak_len = len(speak_text.strip())
     analytics_turn_id: int | None = None
+    stt_ms = body.stt_latency_ms
+    if stt_ms is not None and (stt_ms < 0 or stt_ms > 600_000):
+        stt_ms = None
+    stt_first_ms = body.stt_first_chunk_latency_ms
+    if stt_first_ms is not None and (stt_first_ms < 0 or stt_first_ms > 600_000):
+        stt_first_ms = None
+    stt_chunks = body.stt_chunk_count
+    if stt_chunks is not None and (stt_chunks < 0 or stt_chunks > 10_000):
+        stt_chunks = None
     if os.environ.get("ANALYTICS_DISABLE", "").strip().lower() not in (
         "1",
         "true",
         "yes",
     ):
-        stt_ms = body.stt_latency_ms
-        if stt_ms is not None and (stt_ms < 0 or stt_ms > 600_000):
-            stt_ms = None
-        stt_first_ms = body.stt_first_chunk_latency_ms
-        if stt_first_ms is not None and (stt_first_ms < 0 or stt_first_ms > 600_000):
-            stt_first_ms = None
-        stt_chunks = body.stt_chunk_count
-        if stt_chunks is not None and (stt_chunks < 0 or stt_chunks > 10_000):
-            stt_chunks = None
         analytics_turn_id = record_voice_turn(
             heard_chars=len(user_text),
             answer_chars=speak_len,
@@ -2631,6 +2823,7 @@ async def voice_turn(body: VoiceTurnBody):
         human_dispatched = True
         if analytics_turn_id is not None:
             mark_voice_turn_human_dispatched(analytics_turn_id)
+            schedule_sync_avatar_turn(analytics_turn_id)
         logger.info(
             "voice-turn: stream /human dispatched %d sentence(s) sessionid=%s first_sentence_ms=%s",
             int(stream_human_meta.get("human_sentence_count") or 0),
@@ -2654,18 +2847,48 @@ async def voice_turn(body: VoiceTurnBody):
         human_dispatched = True
         if analytics_turn_id is not None:
             mark_voice_turn_human_dispatched(analytics_turn_id)
+            schedule_sync_avatar_turn(analytics_turn_id)
+        hologram_trace(
+            f"voice-turn: queued LiveTalking /human sessionid={sid} speak_chars={speak_len}"
+        )
         logger.info(
             "voice-turn: queued LiveTalking /human sessionid=%s speak_chars=%d",
             sid,
             speak_len,
         )
     elif speak_len > 0 and (not sid or sid == "0"):
+        hologram_trace("voice-turn: SKIP /human (no valid sessionid)")
         logger.warning(
             "voice-turn: skip server /human — invalid sessionid=%r (check WebRTC /offer)",
             sid or None,
         )
     if analytics_turn_id is not None:
         await _publish_analytics_snapshot()
+    schedule_record_avatar_turn(
+        analytics_turn_id=analytics_turn_id,
+        sessionid=sid,
+        question=user_text,
+        answer=answer,
+        speak_text=speak_text,
+        rag=rag_meta,
+        human_dispatched=human_dispatched,
+        total_request_ms=round(total_ms, 1),
+        analytics={
+            "heard_chars": len(user_text),
+            "answer_chars": speak_len,
+            "total_request_ms": round(total_ms, 1),
+            "rag_latency_ms": rag_latency_ms,
+            "stt_latency_ms": stt_ms,
+            "stt_first_chunk_latency_ms": stt_first_ms,
+            "stt_chunk_count": stt_chunks,
+            "prompt_tokens": ollama_metrics.get("prompt_eval_count"),
+            "completion_tokens": ollama_metrics.get("eval_count"),
+        },
+    )
+    hologram_trace(
+        f"voice-turn: DONE livetalking human_dispatched={human_dispatched} "
+        f"total_ms={round(total_ms, 1)} answer_chars={speak_len}"
+    )
     return {
         "answer": answer,
         "speak_text": speak_text,
@@ -2684,7 +2907,7 @@ async def voice_turn(body: VoiceTurnBody):
 async def analytics_summary():
     """Aggregates for dashboard (voice / mic → RAG stream or Ollama)."""
     s = get_summary()
-    return {"kind": "voice_turns", **s}
+    return {"kind": "voice_turns", "mongodb": mongodb_public_config(), **s}
 
 
 @app.get("/api/analytics/voice-turns")
@@ -2810,6 +3033,7 @@ async def analytics_webrtc_first_voice(body: WebrtcFirstVoiceBody):
         time_to_audio_playback_ms=body.time_to_audio_playback_ms,
     )
     if updated:
+        schedule_sync_avatar_turn(body.turn_id)
         await _publish_analytics_snapshot()
     return {"ok": updated, "turn_id": body.turn_id}
 
@@ -2836,6 +3060,7 @@ async def analytics_lip_sync_latency(body: LipSyncLatencyBody):
         stt_to_lip_sync_ms=body.stt_to_lip_sync_ms,
     )
     if updated:
+        schedule_sync_avatar_turn(body.turn_id)
         await _publish_analytics_snapshot()
     return {"ok": updated, "turn_id": body.turn_id}
 
@@ -4607,6 +4832,434 @@ async def lipsync_qa_stream(
         media_type="text/event-stream",
         headers=dict(SSE_STREAM_HEADERS),
     )
+
+
+def _video_qa_ok(data: Any) -> dict[str, Any]:
+    return {"code": 0, "msg": "ok", "data": data}
+
+
+def _video_qa_err(msg: str, *, code: int = 1) -> dict[str, Any]:
+    return {"code": code, "msg": msg, "data": None}
+
+
+class VideoQaBulkDeleteBody(BaseModel):
+    ids: list[str] = Field(default_factory=list, max_length=500)
+
+
+class VideoQaSearchBody(BaseModel):
+    query: str = Field(..., min_length=1)
+    limit: int = Field(default=20, ge=1, le=100)
+
+
+class VideoQaProcessBody(BaseModel):
+    item_ids: list[str] | None = None
+    skip_processed: bool = True
+    limit: int = Field(default=50, ge=1, le=100)
+    force: bool = False
+
+
+class VideoQaAskBody(BaseModel):
+    question: str = Field(..., min_length=1, max_length=8000)
+    limit: int = Field(default=6, ge=1, le=20)
+    skip_export: bool = False
+
+
+@app.get("/api/video-qa/status")
+async def video_qa_status_endpoint():
+    """Video Q&A storage status (Qdrant + local video dir)."""
+    try:
+        status = await asyncio.to_thread(video_qa_get_status)
+        status["offline_exports"] = video_qa_offline_exports_status()
+        status["rag_generate_configured"] = bool(
+            RAG_GENERATE_STREAM_URL and _rag_generate_stream_url_valid(RAG_GENERATE_STREAM_URL)
+        )
+        return _video_qa_ok(status)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/api/video-qa")
+async def video_qa_create_endpoint(
+    file: UploadFile = File(...),
+    item_id: str = Form(...),
+    question: str = Form(...),
+    answer: str = Form(""),
+    auto_process: bool = Form(False),
+):
+    """Create a video Q&A entry (question, answer, and lip-sync video)."""
+    ans = (answer or "").strip()
+    if not ans:
+        if auto_process:
+            ans = "Pending transcription"
+        else:
+            raise HTTPException(status_code=400, detail="answer is required")
+    try:
+        data = await file.read()
+        item = await asyncio.to_thread(
+            video_qa_create,
+            item_id=item_id,
+            question=question,
+            answer=ans,
+            filename=file.filename or f"{item_id}.mp4",
+            content_type=file.content_type or "video/mp4",
+            data=data,
+        )
+        if auto_process:
+            try:
+                proc = await asyncio.to_thread(video_qa_process_one, item["id"], force=False)
+                out = proc.get("item") or await asyncio.to_thread(video_qa_get, item["id"]) or item
+                return _video_qa_ok(
+                    {
+                        **out,
+                        "auto_processed": not proc.get("skipped"),
+                        "process": proc,
+                    }
+                )
+            except (RuntimeError, ValueError) as e:
+                out = await asyncio.to_thread(video_qa_get, item["id"]) or item
+                return _video_qa_ok(
+                    {
+                        **out,
+                        "auto_processed": False,
+                        "process_error": str(e),
+                    }
+                )
+        return _video_qa_ok(item)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/video-qa")
+async def video_qa_list_endpoint(limit: int = 50):
+    """List video Q&A entries."""
+    try:
+        items = await asyncio.to_thread(video_qa_list, limit=limit)
+        return _video_qa_ok({"items": items})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/api/video-qa/ask")
+async def video_qa_ask_endpoint(body: VideoQaAskBody):
+    """
+    Search video Q&A, generate an answer (RAG stream when configured), and queue offline lip-sync export.
+    """
+    question = body.question.strip()
+    try:
+        matches = await asyncio.to_thread(video_qa_search, query=question, limit=body.limit)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    answer: str | None = None
+    generate_error: str | None = None
+    source_item_id = ""
+    if matches:
+        source_item_id = str(matches[0].get("id") or "")
+
+    use_rag_stream = bool(RAG_GENERATE_STREAM_URL) and _rag_generate_stream_url_valid(RAG_GENERATE_STREAM_URL)
+    if use_rag_stream and matches:
+        conversation = build_video_qa_conversation(question, matches)
+        try:
+            answer = await _collect_rag_generate_stream(RAG_GENERATE_STREAM_URL, conversation)
+            if isinstance(answer, tuple):
+                answer = answer[0]
+            answer = (answer or "").strip() or None
+        except HTTPException as e:
+            generate_error = str(e.detail) if isinstance(e.detail, str) else json.dumps(e.detail)
+        except Exception as e:
+            logger.warning("video-qa ask generate failed: %s", e)
+            generate_error = str(e)
+
+    if not answer:
+        fallback = pick_fallback_answer(matches)
+        if fallback:
+            answer = fallback
+        elif not matches:
+            generate_error = generate_error or "No matching video Q&A entries found."
+
+    export_job: dict[str, Any] | None = None
+    export_error: str | None = None
+    skip_direct_export = mongodb_export_trigger_enabled() and (
+        os.environ.get("MONGODB_EXPORT_TRIGGER_ONLY", "").strip().lower()
+        in ("1", "true", "yes", "on")
+    )
+    if (
+        not body.skip_export
+        and not skip_direct_export
+        and offline_exports_enabled()
+        and answer
+        and question
+    ):
+        try:
+            export_job = await asyncio.to_thread(
+                submit_export_async,
+                source_item_id=source_item_id,
+                user_question=question,
+                answer=answer,
+            )
+            if export_job and export_job.get("job_id"):
+                schedule_poll(str(export_job["job_id"]))
+        except Exception as e:
+            logger.warning("video-qa offline export failed: %s", e)
+            export_error = str(e)[:500]
+
+    return _video_qa_ok(
+        {
+            "question": question,
+            "answer": answer,
+            "matches": matches,
+            "source_item_id": source_item_id,
+            "generate_error": generate_error,
+            "export_job": export_job,
+            "export_error": export_error,
+            "offline_exports_enabled": offline_exports_enabled(),
+        }
+    )
+
+
+@app.get("/api/video-qa/exports")
+async def video_qa_exports_list_endpoint(limit: int = 50):
+    """List offline-export jobs triggered from Video RAG ask."""
+    try:
+        jobs = await asyncio.to_thread(video_qa_export_list, limit=limit)
+        return _video_qa_ok({"jobs": jobs, "offline_exports": video_qa_offline_exports_status()})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/video-qa/exports/{job_id}")
+async def video_qa_export_get_endpoint(job_id: str, refresh: bool = False):
+    """Get offline-export job status (optional refresh from remote API)."""
+    try:
+        if refresh:
+            job = await asyncio.to_thread(video_qa_export_refresh, job_id)
+        else:
+            job = await asyncio.to_thread(video_qa_export_get, job_id)
+            if not job:
+                raise HTTPException(status_code=404, detail="export job not found")
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return _video_qa_ok(job)
+
+
+@app.post("/api/video-qa/process")
+async def video_qa_process_batch_endpoint(body: VideoQaProcessBody):
+    """
+    Process entries: trim leading silence, transcribe audio → answer, mark processed, sync Qdrant.
+    """
+    try:
+        result = await asyncio.to_thread(
+            video_qa_process_batch,
+            item_ids=body.item_ids,
+            skip_processed=body.skip_processed,
+            limit=body.limit,
+            force=body.force,
+        )
+        return _video_qa_ok(result)
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/api/video-qa/{item_id}/process")
+async def video_qa_process_one_endpoint(item_id: str, force: bool = False):
+    """Process one entry: trim silence, transcribe, update answer, mark processed."""
+    try:
+        result = await asyncio.to_thread(video_qa_process_one, item_id, force=force)
+        return _video_qa_ok(result)
+    except ValueError as e:
+        msg = str(e)
+        if "not found" in msg:
+            raise HTTPException(status_code=404, detail=msg) from e
+        raise HTTPException(status_code=400, detail=msg) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    except Exception as e:
+        logger.exception("video-qa process failed for %s", item_id)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/video-qa/{item_id}")
+async def video_qa_get_endpoint(item_id: str):
+    """Get a single video Q&A entry."""
+    try:
+        item = await asyncio.to_thread(video_qa_get, item_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if not item:
+        raise HTTPException(status_code=404, detail="item not found")
+    return _video_qa_ok(item)
+
+
+@app.put("/api/video-qa/{item_id}")
+async def video_qa_update_endpoint(
+    item_id: str,
+    question: str | None = Form(None),
+    answer: str | None = Form(None),
+    file: UploadFile | None = File(None),
+    auto_process: bool = Form(False),
+):
+    """Update question, answer, and/or video for an entry."""
+    try:
+        data: bytes | None = None
+        filename: str | None = None
+        content_type: str | None = None
+        if file is not None and file.filename:
+            data = await file.read()
+            filename = file.filename
+            content_type = file.content_type or "video/mp4"
+        item = await asyncio.to_thread(
+            video_qa_update,
+            item_id=item_id,
+            question=question,
+            answer=answer,
+            filename=filename,
+            content_type=content_type,
+            data=data,
+        )
+        if auto_process and data is not None:
+            try:
+                proc = await asyncio.to_thread(video_qa_process_one, item_id, force=True)
+                out = proc.get("item") or await asyncio.to_thread(video_qa_get, item_id) or item
+                return _video_qa_ok(
+                    {
+                        **out,
+                        "auto_processed": not proc.get("skipped"),
+                        "process": proc,
+                    }
+                )
+            except (RuntimeError, ValueError) as e:
+                out = await asyncio.to_thread(video_qa_get, item_id) or item
+                return _video_qa_ok(
+                    {
+                        **out,
+                        "auto_processed": False,
+                        "process_error": str(e),
+                    }
+                )
+        return _video_qa_ok(item)
+    except ValueError as e:
+        msg = str(e)
+        if "not found" in msg:
+            raise HTTPException(status_code=404, detail=msg) from e
+        raise HTTPException(status_code=400, detail=msg) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.delete("/api/video-qa/{item_id}")
+async def video_qa_delete_endpoint(item_id: str):
+    """Delete a video Q&A entry, its Garage video, and Qdrant metadata."""
+    try:
+        result = await asyncio.to_thread(video_qa_delete, item_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    if not result.get("deleted"):
+        raise HTTPException(status_code=404, detail="item not found")
+    return _video_qa_ok(result)
+
+
+@app.post("/api/video-qa/bulk-delete")
+async def video_qa_bulk_delete_endpoint(body: VideoQaBulkDeleteBody):
+    """Delete multiple video Q&A entries (Garage + Qdrant + SQLite per id)."""
+    ids = [str(i).strip() for i in (body.ids or []) if str(i).strip()]
+    if not ids:
+        raise HTTPException(status_code=400, detail="ids is empty")
+    try:
+        result = await asyncio.to_thread(video_qa_delete_items, ids)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return _video_qa_ok(result)
+
+
+@app.get("/api/video-qa/{item_id}/video")
+async def video_qa_video_endpoint(item_id: str, request: StarletteRequest):
+    """Stream the video file for an entry (Garage S3 or local fallback)."""
+    range_header = request.headers.get("range")
+    try:
+        opened = await asyncio.to_thread(video_qa_open_video, item_id, range_header=range_header)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if not opened:
+        raise HTTPException(status_code=404, detail="video not found")
+
+    content_type = opened["content_type"]
+    total = int(opened["size_bytes"])
+    start = int(opened["start"])
+    end = int(opened["end"])
+    filename = str(opened.get("filename") or f"{item_id}.mp4")
+
+    if opened["source"] == "local":
+        path = opened["path"]
+        headers = {"Accept-Ranges": "bytes"}
+        if range_header:
+            length = end - start + 1
+
+            def _local_iter():
+                with open(path, "rb") as fh:
+                    fh.seek(start)
+                    remaining = length
+                    while remaining > 0:
+                        chunk = fh.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            break
+                        remaining -= len(chunk)
+                        yield chunk
+
+            headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+            headers["Content-Length"] = str(length)
+            return StreamingResponse(
+                _local_iter(),
+                status_code=206,
+                media_type=content_type,
+                headers=headers,
+            )
+        return FileResponse(path, media_type=content_type, filename=filename, headers=headers)
+
+    length = end - start + 1
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Type": content_type,
+        "Content-Length": str(length),
+    }
+    status_code = 200
+    if range_header:
+        headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+        status_code = 206
+
+    async def _garage_iter() -> AsyncIterator[bytes]:
+        for chunk in opened["stream"]:
+            yield chunk
+
+    return StreamingResponse(
+        _garage_iter(),
+        status_code=status_code,
+        media_type=content_type,
+        headers=headers,
+    )
+
+
+@app.post("/api/video-qa/search")
+async def video_qa_search_endpoint(body: VideoQaSearchBody):
+    """Search video Q&A entries by question, answer, or id."""
+    try:
+        items = await asyncio.to_thread(video_qa_search, query=body.query, limit=body.limit)
+        return _video_qa_ok({"items": items, "query": body.query.strip()})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 # Built frontend from `frontend` → `backend/static/dist` (e.g. Docker image)

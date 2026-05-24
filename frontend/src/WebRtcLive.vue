@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from "vue";
+import { ref, computed, onMounted, onUnmounted, nextTick } from "vue";
 
 const busy = ref(false);
 /** True once the remote video is actually rendering (not only SDP done). */
@@ -10,7 +10,31 @@ const sessionId = ref("0");
 const webrtcError = ref("");
 
 const videoEl = ref(null);
+const idleLoopEl = ref(null);
+const cachedVideoEl = ref(null);
+const cachedVideoActive = ref(false);
+/** Idle hologram loop (public MP4); hidden while WebRTC or cached Q&A plays. */
+const webrtcStageActive = ref(false);
+/** Bumps when idle loop must stop (cancels in-flight startIdleLoop play()). */
+let idleLoopGeneration = 0;
 const audioEl = ref(null);
+
+/** Normalize env path → browser URL (files in frontend/public/ are served at /). */
+function resolveIdleLoopVideoUrl(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return "/Videofile.mp4";
+  if (/^https?:\/\//i.test(s)) return s;
+  let path = s.replace(/\\/g, "/");
+  const fromPublicDir = path.match(/(?:^|\/)public\/(.+)$/i);
+  if (fromPublicDir) path = fromPublicDir[1];
+  path = path.replace(/^\.\//, "").replace(/^frontend\/public\//i, "");
+  if (!path.startsWith("/")) path = `/${path}`;
+  return path;
+}
+
+const IDLE_LOOP_VIDEO_SRC = resolveIdleLoopVideoUrl(
+  import.meta.env.VITE_IDLE_LOOP_VIDEO || "/Videofile.mp4"
+);
 
 /** @type {RTCPeerConnection | null} */
 let pc = null;
@@ -187,33 +211,60 @@ function normalizeMenuImageName(name) {
   return String(name || "")
     .trim()
     .toLowerCase()
+    .replace(/['']/g, "")
     .replace(/\s+/g, " ");
 }
 
-/** Every cafe menu name → image (extend when adding PNGs under public/menu-items/). */
+/** Default PNG per menu item id (add files under public/menu-items/). */
+const MENU_ITEM_SRC_BY_ID = {
+  espresso: "/menu-items/Latte.png",
+  americano: "/menu-items/Latte.png",
+  latte: "/menu-items/Latte.png",
+  mocha: "/menu-items/Latte.png",
+  "indian-filter-coffee": "/menu-items/IndianFilterCoffee.png",
+  "lavender-oat-latte": "/menu-items/Latte.png",
+  "honey-blossom": "/menu-items/OrangeJuice.png",
+  "matcha-rose": "/menu-items/Latte.png",
+  "acai-bowl": "/menu-items/Croissant.png",
+  "sourdough-chicken-sandwich": "/menu-items/SourdoughChickenSandwich.png",
+  "veg-sandwich": "/menu-items/SourdoughChickenSandwich.png",
+  "almond-croissant": "/menu-items/Croissant.png",
+  "blueberry-muffin": "/menu-items/Croissant.png",
+  "house-granola": "/menu-items/Croissant.png",
+  "vegan-brownie": "/menu-items/Croissant.png",
+};
+
+function defaultMenuImageSrcForItem(item, sectionId) {
+  if (item?.id && MENU_ITEM_SRC_BY_ID[item.id]) return MENU_ITEM_SRC_BY_ID[item.id];
+  if (sectionId === "coffee" || sectionId === "signature") return "/menu-items/Latte.png";
+  if (sectionId === "brunch") return "/menu-items/SourdoughChickenSandwich.png";
+  if (sectionId === "pastries") return "/menu-items/Croissant.png";
+  return "/menu-items/Croissant.png";
+}
+
+/** Every cafe menu name → image; built from CAFE_MENU + RAG aliases. */
 const MENU_IMAGE_BY_NORMALIZED_NAME = (() => {
   const map = new Map();
-  for (const h of MENU_HERO_ITEMS) {
-    map.set(normalizeMenuImageName(h.label), { id: h.id, label: h.label, src: h.src });
-  }
   const assign = (name, id, src) => {
     map.set(normalizeMenuImageName(name), { id, label: name, src });
   };
-  assign("Espresso", "espresso", "/menu-items/Latte.png");
-  assign("Americano", "americano", "/menu-items/Latte.png");
-  assign("Latte", "latte", "/menu-items/Latte.png");
-  assign("Mocha", "mocha", "/menu-items/Latte.png");
-  assign("Indian Filter Coffee", "indian-filter-coffee", "/menu-items/IndianFilterCoffee.png");
-  assign("Lavender Oat Latte", "lavender-oat-latte", "/menu-items/Latte.png");
-  assign("Honey Blossom Cold Brew", "honey-blossom", "/menu-items/OrangeJuice.png");
-  assign("Matcha Rose Latte", "matcha-rose", "/menu-items/Latte.png");
-  assign("Acai Berry Bowl", "acai-bowl", "/menu-items/Croissant.png");
-  assign("Sourdough Chicken Sandwich", "sourdough-chicken-sandwich", "/menu-items/SourdoughChickenSandwich.png");
-  assign("Veg Sandwich", "veg-sandwich", "/menu-items/SourdoughChickenSandwich.png");
-  assign("Almond Croissant", "almond-croissant", "/menu-items/Croissant.png");
-  assign("Blueberry Muffin", "blueberry-muffin", "/menu-items/Croissant.png");
-  assign("House Granola", "house-granola", "/menu-items/Croissant.png");
-  assign("Vegan Brownie", "vegan-brownie", "/menu-items/Croissant.png");
+  for (const h of MENU_HERO_ITEMS) {
+    assign(h.label, h.id, h.src);
+  }
+  for (const section of CAFE_MENU) {
+    for (const item of section.items) {
+      const src = defaultMenuImageSrcForItem(item, section.id);
+      assign(item.name, item.id, src);
+    }
+  }
+  // RAG / LLM aliases (not on printed menu but common in answers)
+  assign(
+    "Smoked Chicken Burger",
+    "smoked-chicken-burger",
+    "/menu-items/SourdoughChickenSandwich.png"
+  );
+  assign("Chicken Burger", "chicken-burger", "/menu-items/SourdoughChickenSandwich.png");
+  assign("Smoked Chicken Sandwich", "smoked-chicken-sandwich", "/menu-items/SourdoughChickenSandwich.png");
   return map;
 })();
 
@@ -225,14 +276,80 @@ const SHOW_IMAGE_ENABLED = true;
 /** When non-empty, menu + hero strip hidden; item images shown with 3D animation. */
 const featuredMenuImages = ref([]);
 
-function resolveMenuImageByName(name) {
-  const key = normalizeMenuImageName(name);
+function resolveMenuImageByKeyword(key) {
   if (!key) return null;
-  return MENU_IMAGE_BY_NORMALIZED_NAME.get(key) || null;
+  if (/\b(burger|sandwich|sourdough)\b/.test(key) || (/\bchicken\b/.test(key) && /\b(smoked|grilled|crispy|juicy)\b/.test(key))) {
+    return {
+      id: "sourdough-chicken-sandwich",
+      label: "Sourdough Chicken Sandwich",
+      src: "/menu-items/SourdoughChickenSandwich.png",
+    };
+  }
+  if (/\b(filter coffee|indian coffee)\b/.test(key)) {
+    return {
+      id: "indian-filter-coffee",
+      label: "Indian Filter Coffee",
+      src: "/menu-items/IndianFilterCoffee.png",
+    };
+  }
+  if (/\b(coffee|espresso|latte|mocha|americano|cappuccino|brew|matcha|cold brew)\b/.test(key)) {
+    return { id: "latte", label: "Latte", src: "/menu-items/Latte.png" };
+  }
+  if (/\b(croissant|muffin|granola|brownie|pastry|bowl|acai)\b/.test(key)) {
+    return { id: "croissant", label: "Croissant", src: "/menu-items/Croissant.png" };
+  }
+  if (/\b(juice|orange)\b/.test(key)) {
+    return { id: "orange-juice", label: "Orange Juice", src: "/menu-items/OrangeJuice.png" };
+  }
+  return null;
+}
+
+function resolveMenuImageByName(name) {
+  const displayLabel = String(name || "").trim();
+  const key = normalizeMenuImageName(displayLabel);
+  if (!key) return null;
+
+  const withLabel = (img) => (img ? { ...img, label: displayLabel || img.label } : null);
+
+  const exact = MENU_IMAGE_BY_NORMALIZED_NAME.get(key);
+  if (exact) return withLabel(exact);
+
+  for (const [menuKey, img] of MENU_IMAGE_BY_NORMALIZED_NAME) {
+    if (menuKey.includes(key) || key.includes(menuKey)) return withLabel(img);
+  }
+
+  const keyTokens = new Set(key.split(" ").filter((t) => t.length > 2));
+  let best = null;
+  let bestScore = 0;
+  for (const [menuKey, img] of MENU_IMAGE_BY_NORMALIZED_NAME) {
+    let score = 0;
+    for (const t of menuKey.split(" ")) {
+      if (t.length > 2 && keyTokens.has(t)) score += 1;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      best = img;
+    }
+  }
+  if (best && bestScore >= 2) return withLabel(best);
+
+  return withLabel(resolveMenuImageByKeyword(key));
+}
+
+function cleanShowImageInner(raw) {
+  let s = String(raw || "").trim();
+  if (!s) return "";
+  if (s.startsWith("```")) {
+    const lines = s.split("\n");
+    if (lines[0]?.startsWith("```")) lines.shift();
+    if (lines.length && lines[lines.length - 1].trim() === "```") lines.pop();
+    s = lines.join("\n").trim();
+  }
+  return s;
 }
 
 function parseShowImageInner(inner) {
-  const s = String(inner || "").trim();
+  const s = cleanShowImageInner(inner);
   if (!s) return null;
   const candidates = [s];
   if (s.includes("{{") || s.includes("}}")) {
@@ -255,11 +372,17 @@ function parseShowImageInner(inner) {
 }
 
 function parseShowImageFromAnswer(raw) {
-  const re = /<show_image>\s*([\s\S]*?)\s*<\/show_image>/gi;
+  const text = String(raw || "");
+  const closedRe = /<show_image>\s*([\s\S]*?)\s*<\/show_image>/gi;
   let lastInner = null;
-  for (const m of String(raw || "").matchAll(re)) {
+  for (const m of text.matchAll(closedRe)) {
     const inner = (m[1] || "").trim();
     if (inner) lastInner = inner;
+  }
+  if (!lastInner) {
+    const looseRe = /<show_image>\s*([\s\S]*?)$/gi;
+    const loose = looseRe.exec(text);
+    if (loose?.[1]?.trim()) lastInner = loose[1].trim();
   }
   if (!lastInner) return null;
   return parseShowImageInner(lastInner);
@@ -304,14 +427,20 @@ function applyShowImageFromVoiceTurn(data) {
     featuredMenuImages.value = [];
     return;
   }
+  const answer = String(data?.answer || "");
+  const hasShowImageTag = /<show_image\b/i.test(answer);
   const payload =
     normalizeShowImagePayload(data?.show_image) ||
-    parseShowImageFromAnswer(data?.answer) ||
-    parseShowImageFromAnswer(String(data?.speak_text || ""));
+    (hasShowImageTag ? parseShowImageFromAnswer(answer) : null);
   const images = resolveMenuImagesFromPayload(payload);
   featuredMenuImages.value = images;
-  if (payload?.items?.length && !images.length) {
-    console.warn("[show_image] no menu PNG for items:", payload.items.map((it) => it.name));
+  if (images.length) {
+    console.info("[show_image] showing", images.map((i) => i.label));
+  } else if (hasShowImageTag) {
+    console.warn("[show_image] <show_image> present but no menu PNG matched", {
+      show_image: data?.show_image,
+      answer_tail: answer.slice(-200),
+    });
   }
 }
 
@@ -435,6 +564,12 @@ let webrtcTtfaPollId = null;
 let lipSyncPending = null;
 let lipSyncPollId = null;
 let lipSyncTimeout = null;
+/** Keeps WebRTC visible until answer audio finishes (voice-turn JSON returns earlier). */
+let answerEndWatchId = null;
+let answerEndAudioEventsBound = false;
+const ANSWER_END_STALL_MS = 650;
+const ANSWER_END_NEVER_HEARD_MS = 90_000;
+const ANSWER_END_MAX_MS = 180_000;
 /** Voice input request (recognition start) → final transcript (STT latency). */
 let voiceInputRequestMs = 0;
 let sttSessionStartMs = 0;
@@ -462,6 +597,195 @@ function resolveMicLang() {
 
 function showMedia() {
   mediaVisible.value = true;
+  nextTick(() => {
+    void startIdleLoop();
+  });
+}
+
+function pauseIdleLoop() {
+  idleLoopGeneration += 1;
+  const el = idleLoopEl.value;
+  if (!el) return;
+  el.pause();
+  try {
+    el.removeAttribute("autoplay");
+  } catch {
+    /* ignore */
+  }
+}
+
+async function startIdleLoop() {
+  const el = idleLoopEl.value;
+  const path = IDLE_LOOP_VIDEO_SRC;
+  if (!el || !path) return;
+  if (webrtcStageActive.value || cachedVideoActive.value) return;
+  const generation = idleLoopGeneration;
+  const switching = !el.src || (!el.src.endsWith(path) && !el.src.includes(path));
+  if (switching) {
+    el.loop = true;
+    el.muted = true;
+    el.playsInline = true;
+    el.src = path;
+    el.load();
+    await new Promise((resolve, reject) => {
+      const timer = window.setTimeout(() => {
+        cleanup();
+        reject(new Error("idle loop load timeout"));
+      }, 15000);
+      const onReady = () => {
+        cleanup();
+        resolve();
+      };
+      const onErr = () => {
+        cleanup();
+        reject(new Error(`idle loop failed to load: ${path}`));
+      };
+      const cleanup = () => {
+        window.clearTimeout(timer);
+        el.removeEventListener("loadeddata", onReady);
+        el.removeEventListener("canplay", onReady);
+        el.removeEventListener("error", onErr);
+      };
+      if (el.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+        cleanup();
+        resolve();
+        return;
+      }
+      el.addEventListener("loadeddata", onReady, { once: true });
+      el.addEventListener("canplay", onReady, { once: true });
+      el.addEventListener("error", onErr, { once: true });
+    }).catch((e) => {
+      console.warn("[idle-loop]", e.message, { path, resolvedSrc: el.currentSrc || el.src });
+      throw e;
+    });
+  }
+  if (generation !== idleLoopGeneration || webrtcStageActive.value || cachedVideoActive.value) {
+    el.pause();
+    return;
+  }
+  try {
+    await el.play();
+    if (generation !== idleLoopGeneration || webrtcStageActive.value || cachedVideoActive.value) {
+      el.pause();
+      return;
+    }
+    console.info("[idle-loop] playing", path);
+  } catch (e) {
+    console.warn("[idle-loop] playback failed", path, e);
+  }
+}
+
+function activateWebRtcStage() {
+  pauseIdleLoop();
+  if (!webrtcStageActive.value) {
+    webrtcStageActive.value = true;
+  }
+}
+
+function clearAnswerPlaybackEndWatch() {
+  if (answerEndWatchId != null) {
+    window.clearInterval(answerEndWatchId);
+    answerEndWatchId = null;
+  }
+}
+
+function bindAnswerEndAudioEvents() {
+  const audio = audioEl.value;
+  if (!audio || answerEndAudioEventsBound) return;
+  answerEndAudioEventsBound = true;
+  const onEndSignal = () => {
+    if (!webrtcStageActive.value || answerEndWatchId == null) return;
+    finishAnswerPlaybackEndWatch("audio-pause-or-ended");
+  };
+  audio.addEventListener("pause", onEndSignal);
+  audio.addEventListener("ended", onEndSignal);
+}
+
+function finishAnswerPlaybackEndWatch(reason) {
+  clearAnswerPlaybackEndWatch();
+  if (!webrtcStageActive.value) return;
+  console.info("[webrtc-answer] end watch:", reason);
+  deactivateWebRtcStage();
+}
+
+function ensureAnswerPlaybackEndWatch(baselineSec) {
+  if (answerEndWatchId != null || !webrtcStageActive.value) return;
+  bindAnswerEndAudioEvents();
+  const baseline = Number(baselineSec);
+  if (!Number.isFinite(baseline) || baseline < 0) return;
+
+  let sawAnswerAudio = false;
+  let lastAudioT = -1;
+  let stallMs = 0;
+  const startedAt = performance.now();
+
+  answerEndWatchId = window.setInterval(() => {
+    if (!webrtcStageActive.value) {
+      clearAnswerPlaybackEndWatch();
+      return;
+    }
+    const now = performance.now();
+    if (now - startedAt > ANSWER_END_MAX_MS) {
+      finishAnswerPlaybackEndWatch("max-duration");
+      return;
+    }
+    if (!sawAnswerAudio && now - startedAt > ANSWER_END_NEVER_HEARD_MS) {
+      finishAnswerPlaybackEndWatch("no-answer-audio");
+      return;
+    }
+
+    const audio = audioEl.value;
+    if (!audio) return;
+
+    if (webRtcStrictAudioPlaying(baseline)) {
+      sawAnswerAudio = true;
+      stallMs = 0;
+      lastAudioT = audio.currentTime;
+      return;
+    }
+
+    if (!sawAnswerAudio) return;
+
+    if (audio.paused) {
+      finishAnswerPlaybackEndWatch("paused");
+      return;
+    }
+
+    const t = audio.currentTime;
+    if (lastAudioT >= 0 && Math.abs(t - lastAudioT) < 0.01) {
+      stallMs += 16;
+    } else {
+      stallMs = 0;
+      lastAudioT = t;
+    }
+    if (stallMs >= ANSWER_END_STALL_MS) {
+      finishAnswerPlaybackEndWatch("audio-stall");
+    }
+  }, 16);
+}
+
+function answerPlaybackBaseline() {
+  if (lipSyncPending && Number.isFinite(lipSyncPending.audioBaselineTime)) {
+    return lipSyncPending.audioBaselineTime;
+  }
+  if (webrtcTtfaPending && Number.isFinite(webrtcTtfaPending.baselineTime)) {
+    return webrtcTtfaPending.baselineTime;
+  }
+  const audio = audioEl.value;
+  return audio && Number.isFinite(audio.currentTime) ? audio.currentTime : 0;
+}
+
+function deactivateWebRtcStage() {
+  clearAnswerPlaybackEndWatch();
+  if (!webrtcStageActive.value) return;
+  webrtcStageActive.value = false;
+  if (!cachedVideoActive.value) {
+    nextTick(() => {
+      if (!webrtcStageActive.value && !cachedVideoActive.value) {
+        void startIdleLoop();
+      }
+    });
+  }
 }
 
 function apiOrigin() {
@@ -616,6 +940,7 @@ async function connect() {
 
 function disconnect() {
   stopMicInternal({ cancel: true });
+  clearAnswerPlaybackEndWatch();
   started.value = false;
   videoReady.value = false;
   if (orderPlacedHideTimer != null) {
@@ -638,6 +963,9 @@ function bindWebRtcTtfaAudioListener() {
   if (!audio || audio.dataset.ttfaBound === "1") return;
   audio.dataset.ttfaBound = "1";
   audio.addEventListener("playing", () => {
+    if (webrtcTtfaPending || lipSyncPending) {
+      activateWebRtcStage();
+    }
     if (!webrtcTtfaPending) return;
     onWebRtcAudioPlayingForTtfa();
   });
@@ -693,6 +1021,7 @@ function onWebRtcAudioPlayingForTtfa() {
     requestSentMs,
     baselineTime
   );
+  ensureAnswerPlaybackEndWatch(baselineTime);
 }
 
 function clearLipSyncPending() {
@@ -770,6 +1099,7 @@ function scheduleLipSyncLatency(
 ) {
   clearLipSyncPending();
   if (!turnId || !Number.isFinite(audioFirstMs)) return;
+  activateWebRtcStage();
   bindVideoPlaybackListener();
   const v = videoEl.value;
   const baseline =
@@ -806,26 +1136,35 @@ function scheduleLipSyncLatency(
     tryMarkStrictWebRtcAudio(now);
     tryMarkLipSyncAvatar(now);
     if (tryCompleteRealWebRtcPlayback(now)) {
-      onLipSyncVideoReady();
+      onLipSyncPlaybackStarted();
     }
   }, 16);
   lipSyncTimeout = window.setTimeout(() => {
     if (lipSyncPending?.realPlaybackAt != null) {
-      onLipSyncVideoReady();
+      onLipSyncPlaybackStarted();
     } else if (lipSyncPending?.lipSyncAvatarAt != null || lipSyncPending?.strictAudioAt != null) {
-      onLipSyncVideoReady();
+      onLipSyncPlaybackStarted();
     } else {
       clearLipSyncPending();
       clearMicTapTiming();
+      deactivateWebRtcStage();
     }
   }, 120000);
 }
 
-function onLipSyncVideoReady() {
+/** Lip-sync / first-audio metrics only — WebRTC stays up until answer playback ends. */
+function onLipSyncPlaybackStarted() {
   if (!lipSyncPending) return;
   const p = lipSyncPending;
+  const audioBaseline = p.audioBaselineTime;
   clearLipSyncPending();
   clearMicTapTiming();
+  ensureAnswerPlaybackEndWatch(audioBaseline);
+  onLipSyncVideoReady(p);
+}
+
+function onLipSyncVideoReady(p) {
+  if (!p) return;
   const {
     turnId,
     audioFirstMs,
@@ -893,6 +1232,9 @@ function attachVoiceTurnTtfaTurnId(turnId) {
   if (!turnId || !webrtcTtfaPending) return;
   if (webrtcTtfaPending.turnId === 0) {
     webrtcTtfaPending.turnId = turnId;
+    if (webRtcStrictAudioPlaying(webrtcTtfaPending.baselineTime)) {
+      onWebRtcAudioPlayingForTtfa();
+    }
   }
 }
 
@@ -913,6 +1255,9 @@ function _startWebRtcTtfaPoll(turnId, requestSentMs) {
   webrtcTtfaTimeout = window.setTimeout(() => {
     clearWebRtcTtfaPending();
     clearMicTapTiming();
+    if (!answerEndWatchId) {
+      deactivateWebRtcStage();
+    }
   }, 120000);
 }
 
@@ -1020,6 +1365,7 @@ function postHuman(text) {
   if (!t) return;
   const sid = String(sessionId.value || "").trim();
   if (!sid) return;
+  activateWebRtcStage();
   void fetch(signalingUrl("/human"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1388,6 +1734,7 @@ async function runVoicePipeline(userText, stt = null) {
   webrtcError.value = "";
   clearWebRtcTtfaPending();
   pendingVoiceAnalytics = null;
+  activateWebRtcStage();
   const requestSentMs = performance.now();
   beginVoiceTurnTtfaWatch(requestSentMs);
   const sid = String(sessionId.value || "").trim();
@@ -1423,16 +1770,53 @@ async function runVoicePipeline(userText, stt = null) {
     const data = await res.json();
     const voiceTurnCompleteMs = performance.now();
     const clientVoiceTurnMs = Math.max(0, voiceTurnCompleteMs - requestSentMs);
+
+    if (data.video_qa_cached?.video_url) {
+      deactivateWebRtcStage();
+      const cached = data.video_qa_cached;
+      const answer = String(cached.answer || data.answer || "").trim();
+      clearCaptionHideTimer();
+      finalTranscript.value = "";
+      interimTranscript.value = "";
+      voiceThinking.value = false;
+      clearWebRtcTtfaPending();
+      pendingVoiceAnalytics = null;
+      try {
+        await playCachedVideoQa(cached);
+        await nextTick();
+        applyShowImageFromVoiceTurn(data);
+      } catch {
+        clearFeaturedMenuImage();
+        if (answer) {
+          const sidCached = String(sessionId.value || "").trim();
+          if (sidCached && sidCached !== "0") {
+            postHuman(stripReceiptForSpeech(answer));
+          }
+        }
+      }
+      let receipt = data.receipt && typeof data.receipt === "object" ? data.receipt : null;
+      if (!receipt?.items?.length && answer) {
+        receipt = tryParseReceiptFromAnswer(answer);
+      }
+      if (receipt?.items?.length) {
+        liveBill.value = { items: receipt.items };
+      }
+      return;
+    }
+
     const answer = String(data.answer || "").trim();
+    applyShowImageFromVoiceTurn(data);
     let speakText = String(data.speak_text ?? "").trim();
     if (!speakText) {
       speakText = stripReceiptForSpeech(answer);
     }
     const spoken = speakText ? stripReceiptForSpeech(speakText) : "";
     const humanDispatched = Boolean(data.human_dispatched);
+    const streamHuman = Boolean(data.rag?.stream_human);
+    const expectsWebRtcPlayback = Boolean(spoken) || humanDispatched || streamHuman;
     console.info("[voice-turn] complete — audio comes from LiveTalking /human + WebRTC, not this response", {
       human_dispatched: humanDispatched,
-      stream_human: Boolean(data.rag?.stream_human),
+      stream_human: streamHuman,
       rag_first_sentence_ms: data.rag?.rag_first_sentence_ms,
       human_sentence_count: data.rag?.human_sentence_count,
       speak_chars: spoken.length,
@@ -1492,20 +1876,25 @@ async function runVoicePipeline(userText, stt = null) {
     } else if (receipt?.items?.length) {
       liveBill.value = { items: receipt.items };
     }
-    applyShowImageFromVoiceTurn(data);
     const hasShowImage = SHOW_IMAGE_ENABLED && featuredMenuImages.value.length > 0;
     if (!speakText && !receipt?.items?.length && orderNum == null && !hasShowImage) {
       throw new Error("Model returned an empty reply.");
     }
-    if (!spoken) {
+    if (!expectsWebRtcPlayback) {
       clearWebRtcTtfaPending();
       pendingVoiceAnalytics = null;
       clearMicTapTiming();
+      deactivateWebRtcStage();
+    } else {
+      activateWebRtcStage();
+      ensureAnswerPlaybackEndWatch(answerPlaybackBaseline());
     }
   } catch (e) {
     clearWebRtcTtfaPending();
     pendingVoiceAnalytics = null;
     clearMicTapTiming();
+    clearAnswerPlaybackEndWatch();
+    deactivateWebRtcStage();
     webrtcError.value = e instanceof Error ? e.message : String(e);
   } finally {
     voiceThinking.value = false;
@@ -1875,6 +2264,92 @@ function showCaptionThenHide(text) {
   }, CAPTION_HIDE_MS);
 }
 
+function stopCachedVideoQa() {
+  cachedVideoActive.value = false;
+  const el = cachedVideoEl.value;
+  if (!el) return;
+  el.pause();
+  el.removeAttribute("src");
+  el.load();
+  if (!webrtcStageActive.value) {
+    void startIdleLoop();
+  }
+}
+
+function waitCachedVideoReady(el, timeoutMs = 12000) {
+  return new Promise((resolve, reject) => {
+    if (el.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+      resolve();
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      cleanup();
+      reject(new Error("cached video load timeout"));
+    }, timeoutMs);
+    const onReady = () => {
+      cleanup();
+      resolve();
+    };
+    const onErr = () => {
+      cleanup();
+      reject(new Error("cached video failed to load"));
+    };
+    const cleanup = () => {
+      window.clearTimeout(timer);
+      el.removeEventListener("loadeddata", onReady);
+      el.removeEventListener("canplay", onReady);
+      el.removeEventListener("error", onErr);
+    };
+    el.addEventListener("loadeddata", onReady, { once: true });
+    el.addEventListener("canplay", onReady, { once: true });
+    el.addEventListener("error", onErr, { once: true });
+  });
+}
+
+async function playCachedVideoQa(hit) {
+  const path = hit?.video_url || (hit?.id ? `/api/video-qa/${hit.id}/video` : "");
+  if (!path) return;
+  const url = signalingUrl(path);
+  const el = cachedVideoEl.value;
+  if (!el) return;
+
+  pauseIdleLoop();
+  const switching = !el.src || (el.src !== url && !el.src.endsWith(path));
+  if (switching) {
+    el.pause();
+    el.src = url;
+    el.load();
+  }
+  cachedVideoActive.value = true;
+  el.currentTime = 0;
+
+  await waitCachedVideoReady(el);
+
+  const tryPlay = async (muted) => {
+    el.muted = muted;
+    await el.play();
+  };
+
+  try {
+    await tryPlay(false);
+  } catch (e1) {
+    try {
+      await tryPlay(true);
+      el.muted = false;
+    } catch (e2) {
+      console.warn("[video-qa] cached playback failed", e1, e2);
+      stopCachedVideoQa();
+      throw e2;
+    }
+  }
+
+  console.info("[video-qa] playing cached clip behind featured image", {
+    id: hit?.id,
+    question_score: hit?.question_score,
+    answer_score: hit?.answer_score,
+  });
+}
+
 const CAPTION_STATUS_PHRASES = new Set([
   "listening…",
   "listening...",
@@ -1956,6 +2431,7 @@ function formatBillMoney(n) {
 
 onMounted(() => {
   void connect();
+  showMedia();
 });
 
 onUnmounted(() => {
@@ -1975,6 +2451,7 @@ onUnmounted(() => {
     <nav class="panel-nav" aria-label="App pages">
       <router-link class="panel-nav__link" to="/avatar">Studio</router-link>
       <router-link class="panel-nav__link" to="/analytics">Analytics</router-link>
+      <router-link class="panel-nav__link" to="/video-rag">Video RAG</router-link>
     </nav>
 
     <div v-if="!mediaVisible" class="lang-picker">
@@ -1988,10 +2465,14 @@ onUnmounted(() => {
     <div class="media-stack">
       <div
         class="video-wrap"
-        :class="{ 'video-wrap--featured-image': SHOW_IMAGE_ENABLED && featuredMenuImages.length > 0 }"
+        :class="{
+          'video-wrap--featured-image': SHOW_IMAGE_ENABLED && featuredMenuImages.length > 0,
+          'video-wrap--cached-playing': cachedVideoActive,
+          'video-wrap--webrtc-answering': webrtcStageActive,
+        }"
       >
         <div
-          v-if="!videoReady && !webrtcError"
+          v-if="webrtcStageActive && !videoReady && !webrtcError"
           class="video-loading"
           role="status"
           aria-live="polite"
@@ -2035,7 +2516,22 @@ onUnmounted(() => {
           </div>
         </div>
 
-        <video ref="videoEl" class="video" autoplay playsinline />
+        <video
+          ref="idleLoopEl"
+          class="video video--idle-loop"
+          :class="{ 'video--idle-hidden': webrtcStageActive || cachedVideoActive }"
+          playsinline
+          muted
+          loop
+        />
+        <video ref="videoEl" class="video video--webrtc" autoplay playsinline />
+        <video
+          ref="cachedVideoEl"
+          class="video video--cached"
+          :class="{ 'video--cached-active': cachedVideoActive }"
+          playsinline
+          @ended="stopCachedVideoQa"
+        />
         <div class="video-rail video-rail--left" aria-hidden="true" />
         <div class="video-rail video-rail--right" aria-hidden="true" />
         <audio ref="audioEl" class="sr-only" autoplay />
@@ -2079,7 +2575,10 @@ onUnmounted(() => {
         <div
           v-if="SHOW_IMAGE_ENABLED && featuredMenuImages.length"
           class="menu-featured"
-          :class="{ 'menu-featured--multi': featuredMenuImages.length > 1 }"
+          :class="{
+            'menu-featured--multi': featuredMenuImages.length > 1,
+            'menu-featured--over-cached-video': cachedVideoActive,
+          }"
           role="group"
           aria-label="Featured menu items"
         >
@@ -2339,11 +2838,54 @@ onUnmounted(() => {
   display: block;
   position: absolute;
   inset: 0;
-  z-index: 0;
   width: 100%;
   height: 100%;
   object-fit: cover;
   object-position: center center;
+}
+
+/* Default stage: looped idle MP4 from public/ */
+.video--idle-loop {
+  z-index: 0;
+  opacity: 1;
+  visibility: visible;
+}
+
+.video--idle-loop.video--idle-hidden {
+  opacity: 0 !important;
+  visibility: hidden !important;
+  pointer-events: none;
+}
+
+.video--webrtc {
+  z-index: 1;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.2s ease;
+}
+
+.video-wrap--webrtc-answering .video--webrtc {
+  opacity: 1;
+  visibility: visible;
+}
+
+.video-wrap--webrtc-answering .video--idle-loop,
+.video-wrap--cached-playing .video--idle-loop,
+.video-wrap--cached-playing .video--webrtc {
+  opacity: 0;
+  visibility: hidden;
+}
+
+.video--cached {
+  z-index: 2;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s ease;
+}
+
+.video--cached-active {
+  opacity: 1;
+  pointer-events: none;
 }
 
 .video-rail {
@@ -2595,7 +3137,7 @@ onUnmounted(() => {
   right: clamp(1.25rem, 5.5cqw, 8rem);
   top: clamp(6rem, 18cqh, 14rem);
   bottom: max(3.5rem, 9cqh, env(safe-area-inset-bottom));
-  z-index: 4;
+  z-index: 10;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -2665,12 +3207,22 @@ onUnmounted(() => {
   object-fit: contain;
   object-position: center center;
   background: transparent;
-  /* PNGs exported on black: knock out dark backdrop, show avatar through */
+  /* PNGs on black: knock out backdrop, avatar shows through (hologram look) */
   mix-blend-mode: screen;
   transform: translateZ(24px);
   transform-style: preserve-3d;
   filter: none;
   box-shadow: none;
+}
+
+/* Full-screen cached clip is bright — screen blend washes out; use normal + shadow */
+.menu-featured--over-cached-video {
+  z-index: 12;
+}
+
+.menu-featured--over-cached-video .menu-featured__img {
+  mix-blend-mode: normal;
+  filter: drop-shadow(0 12px 32px rgba(0, 0, 0, 0.55));
 }
 
 .menu-featured__caption {
