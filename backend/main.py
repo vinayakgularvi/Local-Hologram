@@ -22,7 +22,7 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, RedirectResponse, Response, StreamingResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import Request as StarletteRequest
@@ -5219,7 +5219,7 @@ async def video_qa_bulk_delete_endpoint(body: VideoQaBulkDeleteBody):
 
 @app.get("/api/video-qa/{item_id}/video")
 async def video_qa_video_endpoint(item_id: str, request: StarletteRequest):
-    """Stream the video file for an entry (Garage S3 or local fallback)."""
+    """Redirect to CDN when configured; otherwise stream from Garage S3 (no local disk)."""
     range_header = request.headers.get("range")
     try:
         opened = await asyncio.to_thread(video_qa_open_video, item_id, range_header=range_header)
@@ -5228,38 +5228,16 @@ async def video_qa_video_endpoint(item_id: str, request: StarletteRequest):
     if not opened:
         raise HTTPException(status_code=404, detail="video not found")
 
+    if opened["source"] == "cdn":
+        redirect_url = str(opened.get("redirect_url") or "").strip()
+        if not redirect_url:
+            raise HTTPException(status_code=404, detail="CDN URL not available")
+        return RedirectResponse(url=redirect_url, status_code=307)
+
     content_type = opened["content_type"]
     total = int(opened["size_bytes"])
     start = int(opened["start"])
     end = int(opened["end"])
-    filename = str(opened.get("filename") or f"{item_id}.mp4")
-
-    if opened["source"] == "local":
-        path = opened["path"]
-        headers = {"Accept-Ranges": "bytes"}
-        if range_header:
-            length = end - start + 1
-
-            def _local_iter():
-                with open(path, "rb") as fh:
-                    fh.seek(start)
-                    remaining = length
-                    while remaining > 0:
-                        chunk = fh.read(min(1024 * 1024, remaining))
-                        if not chunk:
-                            break
-                        remaining -= len(chunk)
-                        yield chunk
-
-            headers["Content-Range"] = f"bytes {start}-{end}/{total}"
-            headers["Content-Length"] = str(length)
-            return StreamingResponse(
-                _local_iter(),
-                status_code=206,
-                media_type=content_type,
-                headers=headers,
-            )
-        return FileResponse(path, media_type=content_type, filename=filename, headers=headers)
 
     length = end - start + 1
     headers = {

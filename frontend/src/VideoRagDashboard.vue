@@ -276,7 +276,7 @@ function onVideoError() {
     return;
   }
   videoError.value =
-    "Unable to load video. Check CDN/VOD status, Garage S3 credentials, and that the file exists.";
+    "Unable to load video from CDN. Check VOD status and that the file is published on the stream CDN.";
 }
 
 function fmtBytes(n) {

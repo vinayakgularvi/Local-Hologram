@@ -17,12 +17,12 @@ from chunk_pipeline import (
 )
 from transcribe_client import transcribe_bytes, transcribe_configured
 from video_qa_garage import garage_object_key, is_configured as garage_is_configured, read_object_bytes
+from video_qa_urls import cdn_configured, fetch_video_bytes
 from video_qa_store import (
     clear_process_error,
     complete_item_processing,
     get_item,
     record_process_error,
-    video_path,
     validate_item_id,
 )
 
@@ -59,10 +59,14 @@ def _download_video_bytes(item: dict[str, Any]) -> tuple[bytes, str]:
             return read_object_bytes(obj_key)
         except Exception:
             pass
-    path = video_path(item_id)
-    if path.is_file():
-        return path.read_bytes(), str(item.get("content_type") or "video/mp4")
-    raise FileNotFoundError(f"video not found for item {item_id}")
+    if cdn_configured():
+        try:
+            return fetch_video_bytes(item)
+        except Exception:
+            pass
+    raise FileNotFoundError(
+        f"video not found for item {item_id} (Garage object missing and CDN fetch failed)"
+    )
 
 
 def _ffmpeg_error_message(exc: BaseException) -> str:

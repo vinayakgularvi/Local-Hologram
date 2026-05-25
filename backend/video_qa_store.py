@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from transcribe_client import transcribe_configured
-from video_qa_urls import cdn_base, cdn_configured, with_public_video_url
+from video_qa_urls import cdn_base, cdn_configured, public_video_url, with_public_video_url
 from video_qa_vod import public_status as vod_public_status
 from video_qa_garage import (
     delete_item_videos as garage_delete_item_videos,
@@ -32,7 +32,6 @@ from video_qa_qdrant import (
 )
 
 _DATA_DIR = Path(__file__).resolve().parent / "data"
-_VIDEOS_DIR = _DATA_DIR / "videos"
 _DB_PATH = _DATA_DIR / "video_qa.db"
 _lock = threading.Lock()
 
@@ -47,7 +46,6 @@ def _now_ts() -> int:
 
 def _connect() -> sqlite3.Connection:
     _DATA_DIR.mkdir(parents=True, exist_ok=True)
-    _VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
     cx = sqlite3.connect(str(_DB_PATH), check_same_thread=False)
     cx.row_factory = sqlite3.Row
     return cx
@@ -104,9 +102,10 @@ def get_status() -> dict[str, Any]:
         "qdrant": qdrant_public_status(),
         "garage": garage_public_status(),
         "transcribe_configured": transcribe_configured(),
-        "local_video_dir": str(_VIDEOS_DIR.resolve()),
+        "video_playback": "cdn" if cdn_configured() else ("garage" if garage_is_configured() else "none"),
         "video_cdn_base": cdn_base(),
         "video_cdn_configured": cdn_configured(),
+        "local_video_storage": False,
         "vod": vod_public_status(),
     }
 
@@ -116,10 +115,6 @@ def validate_item_id(item_id: str) -> str:
     if not item_id or not _ITEM_ID_RE.match(item_id):
         raise ValueError("item_id must be 1–128 chars: letters, digits, ., _, -")
     return item_id
-
-
-def video_path(item_id: str) -> Path:
-    return _VIDEOS_DIR / f"{item_id}.mp4"
 
 
 def _row_to_item(row: sqlite3.Row) -> dict[str, Any]:
@@ -154,9 +149,11 @@ def _sync_qdrant(item: dict[str, Any], *, required: bool = False) -> None:
 
 
 def _store_video(*, item_id: str, obj_key: str, data: bytes, content_type: str) -> None:
-    if garage_is_configured():
-        garage_upload(key=obj_key, data=data, content_type=content_type)
-    video_path(item_id).write_bytes(data)
+    if not garage_is_configured():
+        raise RuntimeError(
+            "Garage S3 is required for Video Q&A uploads (local backend/data/videos storage is disabled)"
+        )
+    garage_upload(key=obj_key, data=data, content_type=content_type)
 
 
 def _delete_video_files(item: dict[str, Any]) -> list[str]:
@@ -168,8 +165,6 @@ def _delete_video_files(item: dict[str, Any]) -> list[str]:
             item_id=item_id,
             garage_object_key_value=obj_key,
         )
-    if item_id:
-        video_path(item_id).unlink(missing_ok=True)
     return deleted_keys
 
 
@@ -206,6 +201,15 @@ def open_video(
     if not item:
         return None
 
+    cdn_url = public_video_url(item)
+    if cdn_url.startswith(("http://", "https://")):
+        return {
+            "source": "cdn",
+            "redirect_url": cdn_url,
+            "content_type": str(item.get("content_type") or "video/mp4"),
+            "filename": item.get("filename") or f"{item_id}.mp4",
+        }
+
     obj_key = str(item.get("garage_object_key") or garage_object_key(item_id))
     content_type = str(item.get("content_type") or "video/mp4")
 
@@ -224,20 +228,6 @@ def open_video(
                 "stream": stream,
                 "filename": item.get("filename") or f"{item_id}.mp4",
             }
-
-    path = video_path(item_id)
-    if path.is_file():
-        total = path.stat().st_size
-        start, end = parse_range_header(range_header, total)
-        return {
-            "source": "local",
-            "content_type": content_type,
-            "size_bytes": total,
-            "start": start,
-            "end": end,
-            "path": path,
-            "filename": path.name,
-        }
     return None
 
 
@@ -654,7 +644,6 @@ def delete_item(item_id: str) -> dict[str, Any]:
                 ).fetchone()
                 if not row:
                     return {"deleted": False, "id": item_id}
-        video_path(item_id).unlink(missing_ok=True)
         return {"deleted": False, "id": item_id}
 
     garage_keys_deleted: list[str] = []
