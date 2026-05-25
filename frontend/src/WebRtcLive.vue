@@ -15,7 +15,7 @@ const cachedVideoEl = ref(null);
 const cachedVideoActive = ref(false);
 /** Idle hologram loop (public MP4); hidden while WebRTC or cached Q&A plays. */
 const webrtcStageActive = ref(false);
-/** Bumps when idle loop must stop (cancels in-flight startIdleLoop play()). */
+/** Bumps when an in-flight startIdleLoop() should abort (e.g. new src load). */
 let idleLoopGeneration = 0;
 const audioEl = ref(null);
 
@@ -602,23 +602,13 @@ function showMedia() {
   });
 }
 
-function pauseIdleLoop() {
-  idleLoopGeneration += 1;
-  const el = idleLoopEl.value;
-  if (!el) return;
-  el.pause();
-  try {
-    el.removeAttribute("autoplay");
-  } catch {
-    /* ignore */
-  }
-}
+/** No-op: idle /Videofile.mp4 stays playing under WebRTC and Video RAG overlays. */
+function pauseIdleLoop() {}
 
 async function startIdleLoop() {
   const el = idleLoopEl.value;
   const path = IDLE_LOOP_VIDEO_SRC;
   if (!el || !path) return;
-  if (webrtcStageActive.value || cachedVideoActive.value) return;
   const generation = idleLoopGeneration;
   const switching = !el.src || (!el.src.endsWith(path) && !el.src.includes(path));
   if (switching) {
@@ -659,17 +649,15 @@ async function startIdleLoop() {
       throw e;
     });
   }
-  if (generation !== idleLoopGeneration || webrtcStageActive.value || cachedVideoActive.value) {
-    el.pause();
+  if (generation !== idleLoopGeneration) {
     return;
   }
   try {
     await el.play();
-    if (generation !== idleLoopGeneration || webrtcStageActive.value || cachedVideoActive.value) {
-      el.pause();
+    if (generation !== idleLoopGeneration) {
       return;
     }
-    console.info("[idle-loop] playing", path);
+    console.info("[idle-loop] playing (base layer)", path);
   } catch (e) {
     console.warn("[idle-loop] playback failed", path, e);
   }
@@ -2573,7 +2561,7 @@ onUnmounted(() => {
         <video
           ref="idleLoopEl"
           class="video video--idle-loop"
-          :class="{ 'video--idle-hidden': webrtcStageActive || cachedVideoActive }"
+          autoplay
           playsinline
           muted
           loop
@@ -2898,16 +2886,11 @@ onUnmounted(() => {
   object-position: center center;
 }
 
-/* Default stage: looped idle MP4 from public/ */
+/* Base layer: /Videofile.mp4 always visible; WebRTC + Video RAG stack on top */
 .video--idle-loop {
   z-index: 0;
   opacity: 1;
   visibility: visible;
-}
-
-.video--idle-loop.video--idle-hidden {
-  opacity: 0 !important;
-  visibility: hidden !important;
   pointer-events: none;
 }
 
@@ -2915,6 +2898,7 @@ onUnmounted(() => {
   z-index: 1;
   opacity: 0;
   visibility: hidden;
+  pointer-events: none;
   transition: opacity 0.2s ease;
 }
 
@@ -2923,22 +2907,17 @@ onUnmounted(() => {
   visibility: visible;
 }
 
-.video-wrap--webrtc-answering .video--idle-loop,
-.video-wrap--cached-playing .video--idle-loop,
-.video-wrap--cached-playing .video--webrtc {
-  opacity: 0;
-  visibility: hidden;
-}
-
 .video--cached {
   z-index: 2;
   opacity: 0;
+  visibility: hidden;
   pointer-events: none;
   transition: opacity 0.2s ease;
 }
 
 .video--cached-active {
   opacity: 1;
+  visibility: visible;
   pointer-events: none;
 }
 
