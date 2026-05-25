@@ -6,6 +6,7 @@ import math
 import os
 from typing import Any
 
+from feature_flags import video_rag_enabled
 from hologram_trace import trace
 from video_qa_qdrant import (
     _embed_text,
@@ -26,7 +27,11 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def is_voice_match_enabled() -> bool:
-    return _env_bool("VIDEO_QA_VOICE_MATCH", default=True) and qdrant_configured()
+    return (
+        video_rag_enabled()
+        and _env_bool("VIDEO_QA_VOICE_MATCH", default=True)
+        and qdrant_configured()
+    )
 
 
 def match_threshold() -> float:
@@ -230,6 +235,7 @@ def find_high_confidence_match(user_query: str) -> dict[str, Any] | None:
 
 def public_config() -> dict[str, Any]:
     return {
+        "video_rag_enabled": video_rag_enabled(),
         "enabled": is_voice_match_enabled(),
         "threshold": match_threshold(),
         "video_cdn_base": cdn_base(),

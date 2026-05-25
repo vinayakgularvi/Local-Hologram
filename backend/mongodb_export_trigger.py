@@ -9,9 +9,13 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
+from feature_flags import (
+    mongodb_export_trigger_enabled as _export_trigger_flag,
+    offline_exports_enabled,
+    video_rag_enabled,
+)
 from hologram_trace import trace
 from mongodb_analytics import get_collection as mongo_get_collection, is_enabled as mongo_enabled
-from offline_exports_client import is_enabled as offline_exports_enabled
 from video_qa_exports import schedule_poll, submit_export_async
 from video_qa_match import find_existing_qdrant_entry
 from video_qa_qdrant import is_configured as qdrant_configured
@@ -27,11 +31,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def is_trigger_enabled() -> bool:
-    return (
-        mongo_enabled()
-        and offline_exports_enabled()
-        and _env_bool("MONGODB_EXPORT_TRIGGER", default=False)
-    )
+    return mongo_enabled() and offline_exports_enabled() and _export_trigger_flag()
 
 
 def change_stream_enabled() -> bool:
@@ -180,11 +180,13 @@ def process_document_export(doc: dict[str, Any], *, collection_name: str | None 
     coll = mongo_get_collection(collection_name or trigger_collection_name())
     doc_id = doc["_id"]
 
-    existing = find_existing_qdrant_entry(
-        question=question,
-        answer=text,
-        item_id=_qdrant_item_id_from_doc(doc),
-    )
+    existing = None
+    if video_rag_enabled():
+        existing = find_existing_qdrant_entry(
+            question=question,
+            answer=text,
+            item_id=_qdrant_item_id_from_doc(doc),
+        )
     if existing:
         qid = str(existing.get("id") or "")
         reason = str(existing.get("match_reason") or "qa_exact")

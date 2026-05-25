@@ -136,6 +136,7 @@ from video_qa_exports import (
     schedule_poll,
     submit_export_async,
 )
+from feature_flags import public_feature_flags, video_rag_enabled
 from offline_exports_client import is_enabled as offline_exports_enabled
 from video_qa_match import find_high_confidence_match, public_config as video_qa_match_config
 from video_qa_vod import batch_vod_status, fetch_vod_status
@@ -1828,6 +1829,7 @@ async def webrtc_proxy_status():
         if TRANSCRIBE_API_URL and TRANSCRIBE_MODE == "chunked"
         else None,
         "video_qa_match": video_qa_match_config(),
+        "features": public_feature_flags(),
     }
 
 
@@ -2618,7 +2620,9 @@ async def voice_turn(body: VoiceTurnBody):
         f"voice-turn: START sessionid={sid or '(none)'} text={user_text[:100]!r}"
     )
 
-    video_hit = await asyncio.to_thread(find_high_confidence_match, user_text)
+    video_hit = None
+    if video_rag_enabled():
+        video_hit = await asyncio.to_thread(find_high_confidence_match, user_text)
     if video_hit:
         hologram_trace(
             f"voice-turn: CACHED VIDEO path id={video_hit.get('id')} "

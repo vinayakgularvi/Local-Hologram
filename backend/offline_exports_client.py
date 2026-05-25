@@ -7,16 +7,11 @@ from typing import Any
 
 import httpx
 
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    raw = (os.environ.get(name) or "").strip().lower()
-    if not raw:
-        return default
-    return raw in ("1", "true", "yes", "on")
+from feature_flags import offline_exports_enabled
 
 
 def is_enabled() -> bool:
-    return _env_bool("OFFLINE_EXPORTS", default=False) and bool(base_url())
+    return offline_exports_enabled() and bool(base_url())
 
 
 def base_url() -> str:
