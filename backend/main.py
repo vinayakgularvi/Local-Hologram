@@ -263,13 +263,31 @@ VOICE_DISPATCH_HUMAN = os.environ.get("VOICE_DISPATCH_HUMAN", "1").strip().lower
     "true",
     "yes",
 )
-# While reading RAG_GENERATE_STREAM_URL, dispatch each completed sentence to /human (lower TTS latency).
+# While reading RAG_GENERATE_STREAM_URL, dispatch chunks to /human (lower TTS latency).
 VOICE_STREAM_HUMAN = os.environ.get("VOICE_STREAM_HUMAN", "1").strip().lower() in (
     "1",
     "true",
     "yes",
 )
-VOICE_STREAM_HUMAN_MIN_CHARS = max(2, _env_first_int("VOICE_STREAM_HUMAN_MIN_CHARS", default=4))
+_raw_stream_unit = (os.environ.get("VOICE_STREAM_HUMAN_UNIT") or "sentence").strip().lower()
+VOICE_STREAM_HUMAN_UNIT = _raw_stream_unit if _raw_stream_unit in ("sentence", "word") else "sentence"
+VOICE_STREAM_HUMAN_WORDS_PER_CHUNK = max(
+    1,
+    min(_env_first_int("VOICE_STREAM_HUMAN_WORDS_PER_CHUNK", default=1), 32),
+)
+VOICE_STREAM_HUMAN_MIN_CHARS = max(
+    1 if VOICE_STREAM_HUMAN_UNIT == "word" else 2,
+    _env_first_int(
+        "VOICE_STREAM_HUMAN_MIN_CHARS",
+        default=1 if VOICE_STREAM_HUMAN_UNIT == "word" else 4,
+    ),
+)
+
+
+def _voice_stream_human_unit_label() -> str:
+    if VOICE_STREAM_HUMAN_UNIT == "word" and VOICE_STREAM_HUMAN_WORDS_PER_CHUNK > 1:
+        return f"word×{VOICE_STREAM_HUMAN_WORDS_PER_CHUNK}"
+    return VOICE_STREAM_HUMAN_UNIT
 HUMAN_DISPATCH_TIMEOUT_SEC = max(5.0, float(_env_first_int("HUMAN_DISPATCH_TIMEOUT_SEC", default=90)))
 TRANSCRIBE_API_URL = os.environ.get(
     "TRANSCRIBE_API_URL",
@@ -1830,6 +1848,10 @@ async def webrtc_proxy_status():
         else None,
         "video_qa_match": video_qa_match_config(),
         "features": public_feature_flags(),
+        "voice_stream_human_unit": VOICE_STREAM_HUMAN_UNIT,
+        "voice_stream_human_words_per_chunk": VOICE_STREAM_HUMAN_WORDS_PER_CHUNK,
+        "voice_stream_human_unit_label": _voice_stream_human_unit_label(),
+        "voice_stream_human_min_chars": VOICE_STREAM_HUMAN_MIN_CHARS,
     }
 
 
@@ -2446,6 +2468,34 @@ def _pop_complete_sentences(buf: str) -> tuple[list[str], str]:
     return sentences, rest
 
 
+def _pop_complete_words(buf: str) -> tuple[list[str], str]:
+    """Split speakable prefix into complete whitespace-delimited words; trailing partial word stays."""
+    if not buf.strip():
+        return [], buf
+    if buf[-1].isspace():
+        return [w for w in buf.split() if w], ""
+    m = re.search(r"(.*?)(\s+)(\S+)\Z", buf, re.DOTALL)
+    if not m:
+        return [], buf
+    words = [w for w in m.group(1).split() if w]
+    return words, m.group(3)
+
+
+def _pop_stream_chunks(buf: str) -> tuple[list[str], str]:
+    if VOICE_STREAM_HUMAN_UNIT == "word":
+        words, remainder = _pop_complete_words(buf)
+        n = VOICE_STREAM_HUMAN_WORDS_PER_CHUNK
+        if n <= 1:
+            return words, remainder
+        chunks: list[str] = []
+        for i in range(0, len(words), n):
+            group = words[i : i + n]
+            if group:
+                chunks.append(" ".join(group))
+        return chunks, remainder
+    return _pop_complete_sentences(buf)
+
+
 def _prepare_stream_sentence_for_human(
     sentence: str, show_image: dict[str, Any] | None
 ) -> str:
@@ -2457,12 +2507,16 @@ def _prepare_stream_sentence_for_human(
 
 
 class _StreamHumanDispatcher:
-    """Dispatch completed sentences to LiveTalking while the LLM stream is still open."""
+    """Dispatch RAG stream chunks (sentence or word) to LiveTalking while the LLM stream is open."""
 
     def __init__(self, sessionid: str, stream_start: float) -> None:
         self.sessionid = sessionid
         self.stream_start = stream_start
         self.buffer = ""
+        self.chunk_unit = _voice_stream_human_unit_label()
+        self.words_per_chunk = (
+            VOICE_STREAM_HUMAN_WORDS_PER_CHUNK if VOICE_STREAM_HUMAN_UNIT == "word" else 1
+        )
         self.sentence_count = 0
         self.first_sentence_ms: float | None = None
         self.first_dispatch_http_ms: float | None = None
@@ -2476,26 +2530,26 @@ class _StreamHumanDispatcher:
         if not piece:
             return
         self.buffer += piece
-        await self._flush_sentences(final=False)
+        await self._flush_chunks(final=False)
 
     async def finish(self) -> None:
-        await self._flush_sentences(final=True)
+        await self._flush_chunks(final=True)
         await _LiveTalkingHumanQueue.for_session(self.sessionid).drain()
 
-    async def _flush_sentences(self, *, final: bool) -> None:
+    async def _flush_chunks(self, *, final: bool) -> None:
         prefix = _speakable_stream_prefix(self.buffer)
         safe_tail = self.buffer[len(prefix) :]
-        sentences, remainder = _pop_complete_sentences(prefix)
+        chunks, remainder = _pop_stream_chunks(prefix)
         self.buffer = remainder + safe_tail
-        for sentence in sentences:
-            await self._dispatch_one(sentence)
+        for chunk in chunks:
+            await self._dispatch_one(chunk)
         if final and self.buffer.strip():
             tail = self.buffer.strip()
             self.buffer = ""
             await self._dispatch_one(tail)
 
-    async def _dispatch_one(self, raw_sentence: str) -> None:
-        speak = _prepare_stream_sentence_for_human(raw_sentence, self.show_image)
+    async def _dispatch_one(self, raw_chunk: str) -> None:
+        speak = _prepare_stream_sentence_for_human(raw_chunk, self.show_image)
         if len(speak) < VOICE_STREAM_HUMAN_MIN_CHARS:
             return
         interrupt = self.sentence_count == 0
@@ -2503,7 +2557,8 @@ class _StreamHumanDispatcher:
             self.first_sentence_ms = (time.perf_counter() - self.stream_start) * 1000.0
         self.sentence_count += 1
         logger.info(
-            "voice-turn stream /human sentence #%d interrupt=%s chars=%d preview=%r",
+            "voice-turn stream /human %s #%d interrupt=%s chars=%d preview=%r",
+            self.chunk_unit,
             self.sentence_count,
             interrupt,
             len(speak),
@@ -3311,8 +3366,16 @@ def _rag_stream_voice_result(
     if human_dispatcher:
         meta = {
             "stream_human": True,
+            "stream_human_unit": human_dispatcher.chunk_unit,
+            "stream_human_words_per_chunk": human_dispatcher.words_per_chunk,
             "human_sentence_count": human_dispatcher.sentence_count,
+            "human_chunk_count": human_dispatcher.sentence_count,
             "rag_first_sentence_ms": (
+                round(human_dispatcher.first_sentence_ms, 1)
+                if human_dispatcher.first_sentence_ms is not None
+                else None
+            ),
+            "rag_first_chunk_ms": (
                 round(human_dispatcher.first_sentence_ms, 1)
                 if human_dispatcher.first_sentence_ms is not None
                 else None

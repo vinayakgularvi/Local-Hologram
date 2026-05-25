@@ -1847,8 +1847,10 @@ async function runVoicePipeline(userText, stt = null) {
     console.info("[voice-turn] complete — audio comes from LiveTalking /human + WebRTC, not this response", {
       human_dispatched: humanDispatched,
       stream_human: streamHuman,
-      rag_first_sentence_ms: data.rag?.rag_first_sentence_ms,
-      human_sentence_count: data.rag?.human_sentence_count,
+      stream_human_unit: data.rag?.stream_human_unit,
+      stream_human_words_per_chunk: data.rag?.stream_human_words_per_chunk,
+      rag_first_sentence_ms: data.rag?.rag_first_chunk_ms ?? data.rag?.rag_first_sentence_ms,
+      human_chunk_count: data.rag?.human_chunk_count ?? data.rag?.human_sentence_count,
       speak_chars: spoken.length,
       total_request_ms: data.total_request_ms,
       sessionid: sid || null,
