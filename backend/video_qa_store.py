@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any
 
 from transcribe_client import transcribe_configured
+from video_qa_urls import cdn_base, cdn_configured, with_public_video_url
+from video_qa_vod import public_status as vod_public_status
 from video_qa_garage import (
     delete_item_videos as garage_delete_item_videos,
     garage_object_key,
@@ -103,6 +105,9 @@ def get_status() -> dict[str, Any]:
         "garage": garage_public_status(),
         "transcribe_configured": transcribe_configured(),
         "local_video_dir": str(_VIDEOS_DIR.resolve()),
+        "video_cdn_base": cdn_base(),
+        "video_cdn_configured": cdn_configured(),
+        "vod": vod_public_status(),
     }
 
 
@@ -119,22 +124,23 @@ def video_path(item_id: str) -> Path:
 
 def _row_to_item(row: sqlite3.Row) -> dict[str, Any]:
     keys = row.keys()
-    return {
-        "id": row["id"],
-        "question": row["question"],
-        "answer": row["answer"],
-        "video_url": f"/api/video-qa/{row['id']}/video",
-        "garage_object_key": row["garage_object_key"],
-        "filename": row["filename"],
-        "content_type": row["content_type"],
-        "size_bytes": row["size_bytes"],
-        "created_at": row["created_at"],
-        "updated_at": row["updated_at"],
-        "processed": bool(row["processed"]) if "processed" in keys else False,
-        "trim_start_sec": float(row["trim_start_sec"]) if "trim_start_sec" in keys else 0.0,
-        "processed_at": int(row["processed_at"]) if "processed_at" in keys else 0,
-        "process_error": str(row["process_error"]) if "process_error" in keys else "",
-    }
+    return with_public_video_url(
+        {
+            "id": row["id"],
+            "question": row["question"],
+            "answer": row["answer"],
+            "garage_object_key": row["garage_object_key"],
+            "filename": row["filename"],
+            "content_type": row["content_type"],
+            "size_bytes": row["size_bytes"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "processed": bool(row["processed"]) if "processed" in keys else False,
+            "trim_start_sec": float(row["trim_start_sec"]) if "trim_start_sec" in keys else 0.0,
+            "processed_at": int(row["processed_at"]) if "processed_at" in keys else 0,
+            "process_error": str(row["process_error"]) if "process_error" in keys else "",
+        }
+    )
 
 
 def _sync_qdrant(item: dict[str, Any], *, required: bool = False) -> None:

@@ -2350,15 +2350,25 @@ function waitCachedVideoReady(el, timeoutMs = 12000) {
   });
 }
 
+function resolveVideoPlaybackUrl(videoUrlOrPath, itemId) {
+  const raw = String(videoUrlOrPath || "").trim();
+  if (raw) {
+    if (/^https?:\/\//i.test(raw)) return raw;
+    const path = raw.startsWith("/") ? raw : `/${raw}`;
+    return signalingUrl(path);
+  }
+  if (itemId) return signalingUrl(`/api/video-qa/${itemId}/video`);
+  return "";
+}
+
 async function playCachedVideoQa(hit) {
-  const path = hit?.video_url || (hit?.id ? `/api/video-qa/${hit.id}/video` : "");
-  if (!path) return;
-  const url = signalingUrl(path);
+  const url = resolveVideoPlaybackUrl(hit?.video_url, hit?.id);
+  if (!url) return;
   const el = cachedVideoEl.value;
   if (!el) return;
 
   pauseIdleLoop();
-  const switching = !el.src || (el.src !== url && !el.src.endsWith(path));
+  const switching = !el.src || el.src !== url;
   if (switching) {
     el.pause();
     el.src = url;

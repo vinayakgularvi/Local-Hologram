@@ -138,6 +138,7 @@ from video_qa_exports import (
 )
 from offline_exports_client import is_enabled as offline_exports_enabled
 from video_qa_match import find_high_confidence_match, public_config as video_qa_match_config
+from video_qa_vod import batch_vod_status, fetch_vod_status
 
 _BACKEND_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _BACKEND_DIR.parent
@@ -4869,6 +4870,30 @@ class VideoQaAskBody(BaseModel):
     question: str = Field(..., min_length=1, max_length=8000)
     limit: int = Field(default=6, ge=1, le=20)
     skip_export: bool = False
+
+
+class VideoQaVodCheckBody(BaseModel):
+    filenames: list[str] = Field(default_factory=list, max_length=100)
+
+
+@app.get("/api/video-qa/vod/status/{video_name:path}")
+async def video_qa_vod_status_endpoint(video_name: str):
+    """Proxy VOD/CDN availability for one filename (see VIDEO_QA_VOD_STATUS_BASE)."""
+    try:
+        status = await asyncio.to_thread(fetch_vod_status, video_name)
+        return _video_qa_ok(status)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/api/video-qa/vod/check")
+async def video_qa_vod_check_endpoint(body: VideoQaVodCheckBody):
+    """Batch VOD/CDN availability for Video RAG filenames."""
+    try:
+        by_name = await asyncio.to_thread(batch_vod_status, body.filenames)
+        return _video_qa_ok({"by_filename": by_name})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.get("/api/video-qa/status")

@@ -13,6 +13,7 @@ from video_qa_qdrant import (
     text_similarity,
 )
 from video_qa_store import get_item, search_items
+from video_qa_urls import cdn_base, cdn_configured, public_video_url
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -126,7 +127,7 @@ def find_high_confidence_match(user_query: str) -> dict[str, Any] | None:
         if not ok:
             continue
 
-        video_url = full.get("video_url") or hit.get("video_url") or f"/api/video-qa/{item_id}/video"
+        video_url = public_video_url(full)
         trace(
             f"Video Q&A match: HIT id={item_id} → play cached video {video_url} "
             f"(skip LiveTalking)"
@@ -153,4 +154,6 @@ def public_config() -> dict[str, Any]:
     return {
         "enabled": is_voice_match_enabled(),
         "threshold": match_threshold(),
+        "video_cdn_base": cdn_base(),
+        "video_cdn_configured": cdn_configured(),
     }

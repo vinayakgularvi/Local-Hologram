@@ -8,6 +8,8 @@ from typing import Any
 
 import httpx
 
+from video_qa_urls import public_video_url, with_public_video_url
+
 _VECTOR_SIZE = 768
 _EMBED_MODEL_DEFAULT = "BAAI/bge-base-en-v1.5"
 _embedder: Any = None
@@ -111,7 +113,7 @@ def _payload_from_item(item: dict[str, Any]) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "id": item["id"],
         "answer": item["answer"],
-        "video_url": item.get("video_url") or f"/api/video-qa/{item['id']}/video",
+        "video_url": public_video_url(item),
         "garage_object_key": item.get("garage_object_key") or f"videos/{item['id']}.mp4",
         "filename": item.get("filename") or f"{item['id']}.mp4",
         "content_type": item.get("content_type") or "video/mp4",
@@ -134,22 +136,23 @@ def _item_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
     item_id = str(payload.get("id") or "").strip()
     if not item_id:
         raise ValueError("Qdrant payload missing id")
-    return {
-        "id": item_id,
-        "question": str(payload.get("question") or ""),
-        "answer": str(payload.get("answer") or ""),
-        "video_url": str(payload.get("video_url") or f"/api/video-qa/{item_id}/video"),
-        "garage_object_key": str(payload.get("garage_object_key") or f"videos/{item_id}.mp4"),
-        "filename": str(payload.get("filename") or f"{item_id}.mp4"),
-        "content_type": str(payload.get("content_type") or "video/mp4"),
-        "size_bytes": int(payload.get("size_bytes") or 0),
-        "created_at": int(payload.get("created_at") or 0),
-        "updated_at": int(payload.get("updated_at") or 0),
-        "processed": bool(payload.get("processed")),
-        "trim_start_sec": float(payload.get("trim_start_sec") or 0),
-        "processed_at": int(payload.get("processed_at") or 0),
-        "process_error": str(payload.get("process_error") or ""),
-    }
+    return with_public_video_url(
+        {
+            "id": item_id,
+            "question": str(payload.get("question") or ""),
+            "answer": str(payload.get("answer") or ""),
+            "garage_object_key": str(payload.get("garage_object_key") or f"videos/{item_id}.mp4"),
+            "filename": str(payload.get("filename") or f"{item_id}.mp4"),
+            "content_type": str(payload.get("content_type") or "video/mp4"),
+            "size_bytes": int(payload.get("size_bytes") or 0),
+            "created_at": int(payload.get("created_at") or 0),
+            "updated_at": int(payload.get("updated_at") or 0),
+            "processed": bool(payload.get("processed")),
+            "trim_start_sec": float(payload.get("trim_start_sec") or 0),
+            "processed_at": int(payload.get("processed_at") or 0),
+            "process_error": str(payload.get("process_error") or ""),
+        }
+    )
 
 
 def _find_point_id(item_id: str) -> str | None:

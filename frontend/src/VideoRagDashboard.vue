@@ -27,6 +27,11 @@ const searchResults = ref([]);
 const searchActive = ref(false);
 const qdrantStatus = ref(null);
 const garageStatus = ref(null);
+const vodServiceStatus = ref(null);
+const videoCdnConfigured = ref(false);
+/** @type {import('vue').Ref<Record<string, object>>} */
+const vodStatusByFilename = ref({});
+const vodCheckBusy = ref(false);
 const transcribeConfigured = ref(false);
 const videoError = ref("");
 const pageReady = ref(false);
@@ -80,10 +85,44 @@ function apiUrl(path) {
   return p;
 }
 
+function itemFilename(item) {
+  if (!item) return "";
+  const fn = String(item.filename || "").trim();
+  if (fn) return fn.includes("/") ? fn.split("/").pop() : fn;
+  const id = String(item.id || "").trim();
+  return id ? `${id}.mp4` : "";
+}
+
+function vodStatusForItem(item) {
+  const name = itemFilename(item);
+  return name ? vodStatusByFilename.value[name] || null : null;
+}
+
 function videoSrc(item) {
+  const vod = vodStatusForItem(item);
+  if (vod?.vod_url) return String(vod.vod_url).trim();
   if (!item?.video_url) return "";
-  const url = item.video_url.startsWith("/") ? item.video_url : `/${item.video_url}`;
-  return apiUrl(url);
+  const url = String(item.video_url).trim();
+  if (/^https?:\/\//i.test(url)) return url;
+  const path = url.startsWith("/") ? url : `/${url}`;
+  return apiUrl(path);
+}
+
+function cdnBadgeClass(item) {
+  const vod = vodStatusForItem(item);
+  if (!vod) return "badge badge--pending";
+  if (vod.available && vod.http_available) return "badge badge--ok";
+  if (vod.error) return "badge badge--error";
+  return "badge badge--warn";
+}
+
+function cdnBadgeLabel(item) {
+  const vod = vodStatusForItem(item);
+  if (vodCheckBusy.value && !vod) return "…";
+  if (!vod) return videoCdnConfigured.value ? "—" : "off";
+  if (vod.available && vod.http_available) return "CDN";
+  if (vod.status) return String(vod.status);
+  return "missing";
 }
 
 async function parseApiResponse(res) {
@@ -105,14 +144,40 @@ async function loadStatus() {
     const data = await parseApiResponse(res);
     qdrantStatus.value = data?.qdrant || null;
     garageStatus.value = data?.garage || null;
+    vodServiceStatus.value = data?.vod || null;
+    videoCdnConfigured.value = Boolean(data?.video_cdn_configured);
     transcribeConfigured.value = Boolean(data?.transcribe_configured);
     offlineExportsEnabled.value = Boolean(data?.offline_exports?.enabled);
     ragGenerateConfigured.value = Boolean(data?.rag_generate_configured);
   } catch {
     qdrantStatus.value = null;
     garageStatus.value = null;
+    vodServiceStatus.value = null;
+    videoCdnConfigured.value = false;
     offlineExportsEnabled.value = false;
     ragGenerateConfigured.value = false;
+  }
+}
+
+async function loadVodStatusForRows(rows) {
+  const names = [...new Set((rows || []).map(itemFilename).filter(Boolean))];
+  if (!names.length) {
+    vodStatusByFilename.value = {};
+    return;
+  }
+  vodCheckBusy.value = true;
+  try {
+    const res = await fetch(apiUrl("/api/video-qa/vod/check"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ filenames: names }),
+    });
+    const data = await parseApiResponse(res);
+    vodStatusByFilename.value = data?.by_filename && typeof data.by_filename === "object" ? data.by_filename : {};
+  } catch {
+    /* keep prior map on transient failure */
+  } finally {
+    vodCheckBusy.value = false;
   }
 }
 
@@ -123,6 +188,7 @@ async function loadItems() {
     const res = await fetch(apiUrl("/api/video-qa?limit=100"));
     const data = await parseApiResponse(res);
     items.value = Array.isArray(data.items) ? data.items : [];
+    await loadVodStatusForRows(items.value);
     pruneCheckedIds();
     if (selectedId.value && !items.value.some((i) => i.id === selectedId.value)) {
       selectedId.value = items.value[0]?.id || "";
@@ -202,7 +268,15 @@ function selectItem(id) {
 }
 
 function onVideoError() {
-  videoError.value = "Unable to load video. Check Garage S3 credentials and that the object exists.";
+  const vod = selectedItem.value ? vodStatusForItem(selectedItem.value) : null;
+  if (vod && !vod.available) {
+    videoError.value =
+      vod.error ||
+      `Video not on CDN (${vod.status || "unavailable"}). Check VOD status for ${vod.video_name || itemFilename(selectedItem.value)}.`;
+    return;
+  }
+  videoError.value =
+    "Unable to load video. Check CDN/VOD status, Garage S3 credentials, and that the file exists.";
 }
 
 function fmtBytes(n) {
@@ -384,6 +458,7 @@ async function runSearch() {
     });
     const data = await parseApiResponse(res);
     searchResults.value = Array.isArray(data.items) ? data.items : [];
+    await loadVodStatusForRows(searchResults.value);
     searchActive.value = true;
     statusMsg.value = `Found ${searchResults.value.length} result(s) for "${q}".`;
     if (searchResults.value.length) selectItem(searchResults.value[0].id);
@@ -645,6 +720,8 @@ onUnmounted(() => {
         <span v-else class="dash__qdrant dash__qdrant--warn">Transcribe not configured</span>
         <span v-if="offlineExportsEnabled" class="dash__qdrant dash__qdrant--ok">Offline exports on</span>
         <span v-else class="dash__qdrant dash__qdrant--warn">Offline exports off</span>
+        <span v-if="vodServiceStatus?.configured" class="dash__qdrant dash__qdrant--ok">VOD status API</span>
+        <span v-if="videoCdnConfigured" class="dash__qdrant dash__qdrant--ok">CDN playback</span>
         <span>{{ items.length }} entr{{ items.length === 1 ? "y" : "ies" }}</span>
         <span v-if="unprocessedCount" class="dash__qdrant dash__qdrant--warn">
           {{ unprocessedCount }} unprocessed
@@ -674,6 +751,15 @@ onUnmounted(() => {
           @click="processAllUnprocessed"
         >
           {{ processAllBusy ? "Processing…" : "Process all" }}
+        </button>
+        <button
+          type="button"
+          class="btn btn--ghost"
+          :disabled="vodCheckBusy || !items.length"
+          title="Re-check CDN/VOD availability for all entries"
+          @click="loadVodStatusForRows(items)"
+        >
+          {{ vodCheckBusy ? "CDN check…" : "Check CDN" }}
         </button>
         <button type="button" class="btn btn--ghost" :disabled="loading" @click="loadItems">
           {{ loading ? "Loading…" : "Refresh" }}
@@ -824,6 +910,32 @@ onUnmounted(() => {
         </div>
         <p v-if="videoError" class="preview-hero__err">{{ videoError }}</p>
         <p v-if="selectedItem.process_error" class="preview-hero__err">{{ selectedItem.process_error }}</p>
+        <p v-if="vodStatusForItem(selectedItem)" class="preview-hero__meta preview-hero__cdn">
+          <span :class="cdnBadgeClass(selectedItem)">{{ cdnBadgeLabel(selectedItem) }}</span>
+          <template v-if="vodStatusForItem(selectedItem).vod_url">
+            ·
+            <a
+              class="preview-hero__link"
+              :href="vodStatusForItem(selectedItem).vod_url"
+              target="_blank"
+              rel="noopener noreferrer"
+              @click.stop
+            >CDN stream</a>
+          </template>
+          <template v-if="vodStatusForItem(selectedItem).file_size_bytes">
+            · CDN {{ fmtBytes(vodStatusForItem(selectedItem).file_size_bytes) }}
+          </template>
+          <template v-if="vodStatusForItem(selectedItem).status_url">
+            ·
+            <a
+              class="preview-hero__link"
+              :href="vodStatusForItem(selectedItem).status_url"
+              target="_blank"
+              rel="noopener noreferrer"
+              @click.stop
+            >VOD status</a>
+          </template>
+        </p>
         <p class="preview-hero__meta">
           {{ selectedItem.filename }} · {{ fmtBytes(selectedItem.size_bytes) }} ·
           {{ selectedItem.garage_object_key }} · updated {{ fmtTs(selectedItem.updated_at) }}
@@ -957,6 +1069,7 @@ onUnmounted(() => {
               <th>Question</th>
               <th>Answer</th>
               <th>Status</th>
+              <th>CDN</th>
               <th>Error</th>
               <th>Size</th>
               <th>Updated</th>
@@ -965,7 +1078,7 @@ onUnmounted(() => {
           </thead>
           <tbody>
             <tr v-if="!displayItems.length">
-              <td colspan="9" class="table__empty">No entries yet — create one above.</td>
+              <td colspan="10" class="table__empty">No entries yet — create one above.</td>
             </tr>
             <tr
               v-for="(item, idx) in displayItems"
@@ -995,6 +1108,17 @@ onUnmounted(() => {
                 <span v-if="item.process_error" class="badge badge--error">Error</span>
                 <span v-else-if="item.processed" class="badge badge--ok">Processed</span>
                 <span v-else class="badge badge--pending">Pending</span>
+              </td>
+              <td
+                class="table__cdn"
+                :title="
+                  vodStatusForItem(item)?.vod_url ||
+                  vodStatusForItem(item)?.error ||
+                  vodStatusForItem(item)?.status_url ||
+                  ''
+                "
+              >
+                <span :class="cdnBadgeClass(item)">{{ cdnBadgeLabel(item) }}</span>
               </td>
               <td class="table__error" :title="item.process_error || ''">
                 {{ item.process_error || "—" }}
@@ -1553,6 +1677,21 @@ onUnmounted(() => {
 .badge--error {
   background: #fee2e2;
   color: #991b1b;
+}
+
+.badge--warn {
+  background: #ffedd5;
+  color: #9a3412;
+}
+
+.preview-hero__link {
+  color: #5b21b6;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.preview-hero__link:hover {
+  color: #4c1d95;
 }
 
 .table__row--error {
