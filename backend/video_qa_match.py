@@ -12,8 +12,10 @@ from video_qa_qdrant import (
     is_configured as qdrant_configured,
     text_similarity,
 )
-from video_qa_store import get_item, search_items
+from video_qa_store import get_item, search_items, validate_item_id
 from video_qa_urls import cdn_base, cdn_configured, public_video_url
+
+_EXACT_MATCH_SCORE = 1.0
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -66,6 +68,82 @@ def _combined_similarity(query: str, target: str, vector_score: float) -> float:
     if emb is not None:
         scores.append(emb)
     return max(scores)
+
+
+def _is_exact_text_match(a: str, b: str) -> bool:
+    return text_similarity(a, b) >= _EXACT_MATCH_SCORE
+
+
+def _qa_pair_exact_match(question: str, answer: str, item: dict[str, Any]) -> bool:
+    stored_q = str(item.get("question") or "").strip()
+    stored_a = str(item.get("answer") or "").strip()
+    if not stored_a:
+        return False
+    return _is_exact_text_match(question, stored_q) and _is_exact_text_match(answer, stored_a)
+
+
+def find_existing_qdrant_entry(
+    *,
+    question: str,
+    answer: str,
+    item_id: str | None = None,
+) -> dict[str, Any] | None:
+    """
+    Return a Qdrant Video Q&A row when question+answer are a 100% text match.
+    If item_id is provided and exists, only a full Q+A match on that id counts.
+    Otherwise search Qdrant for any id with the same Q+A pair.
+    """
+    if not qdrant_configured():
+        return None
+    q = (question or "").strip()
+    a = (answer or "").strip()
+    if not q or not a:
+        return None
+
+    raw_id = (item_id or "").strip()
+    if raw_id:
+        try:
+            rid = validate_item_id(raw_id)
+        except ValueError:
+            rid = ""
+        if rid:
+            by_id = get_item(rid)
+            if by_id and _qa_pair_exact_match(q, a, by_id):
+                trace(
+                    f"Video Q&A dedup: id={rid} question+answer 100% match → skip offline export"
+                )
+                return {
+                    **by_id,
+                    "match_reason": "id_and_qa",
+                    "question_match_score": _EXACT_MATCH_SCORE,
+                    "answer_match_score": _EXACT_MATCH_SCORE,
+                }
+            if by_id:
+                trace(
+                    f"Video Q&A dedup: id={rid} exists but Q/A differ → scan Qdrant for duplicate pair"
+                )
+
+    seen_ids: set[str] = set()
+    for search_q in (q, a) if a != q else (q,):
+        for hit in search_items(query=search_q, limit=40):
+            hid = str(hit.get("id") or "").strip()
+            if not hid or hid in seen_ids:
+                continue
+            seen_ids.add(hid)
+            full = get_item(hid) or hit
+            if not _qa_pair_exact_match(q, a, full):
+                continue
+            trace(
+                f"Video Q&A dedup: found id={hid} question+answer 100% match "
+                f"(search={search_q[:40]!r}…) → skip offline export"
+            )
+            return {
+                **full,
+                "match_reason": "qa_exact",
+                "question_match_score": _EXACT_MATCH_SCORE,
+                "answer_match_score": _EXACT_MATCH_SCORE,
+            }
+    return None
 
 
 def find_high_confidence_match(user_query: str) -> dict[str, Any] | None:

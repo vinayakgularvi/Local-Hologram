@@ -13,6 +13,8 @@ from hologram_trace import trace
 from mongodb_analytics import get_collection as mongo_get_collection, is_enabled as mongo_enabled
 from offline_exports_client import is_enabled as offline_exports_enabled
 from video_qa_exports import schedule_poll, submit_export_async
+from video_qa_match import find_existing_qdrant_entry
+from video_qa_qdrant import is_configured as qdrant_configured
 
 _log = logging.getLogger("mongodb_export_trigger")
 
@@ -49,11 +51,21 @@ def public_config() -> dict[str, Any]:
         "enabled": is_trigger_enabled(),
         "collection": trigger_collection_name() if is_trigger_enabled() else None,
         "change_stream": change_stream_enabled(),
+        "qdrant_dedup": qdrant_configured(),
     }
 
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _qdrant_item_id_from_doc(doc: dict[str, Any]) -> str:
+    """Best-effort Video Q&A id from Mongo doc (export_item_id / item_id / source_item_id)."""
+    for key in ("export_item_id", "item_id", "source_item_id"):
+        v = str(doc.get(key) or "").strip()
+        if v:
+            return v
+    return ""
 
 
 def _source_item_id_from_doc(doc: dict[str, Any]) -> str:
@@ -114,6 +126,27 @@ def _mark_export_job(coll: Any, doc_id: Any, job: dict[str, Any]) -> None:
     )
 
 
+def _mark_export_skipped_qdrant(
+    coll: Any,
+    doc_id: Any,
+    *,
+    qdrant_id: str,
+    match_reason: str,
+) -> None:
+    coll.update_one(
+        {"_id": doc_id},
+        {
+            "$set": {
+                "offline_export_status": "skipped_qdrant_duplicate",
+                "offline_export_qdrant_id": qdrant_id,
+                "offline_export_match_reason": match_reason,
+                "offline_export_updated_at": _utc_now(),
+            },
+            "$unset": {"offline_export_claimed": ""},
+        },
+    )
+
+
 def _mark_export_failed(coll: Any, doc_id: Any, error: str) -> None:
     coll.update_one(
         {"_id": doc_id},
@@ -146,6 +179,27 @@ def process_document_export(doc: dict[str, Any], *, collection_name: str | None 
 
     coll = mongo_get_collection(collection_name or trigger_collection_name())
     doc_id = doc["_id"]
+
+    existing = find_existing_qdrant_entry(
+        question=question,
+        answer=text,
+        item_id=_qdrant_item_id_from_doc(doc),
+    )
+    if existing:
+        qid = str(existing.get("id") or "")
+        reason = str(existing.get("match_reason") or "qa_exact")
+        trace(
+            f"offline-export trigger: SKIP doc={doc_id} "
+            f"(Qdrant 100% match id={qid} reason={reason})"
+        )
+        _mark_export_skipped_qdrant(
+            coll,
+            doc_id,
+            qdrant_id=qid,
+            match_reason=reason,
+        )
+        return None
+
     if not _claim_document(coll, doc_id):
         trace(f"offline-export trigger: SKIP doc={doc_id} (already claimed)")
         return None
