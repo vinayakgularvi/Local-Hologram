@@ -140,6 +140,13 @@ from feature_flags import public_feature_flags, video_rag_enabled
 from offline_exports_client import is_enabled as offline_exports_enabled
 from video_qa_match import find_high_confidence_match, public_config as video_qa_match_config
 from video_qa_vod import batch_vod_status, fetch_vod_status
+from transcribe_client import (
+    get_transcribe_backend,
+    map_language_for_backend,
+    resolve_transcribe_url,
+    transcribe_configured,
+    transcribe_upload_async,
+)
 
 _BACKEND_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _BACKEND_DIR.parent
@@ -291,8 +298,10 @@ def _voice_stream_human_unit_label() -> str:
 HUMAN_DISPATCH_TIMEOUT_SEC = max(5.0, float(_env_first_int("HUMAN_DISPATCH_TIMEOUT_SEC", default=90)))
 TRANSCRIBE_API_URL = os.environ.get(
     "TRANSCRIBE_API_URL",
-    "http://10.29.145.124:8000/api/transcribe",
+    "http://10.29.145.124:8899/v1/audio/transcriptions",
 ).strip()
+TRANSCRIBE_WHISPER_API_URL = os.environ.get("TRANSCRIBE_WHISPER_API_URL", "").strip()
+TRANSCRIBE_BACKEND = get_transcribe_backend()
 TRANSCRIBE_TIMEOUT_SEC = max(5.0, float(_env_first_int("TRANSCRIBE_TIMEOUT_SEC", default=120)))
 TRANSCRIBE_MAX_UPLOAD_BYTES = max(
     256 * 1024,
@@ -321,6 +330,11 @@ TRANSCRIBE_SLICE_MAX_NEW_TOKENS = max(8, _env_first_int("TRANSCRIBE_SLICE_MAX_NE
 TRANSCRIBE_SLICE_BATCH_SIZE = max(1, _env_first_int("TRANSCRIBE_SLICE_BATCH_SIZE", default=1))
 TRANSCRIBE_SLICE_TIMEOUT_SEC = max(2.0, float(_env_first_int("TRANSCRIBE_SLICE_TIMEOUT_SEC", default=25)))
 TRANSCRIBE_STRIDE_LENGTH_S = os.environ.get("TRANSCRIBE_STRIDE_LENGTH_S", "0").strip() or "0"
+IDLE_LOOP_VIDEO = (
+    os.environ.get("IDLE_LOOP_VIDEO", "").strip()
+    or os.environ.get("VITE_IDLE_LOOP_VIDEO", "").strip()
+    or "/Videofile.mp4"
+)
 HOLOGRAM_UPLOAD_TIMEOUT_SEC = max(60.0, float(_env_first_int("HOLOGRAM_UPLOAD_TIMEOUT_SEC", default=600)))
 HOLOGRAM_PREPARE_TIMEOUT_SEC = max(120.0, float(_env_first_int("HOLOGRAM_PREPARE_TIMEOUT_SEC", default=900)))
 _HOLOGRAM_ASSET_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
@@ -1802,11 +1816,18 @@ async def health():
         "rt_target_sec": LIPSYNC_RT_TARGET_SEC,
         "rt_min_chars": LIPSYNC_RT_MIN_CHARS,
         "webrtc_signaling_proxy": bool(WEBRTC_SIGNALING_BASE),
-        "transcribe_configured": bool(TRANSCRIBE_API_URL),
-        "transcribe_model_id": TRANSCRIBE_MODEL_ID if TRANSCRIBE_API_URL else None,
-        "transcribe_mode": TRANSCRIBE_MODE if TRANSCRIBE_API_URL else None,
+        "transcribe_configured": transcribe_configured(),
+        "transcribe_backend": TRANSCRIBE_BACKEND,
+        "transcribe_provider": "nvidia"
+        if TRANSCRIBE_BACKEND == "parakeet"
+        else ("whisper" if TRANSCRIBE_BACKEND == "whisper" else None),
+        "transcribe_api_url": resolve_transcribe_url() if transcribe_configured() else None,
+        "transcribe_model_id": TRANSCRIBE_MODEL_ID if transcribe_configured() else None,
+        "transcribe_mode": TRANSCRIBE_MODE
+        if transcribe_configured() and TRANSCRIBE_BACKEND == "whisper"
+        else None,
         "transcribe_chunk_length_s": int(float(TRANSCRIBE_CHUNK_LENGTH_S))
-        if TRANSCRIBE_API_URL and TRANSCRIBE_MODE == "chunked"
+        if transcribe_configured() and TRANSCRIBE_BACKEND == "whisper" and TRANSCRIBE_MODE == "chunked"
         else None,
         "avatar_api_base": AVATAR_API_BASE,
         "rag": rag_info,
@@ -1856,13 +1877,19 @@ async def webrtc_proxy_status():
     return {
         "signaling_proxy_configured": bool(WEBRTC_SIGNALING_BASE),
         "interrupt_talk_proxy": bool(WEBRTC_SIGNALING_BASE),
-        "transcribe_configured": bool(TRANSCRIBE_API_URL),
-        "transcribe_mode": TRANSCRIBE_MODE if TRANSCRIBE_API_URL else None,
+        "transcribe_configured": transcribe_configured(),
+        "transcribe_backend": TRANSCRIBE_BACKEND,
+        "transcribe_provider": "nvidia"
+        if TRANSCRIBE_BACKEND == "parakeet"
+        else ("whisper" if TRANSCRIBE_BACKEND == "whisper" else None),
+        "transcribe_mode": TRANSCRIBE_MODE
+        if transcribe_configured() and TRANSCRIBE_BACKEND == "whisper"
+        else None,
         "transcribe_chunk_length_s": int(float(TRANSCRIBE_CHUNK_LENGTH_S))
-        if TRANSCRIBE_API_URL and TRANSCRIBE_MODE == "chunked"
+        if transcribe_configured() and TRANSCRIBE_BACKEND == "whisper" and TRANSCRIBE_MODE == "chunked"
         else None,
         "transcribe_slice_chunk_length_s": int(float(TRANSCRIBE_SLICE_CHUNK_LENGTH_S))
-        if TRANSCRIBE_API_URL and TRANSCRIBE_MODE == "chunked"
+        if transcribe_configured() and TRANSCRIBE_BACKEND == "whisper" and TRANSCRIBE_MODE == "chunked"
         else None,
         "video_qa_match": video_qa_match_config(),
         "features": public_feature_flags(),
@@ -1870,6 +1897,7 @@ async def webrtc_proxy_status():
         "voice_stream_human_words_per_chunk": VOICE_STREAM_HUMAN_WORDS_PER_CHUNK,
         "voice_stream_human_unit_label": _voice_stream_human_unit_label(),
         "voice_stream_human_min_chars": VOICE_STREAM_HUMAN_MIN_CHARS,
+        "idle_loop_video": IDLE_LOOP_VIDEO,
     }
 
 
@@ -1890,15 +1918,24 @@ async def api_transcribe(
     slice: str = Form(""),
 ):
     """
-    Proxy mic audio to the Whisper transcribe service (multipart), e.g. POST /api/transcribe on Ollama host.
+    Proxy mic audio to STT: NVIDIA Parakeet / NeMo (default) or legacy Whisper API.
     """
-    if not TRANSCRIBE_API_URL:
+    if not transcribe_configured():
         raise HTTPException(
             status_code=503,
             detail="TRANSCRIBE_API_URL is not set in .env.",
         )
     raw = await file.read()
+    slice_request = (slice or "").strip().lower() in ("1", "true", "yes", "on")
     if not raw:
+        if slice_request:
+            return await transcribe_upload_async(
+                b"",
+                filename=file.filename or "mic.webm",
+                content_type=file.content_type or "application/octet-stream",
+                language=(language or TRANSCRIBE_DEFAULT_LANGUAGE).strip() or TRANSCRIBE_DEFAULT_LANGUAGE,
+                slice_request=True,
+            )
         raise HTTPException(status_code=400, detail="Empty audio upload.")
     if len(raw) > TRANSCRIBE_MAX_UPLOAD_BYTES:
         raise HTTPException(
@@ -1906,93 +1943,54 @@ async def api_transcribe(
             detail=f"Audio too large (max {TRANSCRIBE_MAX_UPLOAD_BYTES // (1024 * 1024)} MB).",
         )
     lang = (language or TRANSCRIBE_DEFAULT_LANGUAGE).strip() or TRANSCRIBE_DEFAULT_LANGUAGE
-    slice_request = (slice or "").strip().lower() in ("1", "true", "yes", "on")
+    whisper_overrides: dict[str, str] | None = None
+    if TRANSCRIBE_BACKEND == "whisper":
 
-    def _form_int(raw: str, default: int) -> str:
-        s = (raw or "").strip()
-        if not s:
-            return str(default)
-        try:
-            return str(int(s))
-        except ValueError:
-            return str(default)
+        def _form_int(raw_val: str, default: int) -> str:
+            s = (raw_val or "").strip()
+            if not s:
+                return str(default)
+            try:
+                return str(int(s))
+            except ValueError:
+                return str(default)
 
-    resolved_mode = (mode or TRANSCRIBE_MODE).strip().lower() or TRANSCRIBE_MODE
-    # Short live slices: sequential + no chunk window (chunked + chunk_length_s=1 → 422 upstream).
-    if slice_request:
-        resolved_mode = "sequential"
-    slice_model = (
-        TRANSCRIBE_SLICE_MODEL_ID
-        or (model_id or "").strip()
-        or TRANSCRIBE_MODEL_ID
-    )
-    form: dict[str, str] = {
-        "stride_length_s": (stride_length_s or "").strip() or TRANSCRIBE_STRIDE_LENGTH_S,
-        "mode": resolved_mode,
-        "task": (task or TRANSCRIBE_TASK).strip() or TRANSCRIBE_TASK,
-        "batch_size": str(TRANSCRIBE_SLICE_BATCH_SIZE)
-        if slice_request
-        else _form_int(batch_size, TRANSCRIBE_BATCH_SIZE),
-        "num_beams": _form_int(num_beams, TRANSCRIBE_NUM_BEAMS),
-        "chunk_length_s": "0"
-        if slice_request
-        else _transcribe_chunk_length_s(chunk_length_s, resolved_mode, slice_request=False),
-        "model_id": slice_model if slice_request else (model_id or TRANSCRIBE_MODEL_ID).strip() or TRANSCRIBE_MODEL_ID,
-        "temperature": (temperature or TRANSCRIBE_TEMPERATURE).strip() or TRANSCRIBE_TEMPERATURE,
-        "max_new_tokens": str(TRANSCRIBE_SLICE_MAX_NEW_TOKENS)
-        if slice_request
-        else _form_int(max_new_tokens, TRANSCRIBE_MAX_NEW_TOKENS),
-        "timestamp": (timestamp or TRANSCRIBE_TIMESTAMP).strip() or TRANSCRIBE_TIMESTAMP,
-        "language": lang,
-    }
+        resolved_mode = (mode or TRANSCRIBE_MODE).strip().lower() or TRANSCRIBE_MODE
+        whisper_overrides = {
+            "stride_length_s": (stride_length_s or "").strip() or TRANSCRIBE_STRIDE_LENGTH_S,
+            "mode": resolved_mode,
+            "task": (task or TRANSCRIBE_TASK).strip() or TRANSCRIBE_TASK,
+            "batch_size": _form_int(batch_size, TRANSCRIBE_BATCH_SIZE),
+            "num_beams": _form_int(num_beams, TRANSCRIBE_NUM_BEAMS),
+            "chunk_length_s": _transcribe_chunk_length_s(
+                chunk_length_s, resolved_mode, slice_request=False
+            ),
+            "model_id": (model_id or TRANSCRIBE_MODEL_ID).strip() or TRANSCRIBE_MODEL_ID,
+            "temperature": (temperature or TRANSCRIBE_TEMPERATURE).strip() or TRANSCRIBE_TEMPERATURE,
+            "max_new_tokens": _form_int(max_new_tokens, TRANSCRIBE_MAX_NEW_TOKENS),
+            "timestamp": (timestamp or TRANSCRIBE_TIMESTAMP).strip() or TRANSCRIBE_TIMESTAMP,
+            "language": map_language_for_backend(lang, backend="whisper"),
+        }
     filename = file.filename or "mic.webm"
     content_type = file.content_type or "application/octet-stream"
-    files = {"file": (filename, raw, content_type)}
-    timeout_sec = TRANSCRIBE_SLICE_TIMEOUT_SEC if slice_request else TRANSCRIBE_TIMEOUT_SEC
-    timeout = httpx.Timeout(timeout_sec, connect=15.0)
-    t0 = time.perf_counter()
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.post(TRANSCRIBE_API_URL, data=form, files=files)
-    except httpx.TimeoutException as e:
-        raise HTTPException(status_code=504, detail="Transcribe service timed out.") from e
-    except httpx.RequestError as e:
-        logger.warning("Transcribe proxy request failed: %s", e)
-        raise HTTPException(status_code=502, detail=f"Transcribe service unreachable: {e}") from e
-    if r.status_code >= 400:
-        if slice_request and r.status_code in (400, 413, 422):
-            logger.debug(
-                "Slice transcribe skipped (%s, %s bytes): %s",
-                r.status_code,
-                len(raw),
-                (r.text or "")[:200],
-            )
-            proxy_ms = round((time.perf_counter() - t0) * 1000.0, 1)
-            return {
-                "text": "",
-                "metadata": None,
-                "chunks": [],
-                "latency_ms": proxy_ms,
-                "skipped": True,
-            }
-        raise HTTPException(
-            status_code=r.status_code,
-            detail=r.text[:500] or "Transcribe service error",
+        return await transcribe_upload_async(
+            raw,
+            filename=filename,
+            content_type=content_type,
+            language=lang,
+            slice_request=slice_request,
+            whisper_overrides=whisper_overrides,
         )
-    try:
-        payload = r.json()
-    except Exception as e:
-        raise HTTPException(status_code=502, detail="Transcribe returned non-JSON.") from e
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=502, detail="Transcribe returned unexpected JSON.")
-    text = str(payload.get("text") or "").strip()
-    proxy_ms = round((time.perf_counter() - t0) * 1000.0, 1)
-    return {
-        "text": text,
-        "metadata": payload.get("metadata"),
-        "chunks": payload.get("chunks"),
-        "latency_ms": proxy_ms,
-    }
+    except TimeoutError as e:
+        raise HTTPException(status_code=504, detail="Transcribe service timed out.") from e
+    except ConnectionError as e:
+        logger.warning("Transcribe proxy request failed: %s", e)
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e)[:500]) from e
 
 
 def _livetalking_base() -> str:

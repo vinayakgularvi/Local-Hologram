@@ -1,11 +1,17 @@
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite";
 import vue from "@vitejs/plugin-vue";
 import basicSsl from '@vitejs/plugin-basic-ssl'
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const repoRoot = path.resolve(__dirname, "..");
 const backendPort = process.env.PORT || "8080";
 const backendOrigin = `http://127.0.0.1:${backendPort}`;
 
 export default defineConfig({
+  /** Load VITE_* from repository root `.env` (not only `frontend/.env`). */
+  envDir: repoRoot,
   plugins: [
     basicSsl(),
     vue(),

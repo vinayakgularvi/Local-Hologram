@@ -35,6 +35,12 @@ function resolveIdleLoopVideoUrl(raw) {
 const IDLE_LOOP_VIDEO_SRC = resolveIdleLoopVideoUrl(
   import.meta.env.VITE_IDLE_LOOP_VIDEO || "/Videofile.mp4"
 );
+/** Runtime override from GET /api/webrtc (Docker / root .env without frontend rebuild). */
+let idleLoopVideoFromServer = null;
+
+function getIdleLoopVideoSrc() {
+  return idleLoopVideoFromServer || IDLE_LOOP_VIDEO_SRC;
+}
 
 /** @type {RTCPeerConnection | null} */
 let pc = null;
@@ -43,8 +49,9 @@ let recInstance = null;
 /** Browser STT for sub-200ms interim while server Whisper runs (hybrid mode). */
 let interimRecInstance = null;
 let browserInterimText = "";
-/** @type {AbortController | null} */
-let sliceTranscribeAbort = null;
+/** @type {{ blob: Blob, index: number }[]} */
+let parallelSliceQueue = [];
+let parallelSliceInFlight = 0;
 /** @type {MediaRecorder | null} */
 let mediaRecorder = null;
 /** @type {MediaStream | null} */
@@ -58,6 +65,7 @@ let micSilenceRaf = null;
 let micLastSoundMs = 0;
 let micRecordStartedMs = 0;
 let micHasDetectedSpeech = false;
+let micLastRms = 0;
 /** @type {number | null} */
 let liveTranscribeTimer = null;
 let liveTranscribeInFlight = false;
@@ -80,6 +88,8 @@ let lastLiveTranscribeAtMs = 0;
 let lastLiveTranscribeApiMs = null;
 
 const transcribeConfigured = ref(false);
+/** @type {import('vue').Ref<'parakeet' | 'whisper'>} */
+const transcribeBackend = ref("parakeet");
 const micListening = ref(false);
 const voiceThinking = ref(false);
 const mediaVisible = ref(false);
@@ -541,17 +551,22 @@ const TRANSCRIBE_PARALLEL_SLICES =
 const TRANSCRIBE_PARALLEL_ENABLED = TRANSCRIBE_PARALLEL_SLICES && TRANSCRIBE_SLICE_MS > 0;
 const TRANSCRIBE_SLICE_MIN_BYTES = Math.max(
   1,
-  Number.parseInt(import.meta.env.VITE_TRANSCRIBE_SLICE_MIN_BYTES || "800", 10) || 800
+  Number.parseInt(import.meta.env.VITE_TRANSCRIBE_SLICE_MIN_BYTES || "200", 10) || 200
 );
-/** Batch N ms of recorder slices per API call (0 = flush every timeslice). */
+/** Batch N ms of recorder slices per API call (0 = one POST per 20ms timeslice). */
 const TRANSCRIBE_SLICE_BATCH_MS = Math.max(
   0,
-  Number.parseInt(import.meta.env.VITE_TRANSCRIBE_SLICE_BATCH_MS || "80", 10) || 80
+  Number.parseInt(import.meta.env.VITE_TRANSCRIBE_SLICE_BATCH_MS || "0", 10) || 0
 );
-/** Min record time before first slice POST (parallel only; not clamped to 800ms). */
+/** Min record time before first slice POST (0 = send from first 20ms chunk after header). */
 const TRANSCRIBE_SLICE_MIN_RECORD_MS = Math.max(
   0,
-  Number.parseInt(import.meta.env.VITE_TRANSCRIBE_SLICE_MIN_RECORD_MS || "80", 10) || 80
+  Number.parseInt(import.meta.env.VITE_TRANSCRIBE_SLICE_MIN_RECORD_MS || "0", 10) || 0
+);
+/** Max concurrent slice POSTs (0 = unlimited). */
+const TRANSCRIBE_SLICE_MAX_IN_FLIGHT = Math.max(
+  0,
+  Number.parseInt(import.meta.env.VITE_TRANSCRIBE_SLICE_MAX_IN_FLIGHT || "16", 10) || 16
 );
 /** Instant interim via browser Speech API while Whisper slices run (Chromium). */
 const STT_BROWSER_INTERIM =
@@ -656,7 +671,7 @@ function pauseIdleLoop() {}
 
 async function startIdleLoop() {
   const el = idleLoopEl.value;
-  const path = IDLE_LOOP_VIDEO_SRC;
+  const path = getIdleLoopVideoSrc();
   if (!el || !path) return;
   const generation = idleLoopGeneration;
   const switching = !el.src || (!el.src.endsWith(path) && !el.src.includes(path));
@@ -849,6 +864,26 @@ fetch(signalingUrl("/api/webrtc"))
   .then((d) => {
     proxyConfigured.value = Boolean(d.signaling_proxy_configured);
     transcribeConfigured.value = Boolean(d.transcribe_configured);
+    if (d.transcribe_backend === "whisper") {
+      transcribeBackend.value = "whisper";
+    } else if (
+      d.transcribe_backend === "parakeet" ||
+      d.transcribe_backend === "openai" ||
+      d.transcribe_backend === "nvidia" ||
+      d.transcribe_backend === "nemo"
+    ) {
+      transcribeBackend.value = "parakeet";
+    }
+    if (d.idle_loop_video) {
+      const resolved = resolveIdleLoopVideoUrl(d.idle_loop_video);
+      if (resolved !== idleLoopVideoFromServer) {
+        idleLoopVideoFromServer = resolved;
+        idleLoopGeneration += 1;
+        if (mediaVisible.value) {
+          void startIdleLoop();
+        }
+      }
+    }
   })
   .catch(() => {
     proxyConfigured.value = false;
@@ -1513,8 +1548,8 @@ function resetLiveTranscribeState() {
   parallelSliceSendIndex = 0;
   webmHeaderChunk = null;
   pendingSliceChunks = [];
-  sliceTranscribeAbort?.abort();
-  sliceTranscribeAbort = null;
+  parallelSliceQueue = [];
+  parallelSliceInFlight = 0;
   stopBrowserInterimStt();
   if (parallelSliceFlushTimer != null) {
     window.clearTimeout(parallelSliceFlushTimer);
@@ -1526,12 +1561,21 @@ function resetLiveTranscribeState() {
 
 function joinParallelTranscriptParts(parts) {
   const sorted = [...parts].sort((a, b) => a.index - b.index);
-  return sorted
-    .map((p) => String(p.text || "").trim())
-    .filter(Boolean)
-    .join(" ")
-    .replace(/\s+/g, " ")
-    .trim();
+  let out = "";
+  for (const p of sorted) {
+    const piece = String(p.text || "").trim();
+    if (!piece) continue;
+    if (!out) {
+      out = piece;
+      continue;
+    }
+    if (piece.startsWith(out) || out.endsWith(piece)) {
+      out = piece.length > out.length ? piece : out;
+    } else if (!out.endsWith(piece) && !piece.startsWith(out.split(/\s+/).pop() || "")) {
+      out = `${out} ${piece}`;
+    }
+  }
+  return out.replace(/\s+/g, " ").trim();
 }
 
 function refreshInterimCaption() {
@@ -1623,7 +1667,71 @@ function flushParallelSlicePending() {
   pendingSliceChunks = [];
   const blob = new Blob(parts, { type: mimeType });
   const index = parallelSliceSendIndex++;
-  scheduleParallelSliceTranscribe(blob, index);
+  queueParallelSliceTranscribe(blob, index);
+}
+
+/** One 20ms MediaRecorder chunk → Parakeet POST (header + single cluster). */
+function enqueueParallelSliceTranscribe(chunk) {
+  if (!chunk?.size || !webmHeaderChunk) return;
+  if (TRANSCRIBE_SLICE_BATCH_MS > 0) {
+    pendingSliceChunks.push(chunk);
+    scheduleParallelSliceBatchFlush();
+    return;
+  }
+  const mimeType = mediaRecorder?.mimeType || "audio/webm";
+  const blob = new Blob([webmHeaderChunk, chunk], { type: mimeType });
+  if (shouldSkipTranscribeBlob(blob, { slice: true })) return;
+  if (!micHasDetectedSpeech && micRecordDurationMs() < TRANSCRIBE_SLICE_MIN_RECORD_MS) return;
+  const index = parallelSliceSendIndex++;
+  queueParallelSliceTranscribe(blob, index);
+}
+
+function pumpParallelSliceQueue() {
+  const max = TRANSCRIBE_SLICE_MAX_IN_FLIGHT;
+  while (parallelSliceQueue.length && (max === 0 || parallelSliceInFlight < max)) {
+    const item = parallelSliceQueue.shift();
+    if (!item) break;
+    parallelSliceInFlight += 1;
+    const job = runParallelSliceJob(item.blob, item.index).finally(() => {
+      parallelSliceInFlight -= 1;
+      pumpParallelSliceQueue();
+    });
+    parallelSliceJobs.push(job);
+  }
+}
+
+function queueParallelSliceTranscribe(blob, index) {
+  if (shouldSkipTranscribeBlob(blob, { slice: true })) return;
+  if (!micHasDetectedSpeech && micRecordDurationMs() < TRANSCRIBE_SLICE_MIN_RECORD_MS) return;
+  parallelSliceQueue.push({ blob, index });
+  pumpParallelSliceQueue();
+}
+
+async function runParallelSliceJob(blob, index) {
+  const seq = liveTranscribeSeq;
+  try {
+    const { text, latencyMs } = await transcribeMicBlob(blob, { slice: true });
+    if (seq !== liveTranscribeSeq || voiceSessionCancelled) return;
+    if (!text || isPhantomTranscript(text, blob, TRANSCRIBE_SLICE_MS)) return;
+    parallelSliceParts.push({ index, text });
+    sttChunkCount += 1;
+    lastLiveTranscribeAtMs = performance.now();
+    lastLiveTranscribeApiMs = latencyMs;
+    refreshLiveInterimFromParallel();
+    if (sttFirstChunkLatencyMs == null && micTapStartMs > 0) {
+      sttFirstChunkLatencyMs = Math.round((performance.now() - micTapStartMs) * 10) / 10;
+    }
+    console.info("[parallel-transcribe slice]", {
+      index,
+      api_ms: latencyMs,
+      chars: text.length,
+      joined_chars: liveTranscriptText.length,
+      in_flight: parallelSliceInFlight,
+      queued: parallelSliceQueue.length,
+    });
+  } catch (e) {
+    console.warn("[parallel-transcribe slice]", index, e);
+  }
 }
 
 function scheduleParallelSliceBatchFlush() {
@@ -1640,35 +1748,8 @@ function scheduleParallelSliceBatchFlush() {
   }, TRANSCRIBE_SLICE_BATCH_MS);
 }
 
-function scheduleParallelSliceTranscribe(blob, index) {
-  if (!blob?.size || blob.size < TRANSCRIBE_SLICE_MIN_BYTES) return;
-  if (!micHasDetectedSpeech && micRecordDurationMs() < TRANSCRIBE_SLICE_MIN_RECORD_MS) return;
-
-  const seq = liveTranscribeSeq;
-  const job = (async () => {
-    try {
-      const { text, latencyMs } = await transcribeMicBlob(blob, { slice: true, cancelPrevious: true });
-      if (seq !== liveTranscribeSeq || voiceSessionCancelled) return;
-      if (!text || isPhantomTranscript(text, blob, TRANSCRIBE_SLICE_MS)) return;
-      parallelSliceParts.push({ index, text });
-      sttChunkCount += 1;
-      lastLiveTranscribeAtMs = performance.now();
-      lastLiveTranscribeApiMs = latencyMs;
-      refreshLiveInterimFromParallel();
-      if (sttFirstChunkLatencyMs == null && micTapStartMs > 0) {
-        sttFirstChunkLatencyMs = Math.round((performance.now() - micTapStartMs) * 10) / 10;
-      }
-      console.info("[parallel-transcribe slice]", {
-        index,
-        api_ms: latencyMs,
-        chars: text.length,
-        joined_chars: liveTranscriptText.length,
-      });
-    } catch (e) {
-      console.warn("[parallel-transcribe slice]", index, e);
-    }
-  })();
-  parallelSliceJobs.push(job);
+function warmTranscribeConnection() {
+  fetch(signalingUrl("/api/health"), { method: "GET" }).catch(() => {});
 }
 
 function stopLiveTranscribeLoop() {
@@ -1707,7 +1788,7 @@ async function tickLiveTranscribe() {
   if (!micHasDetectedSpeech || recordMs < TRANSCRIBE_LIVE_MIN_MS) return;
   flushMicRecorderData();
   const blob = buildMicBlobSoFar();
-  if (blob.size < TRANSCRIBE_LIVE_MIN_BYTES) return;
+  if (shouldSkipTranscribeBlob(blob, { slice: false }) || blob.size < TRANSCRIBE_LIVE_MIN_BYTES) return;
   const now = performance.now();
   if (
     blob.size <= lastLiveTranscribeBytes &&
@@ -1758,6 +1839,20 @@ function normalizeSttMetrics(stt) {
     return Number.isFinite(stt) && stt >= 0 ? { finalApiMs: stt } : {};
   }
   return stt && typeof stt === "object" ? stt : {};
+}
+
+/** Skip transcribe when there is no meaningful audio (empty blob, silence, or no speech yet). */
+function shouldSkipTranscribeBlob(blob, opts = {}) {
+  if (!blob?.size) return true;
+  const minBytes = opts.slice ? TRANSCRIBE_SLICE_MIN_BYTES : MIC_MIN_TRANSCRIBE_BYTES;
+  if (blob.size < minBytes) return true;
+  if (opts.slice) {
+    if (!micHasDetectedSpeech) return true;
+    if (micLastRms < MIC_SILENCE_RMS_THRESHOLD) return true;
+  } else if (!micHasDetectedSpeech) {
+    return true;
+  }
+  return false;
 }
 
 function isPhantomTranscript(text, blob, recordMs) {
@@ -1841,41 +1936,31 @@ function transcribePostUrl(opts = {}) {
 }
 
 async function transcribeMicBlob(blob, opts = {}) {
+  if (shouldSkipTranscribeBlob(blob, opts)) {
+    return { text: "", latencyMs: 0, chunks: [], skipped: true };
+  }
   const fd = new FormData();
   const ext = blob.type.includes("webm") ? "webm" : blob.type.includes("ogg") ? "ogg" : "wav";
   fd.append("file", blob, `mic.${ext}`);
   fd.append("language", transcribeLanguageForTag(resolveMicLang()));
   if (opts.slice) {
     fd.append("slice", "1");
-    fd.append("mode", "sequential");
-  } else {
+    if (transcribeBackend.value === "whisper") {
+      fd.append("mode", "sequential");
+    }
+  } else if (transcribeBackend.value === "whisper") {
     fd.append("mode", TRANSCRIBE_MODE);
     const chunkLen = resolveTranscribeChunkLengthS(opts);
     if (chunkLen != null) {
       fd.append("chunk_length_s", String(chunkLen));
     }
   }
-  let signal;
-  if (opts.slice && opts.cancelPrevious) {
-    sliceTranscribeAbort?.abort();
-    sliceTranscribeAbort = new AbortController();
-    signal = sliceTranscribeAbort.signal;
-  }
   const reqStartMs = performance.now();
-  let res;
-  try {
-    res = await fetch(transcribePostUrl(opts), {
-      method: "POST",
-      headers: { Accept: "application/json" },
-      body: fd,
-      signal,
-    });
-  } catch (e) {
-    if (opts.slice && e?.name === "AbortError") {
-      return { text: "", latencyMs: 0, chunks: [] };
-    }
-    throw e;
-  }
+  const res = await fetch(transcribePostUrl(opts), {
+    method: "POST",
+    headers: { Accept: "application/json" },
+    body: fd,
+  });
   const latencyMs = Math.max(0, performance.now() - reqStartMs);
   if (!res.ok) {
     const body = await res.text();
@@ -2226,6 +2311,7 @@ function stopMicInternal({ cancel }) {
 function startMicSilenceMonitor(analyser) {
   stopMicSilenceMonitor();
   micHasDetectedSpeech = false;
+  micLastRms = 0;
   micLastSoundMs = performance.now();
   const buf = new Uint8Array(analyser.fftSize);
   const tick = () => {
@@ -2237,9 +2323,11 @@ function startMicSilenceMonitor(analyser) {
       sum += v * v;
     }
     const rms = Math.sqrt(sum / buf.length);
+    micLastRms = rms;
     if (rms > MIC_SILENCE_RMS_THRESHOLD) {
       if (!micHasDetectedSpeech && TRANSCRIBE_PARALLEL_ENABLED) {
-        flushParallelSlicePending();
+        if (TRANSCRIBE_SLICE_BATCH_MS > 0) flushParallelSlicePending();
+        else pumpParallelSliceQueue();
       }
       micHasDetectedSpeech = true;
       micLastSoundMs = performance.now();
@@ -2270,7 +2358,10 @@ async function onMediaRecorderStop() {
   const savedFirstChunkMs = sttFirstChunkLatencyMs;
   const savedChunkCount = sttChunkCount;
   releaseMicCapture();
-  if (!blob.size || recordMs < MIC_MIN_TRANSCRIBE_MS || blob.size < MIC_MIN_TRANSCRIBE_BYTES) {
+  if (
+    shouldSkipTranscribeBlob(blob, { slice: false }) ||
+    recordMs < MIC_MIN_TRANSCRIBE_MS
+  ) {
     resetLiveTranscribeState();
     clearMicTapTiming();
     return;
@@ -2278,6 +2369,7 @@ async function onMediaRecorderStop() {
   try {
     if (TRANSCRIBE_PARALLEL_ENABLED) {
       flushParallelSlicePending();
+      pumpParallelSliceQueue();
     }
     if (TRANSCRIBE_PARALLEL_ENABLED && parallelSliceJobs.length) {
       await Promise.allSettled(parallelSliceJobs);
@@ -2382,8 +2474,7 @@ async function startServerMicCapture() {
       webmHeaderChunk = ev.data;
       return;
     }
-    pendingSliceChunks.push(ev.data);
-    scheduleParallelSliceBatchFlush();
+    enqueueParallelSliceTranscribe(ev.data);
   };
   mediaRecorder.onstop = () => {
     void onMediaRecorderStop();
@@ -2404,6 +2495,7 @@ async function startServerMicCapture() {
     playMicTone("on");
     startMicSilenceMonitor(analyser);
     startLiveTranscribeLoop();
+    warmTranscribeConnection();
     startBrowserInterimStt();
     micMaxRecordTimer = window.setTimeout(() => {
       micMaxRecordTimer = null;
