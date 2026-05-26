@@ -40,6 +40,11 @@ const IDLE_LOOP_VIDEO_SRC = resolveIdleLoopVideoUrl(
 let pc = null;
 
 let recInstance = null;
+/** Browser STT for sub-200ms interim while server Whisper runs (hybrid mode). */
+let interimRecInstance = null;
+let browserInterimText = "";
+/** @type {AbortController | null} */
+let sliceTranscribeAbort = null;
 /** @type {MediaRecorder | null} */
 let mediaRecorder = null;
 /** @type {MediaStream | null} */
@@ -57,6 +62,16 @@ let micHasDetectedSpeech = false;
 let liveTranscribeTimer = null;
 let liveTranscribeInFlight = false;
 let liveTranscribeSeq = 0;
+/** @type {Promise<void>[]} */
+let parallelSliceJobs = [];
+/** @type {{ index: number, text: string }[]} */
+let parallelSliceParts = [];
+let parallelSliceSendIndex = 0;
+/** @type {Blob | null} */
+let webmHeaderChunk = null;
+/** @type {Blob[]} */
+let pendingSliceChunks = [];
+let parallelSliceFlushTimer = null;
 let liveTranscriptText = "";
 let sttFirstChunkLatencyMs = null;
 let sttChunkCount = 0;
@@ -516,6 +531,40 @@ const TRANSCRIBE_MODE = (() => {
 const TRANSCRIBE_LIVE_ENABLED =
   TRANSCRIBE_LIVE_CHUNK_MS > 0 &&
   String(import.meta.env.VITE_TRANSCRIBE_LIVE_ENABLED ?? "1").trim().toLowerCase() !== "0";
+/** Parallel live STT: MediaRecorder emits every N ms; each slice POSTs to /api/transcribe in parallel. */
+const TRANSCRIBE_SLICE_MS = Math.max(
+  20,
+  Number.parseInt(import.meta.env.VITE_TRANSCRIBE_SLICE_MS || "20", 10) || 20
+);
+const TRANSCRIBE_PARALLEL_SLICES =
+  String(import.meta.env.VITE_TRANSCRIBE_PARALLEL_SLICES ?? "1").trim().toLowerCase() !== "0";
+const TRANSCRIBE_PARALLEL_ENABLED = TRANSCRIBE_PARALLEL_SLICES && TRANSCRIBE_SLICE_MS > 0;
+const TRANSCRIBE_SLICE_MIN_BYTES = Math.max(
+  1,
+  Number.parseInt(import.meta.env.VITE_TRANSCRIBE_SLICE_MIN_BYTES || "800", 10) || 800
+);
+/** Batch N ms of recorder slices per API call (0 = flush every timeslice). */
+const TRANSCRIBE_SLICE_BATCH_MS = Math.max(
+  0,
+  Number.parseInt(import.meta.env.VITE_TRANSCRIBE_SLICE_BATCH_MS || "80", 10) || 80
+);
+/** Min record time before first slice POST (parallel only; not clamped to 800ms). */
+const TRANSCRIBE_SLICE_MIN_RECORD_MS = Math.max(
+  0,
+  Number.parseInt(import.meta.env.VITE_TRANSCRIBE_SLICE_MIN_RECORD_MS || "80", 10) || 80
+);
+/** Instant interim via browser Speech API while Whisper slices run (Chromium). */
+const STT_BROWSER_INTERIM =
+  String(
+    import.meta.env.VITE_STT_BROWSER_INTERIM ??
+      (TRANSCRIBE_PARALLEL_ENABLED ? "1" : "0")
+  )
+    .trim()
+    .toLowerCase() !== "0";
+/** Skip Hologram proxy for slices when CORS allows (saves one hop). */
+const TRANSCRIBE_DIRECT_URL = String(import.meta.env.VITE_TRANSCRIBE_DIRECT_URL || "").trim();
+const TRANSCRIBE_LIVE_INTERVAL_ENABLED = TRANSCRIBE_LIVE_ENABLED && !TRANSCRIBE_PARALLEL_ENABLED;
+const MIC_RECORDER_TIMESLICE_MS = TRANSCRIBE_PARALLEL_ENABLED ? TRANSCRIBE_SLICE_MS : 250;
 /** Whisper often returns these on silence / very short cancel taps. */
 const PHANTOM_TRANSCRIPT_RE =
   /^(thank\s*you|thanks|thank\s*you\.|thanks\.|ok|okay|bye|goodbye|you|the|\.+)$/i;
@@ -1459,8 +1508,167 @@ function resetLiveTranscribeState() {
   lastLiveTranscribeBytes = 0;
   lastLiveTranscribeAtMs = 0;
   lastLiveTranscribeApiMs = null;
+  parallelSliceJobs = [];
+  parallelSliceParts = [];
+  parallelSliceSendIndex = 0;
+  webmHeaderChunk = null;
+  pendingSliceChunks = [];
+  sliceTranscribeAbort?.abort();
+  sliceTranscribeAbort = null;
+  stopBrowserInterimStt();
+  if (parallelSliceFlushTimer != null) {
+    window.clearTimeout(parallelSliceFlushTimer);
+    parallelSliceFlushTimer = null;
+  }
   liveTranscribeSeq++;
   liveTranscribeInFlight = false;
+}
+
+function joinParallelTranscriptParts(parts) {
+  const sorted = [...parts].sort((a, b) => a.index - b.index);
+  return sorted
+    .map((p) => String(p.text || "").trim())
+    .filter(Boolean)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function refreshInterimCaption() {
+  const whisper = joinParallelTranscriptParts(parallelSliceParts) || liveTranscriptText;
+  const text = (whisper || browserInterimText || "").trim();
+  if (text) interimTranscript.value = text;
+}
+
+function refreshLiveInterimFromParallel() {
+  const joined = joinParallelTranscriptParts(parallelSliceParts);
+  if (!joined) {
+    refreshInterimCaption();
+    return;
+  }
+  liveTranscriptText = joined;
+  refreshInterimCaption();
+}
+
+function stopBrowserInterimStt() {
+  if (interimRecInstance) {
+    try {
+      interimRecInstance.stop();
+    } catch {
+      /* ignore */
+    }
+    interimRecInstance = null;
+  }
+  browserInterimText = "";
+}
+
+function startBrowserInterimStt() {
+  if (!STT_BROWSER_INTERIM || !speechRecCtor.value) return;
+  stopBrowserInterimStt();
+  const SR = speechRecCtor.value;
+  interimRecInstance = new SR();
+  interimRecInstance.lang = resolveMicLang();
+  interimRecInstance.continuous = true;
+  interimRecInstance.interimResults = true;
+  interimRecInstance.maxAlternatives = 1;
+  browserInterimText = "";
+  interimRecInstance.onresult = (event) => {
+    if (voiceSessionCancelled || !micListening.value) return;
+    let interim = "";
+    let finals = "";
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      const piece = String(event.results[i][0]?.transcript || "");
+      if (event.results[i].isFinal) finals += piece;
+      else interim += piece;
+    }
+    if (finals.trim()) {
+      browserInterimText = `${browserInterimText} ${finals}`.trim().replace(/\s+/g, " ");
+    }
+    const line = `${browserInterimText} ${interim}`.trim().replace(/\s+/g, " ");
+    if (line) {
+      if (sttFirstChunkLatencyMs == null && micTapStartMs > 0) {
+        sttFirstChunkLatencyMs = Math.round((performance.now() - micTapStartMs) * 10) / 10;
+      }
+      interimTranscript.value = liveTranscriptText || line;
+    }
+  };
+  interimRecInstance.onerror = () => {
+    /* keep server path; browser interim is optional */
+  };
+  interimRecInstance.onend = () => {
+    if (voiceSessionCancelled || !micListening.value || !interimRecInstance) return;
+    try {
+      interimRecInstance.start();
+    } catch {
+      /* ignore */
+    }
+  };
+  try {
+    interimRecInstance.start();
+  } catch {
+    interimRecInstance = null;
+  }
+}
+
+function flushParallelSlicePending() {
+  if (parallelSliceFlushTimer != null) {
+    window.clearTimeout(parallelSliceFlushTimer);
+    parallelSliceFlushTimer = null;
+  }
+  if (!pendingSliceChunks.length) return;
+  const mimeType = mediaRecorder?.mimeType || "audio/webm";
+  const parts = webmHeaderChunk
+    ? [webmHeaderChunk, ...pendingSliceChunks]
+    : [...pendingSliceChunks];
+  pendingSliceChunks = [];
+  const blob = new Blob(parts, { type: mimeType });
+  const index = parallelSliceSendIndex++;
+  scheduleParallelSliceTranscribe(blob, index);
+}
+
+function scheduleParallelSliceBatchFlush() {
+  if (TRANSCRIBE_SLICE_BATCH_MS <= 0) {
+    flushParallelSlicePending();
+    return;
+  }
+  if (parallelSliceFlushTimer != null) {
+    window.clearTimeout(parallelSliceFlushTimer);
+  }
+  parallelSliceFlushTimer = window.setTimeout(() => {
+    parallelSliceFlushTimer = null;
+    flushParallelSlicePending();
+  }, TRANSCRIBE_SLICE_BATCH_MS);
+}
+
+function scheduleParallelSliceTranscribe(blob, index) {
+  if (!blob?.size || blob.size < TRANSCRIBE_SLICE_MIN_BYTES) return;
+  if (!micHasDetectedSpeech && micRecordDurationMs() < TRANSCRIBE_SLICE_MIN_RECORD_MS) return;
+
+  const seq = liveTranscribeSeq;
+  const job = (async () => {
+    try {
+      const { text, latencyMs } = await transcribeMicBlob(blob, { slice: true, cancelPrevious: true });
+      if (seq !== liveTranscribeSeq || voiceSessionCancelled) return;
+      if (!text || isPhantomTranscript(text, blob, TRANSCRIBE_SLICE_MS)) return;
+      parallelSliceParts.push({ index, text });
+      sttChunkCount += 1;
+      lastLiveTranscribeAtMs = performance.now();
+      lastLiveTranscribeApiMs = latencyMs;
+      refreshLiveInterimFromParallel();
+      if (sttFirstChunkLatencyMs == null && micTapStartMs > 0) {
+        sttFirstChunkLatencyMs = Math.round((performance.now() - micTapStartMs) * 10) / 10;
+      }
+      console.info("[parallel-transcribe slice]", {
+        index,
+        api_ms: latencyMs,
+        chars: text.length,
+        joined_chars: liveTranscriptText.length,
+      });
+    } catch (e) {
+      console.warn("[parallel-transcribe slice]", index, e);
+    }
+  })();
+  parallelSliceJobs.push(job);
 }
 
 function stopLiveTranscribeLoop() {
@@ -1538,7 +1746,7 @@ async function tickLiveTranscribe() {
 
 function startLiveTranscribeLoop() {
   stopLiveTranscribeLoop();
-  if (!TRANSCRIBE_LIVE_ENABLED) return;
+  if (!TRANSCRIBE_LIVE_INTERVAL_ENABLED) return;
   liveTranscribeTimer = window.setInterval(() => {
     void tickLiveTranscribe();
   }, TRANSCRIBE_LIVE_CHUNK_MS);
@@ -1617,6 +1825,7 @@ function transcribeLanguageForTag(tag) {
 }
 
 function resolveTranscribeChunkLengthS(opts = {}) {
+  if (opts.slice) return null;
   if (TRANSCRIBE_MODE !== "chunked") return null;
   if (opts.live && TRANSCRIBE_LIVE_CHUNK_LENGTH_S > 0) {
     return TRANSCRIBE_LIVE_CHUNK_LENGTH_S;
@@ -1624,25 +1833,55 @@ function resolveTranscribeChunkLengthS(opts = {}) {
   return TRANSCRIBE_CHUNK_LENGTH_S > 0 ? TRANSCRIBE_CHUNK_LENGTH_S : 10;
 }
 
+function transcribePostUrl(opts = {}) {
+  if (opts.slice && TRANSCRIBE_DIRECT_URL) {
+    return TRANSCRIBE_DIRECT_URL;
+  }
+  return signalingUrl("/api/transcribe");
+}
+
 async function transcribeMicBlob(blob, opts = {}) {
   const fd = new FormData();
   const ext = blob.type.includes("webm") ? "webm" : blob.type.includes("ogg") ? "ogg" : "wav";
   fd.append("file", blob, `mic.${ext}`);
   fd.append("language", transcribeLanguageForTag(resolveMicLang()));
-  fd.append("mode", TRANSCRIBE_MODE);
-  const chunkLen = resolveTranscribeChunkLengthS(opts);
-  if (chunkLen != null) {
-    fd.append("chunk_length_s", String(chunkLen));
+  if (opts.slice) {
+    fd.append("slice", "1");
+    fd.append("mode", "sequential");
+  } else {
+    fd.append("mode", TRANSCRIBE_MODE);
+    const chunkLen = resolveTranscribeChunkLengthS(opts);
+    if (chunkLen != null) {
+      fd.append("chunk_length_s", String(chunkLen));
+    }
+  }
+  let signal;
+  if (opts.slice && opts.cancelPrevious) {
+    sliceTranscribeAbort?.abort();
+    sliceTranscribeAbort = new AbortController();
+    signal = sliceTranscribeAbort.signal;
   }
   const reqStartMs = performance.now();
-  const res = await fetch(signalingUrl("/api/transcribe"), {
-    method: "POST",
-    headers: { Accept: "application/json" },
-    body: fd,
-  });
+  let res;
+  try {
+    res = await fetch(transcribePostUrl(opts), {
+      method: "POST",
+      headers: { Accept: "application/json" },
+      body: fd,
+      signal,
+    });
+  } catch (e) {
+    if (opts.slice && e?.name === "AbortError") {
+      return { text: "", latencyMs: 0, chunks: [] };
+    }
+    throw e;
+  }
   const latencyMs = Math.max(0, performance.now() - reqStartMs);
   if (!res.ok) {
     const body = await res.text();
+    if (opts.slice && (res.status === 422 || res.status === 400)) {
+      return { text: "", latencyMs: Math.round(latencyMs * 10) / 10, chunks: [] };
+    }
     throw new Error(body.slice(0, 400) || `Transcribe failed (${res.status})`);
   }
   const data = await res.json();
@@ -1999,6 +2238,9 @@ function startMicSilenceMonitor(analyser) {
     }
     const rms = Math.sqrt(sum / buf.length);
     if (rms > MIC_SILENCE_RMS_THRESHOLD) {
+      if (!micHasDetectedSpeech && TRANSCRIBE_PARALLEL_ENABLED) {
+        flushParallelSlicePending();
+      }
       micHasDetectedSpeech = true;
       micLastSoundMs = performance.now();
     } else if (
@@ -2034,11 +2276,28 @@ async function onMediaRecorderStop() {
     return;
   }
   try {
-    if (liveTranscribeInFlight) {
+    if (TRANSCRIBE_PARALLEL_ENABLED) {
+      flushParallelSlicePending();
+    }
+    if (TRANSCRIBE_PARALLEL_ENABLED && parallelSliceJobs.length) {
+      await Promise.allSettled(parallelSliceJobs);
+    } else if (liveTranscribeInFlight) {
       await new Promise((r) => window.setTimeout(r, 120));
     }
     const sinceLiveMs = performance.now() - lastLiveTranscribeAtMs;
+    const parallelJoined = joinParallelTranscriptParts(parallelSliceParts);
+    const browserFallback = `${browserInterimText}`.trim();
+    const canReuseParallel =
+      TRANSCRIBE_PARALLEL_ENABLED &&
+      parallelJoined &&
+      !isPhantomTranscript(parallelJoined, blob, recordMs);
+    const canReuseBrowser =
+      !canReuseParallel &&
+      TRANSCRIBE_PARALLEL_ENABLED &&
+      browserFallback &&
+      !isPhantomTranscript(browserFallback, blob, recordMs);
     const canReuseLive =
+      !canReuseParallel &&
       liveTranscriptText &&
       sinceLiveMs < 800 &&
       lastLiveTranscribeBytes >= blob.size * 0.9 &&
@@ -2047,7 +2306,15 @@ async function onMediaRecorderStop() {
     let text = "";
     let latencyMs = null;
     let finalChunkCount = savedChunkCount;
-    if (canReuseLive) {
+    if (canReuseParallel) {
+      text = parallelJoined;
+      latencyMs = lastLiveTranscribeApiMs;
+      finalChunkCount = savedChunkCount;
+    } else if (canReuseBrowser) {
+      text = browserFallback;
+      latencyMs = sttFirstChunkLatencyMs;
+      finalChunkCount = savedChunkCount;
+    } else if (canReuseLive) {
       text = liveTranscriptText;
       latencyMs = lastLiveTranscribeApiMs;
       finalChunkCount = savedChunkCount;
@@ -2108,7 +2375,15 @@ async function startServerMicCapture() {
     : new MediaRecorder(micCaptureStream);
   micRecordedChunks = [];
   mediaRecorder.ondataavailable = (ev) => {
-    if (ev.data?.size) micRecordedChunks.push(ev.data);
+    if (!ev.data?.size) return;
+    micRecordedChunks.push(ev.data);
+    if (!TRANSCRIBE_PARALLEL_ENABLED) return;
+    if (!webmHeaderChunk) {
+      webmHeaderChunk = ev.data;
+      return;
+    }
+    pendingSliceChunks.push(ev.data);
+    scheduleParallelSliceBatchFlush();
   };
   mediaRecorder.onstop = () => {
     void onMediaRecorderStop();
@@ -2124,11 +2399,12 @@ async function startServerMicCapture() {
     analyser.fftSize = 2048;
     source.connect(analyser);
     micRecordStartedMs = performance.now();
-    mediaRecorder.start(250);
+    mediaRecorder.start(MIC_RECORDER_TIMESLICE_MS);
     micListening.value = true;
     playMicTone("on");
     startMicSilenceMonitor(analyser);
     startLiveTranscribeLoop();
+    startBrowserInterimStt();
     micMaxRecordTimer = window.setTimeout(() => {
       micMaxRecordTimer = null;
       if (micListening.value) stopMicInternal({ cancel: false });

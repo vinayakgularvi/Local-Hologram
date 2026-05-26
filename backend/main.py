@@ -313,6 +313,13 @@ TRANSCRIBE_TEMPERATURE = os.environ.get("TRANSCRIBE_TEMPERATURE", "0").strip() o
 TRANSCRIBE_TIMESTAMP = os.environ.get("TRANSCRIBE_TIMESTAMP", "none").strip() or "none"
 TRANSCRIBE_DEFAULT_LANGUAGE = os.environ.get("TRANSCRIBE_DEFAULT_LANGUAGE", "english").strip() or "english"
 TRANSCRIBE_CHUNK_LENGTH_S = os.environ.get("TRANSCRIBE_CHUNK_LENGTH_S", "10").strip() or "10"
+TRANSCRIBE_SLICE_CHUNK_LENGTH_S = (
+    os.environ.get("TRANSCRIBE_SLICE_CHUNK_LENGTH_S", "1").strip() or "1"
+)
+TRANSCRIBE_SLICE_MODEL_ID = os.environ.get("TRANSCRIBE_SLICE_MODEL_ID", "").strip()
+TRANSCRIBE_SLICE_MAX_NEW_TOKENS = max(8, _env_first_int("TRANSCRIBE_SLICE_MAX_NEW_TOKENS", default=32))
+TRANSCRIBE_SLICE_BATCH_SIZE = max(1, _env_first_int("TRANSCRIBE_SLICE_BATCH_SIZE", default=1))
+TRANSCRIBE_SLICE_TIMEOUT_SEC = max(2.0, float(_env_first_int("TRANSCRIBE_SLICE_TIMEOUT_SEC", default=25)))
 TRANSCRIBE_STRIDE_LENGTH_S = os.environ.get("TRANSCRIBE_STRIDE_LENGTH_S", "0").strip() or "0"
 HOLOGRAM_UPLOAD_TIMEOUT_SEC = max(60.0, float(_env_first_int("HOLOGRAM_UPLOAD_TIMEOUT_SEC", default=600)))
 HOLOGRAM_PREPARE_TIMEOUT_SEC = max(120.0, float(_env_first_int("HOLOGRAM_PREPARE_TIMEOUT_SEC", default=900)))
@@ -1824,11 +1831,19 @@ async def health():
     }
 
 
-def _transcribe_chunk_length_s(raw: str, mode: str) -> str:
+def _transcribe_chunk_length_s(
+    raw: str,
+    mode: str,
+    *,
+    slice_request: bool = False,
+) -> str:
     """Whisper API uses chunk_length_s only when mode=chunked (default 10s for mic latency)."""
     resolved_mode = (mode or TRANSCRIBE_MODE).strip().lower() or TRANSCRIBE_MODE
     if resolved_mode != "chunked":
         return "0"
+    if slice_request:
+        s = TRANSCRIBE_SLICE_CHUNK_LENGTH_S
+        return s if s not in ("", "0") else "1"
     s = (raw or "").strip()
     if s and s != "0":
         return s
@@ -1844,6 +1859,9 @@ async def webrtc_proxy_status():
         "transcribe_configured": bool(TRANSCRIBE_API_URL),
         "transcribe_mode": TRANSCRIBE_MODE if TRANSCRIBE_API_URL else None,
         "transcribe_chunk_length_s": int(float(TRANSCRIBE_CHUNK_LENGTH_S))
+        if TRANSCRIBE_API_URL and TRANSCRIBE_MODE == "chunked"
+        else None,
+        "transcribe_slice_chunk_length_s": int(float(TRANSCRIBE_SLICE_CHUNK_LENGTH_S))
         if TRANSCRIBE_API_URL and TRANSCRIBE_MODE == "chunked"
         else None,
         "video_qa_match": video_qa_match_config(),
@@ -1869,6 +1887,7 @@ async def api_transcribe(
     timestamp: str = Form(""),
     stride_length_s: str = Form("0"),
     chunk_length_s: str = Form("0"),
+    slice: str = Form(""),
 ):
     """
     Proxy mic audio to the Whisper transcribe service (multipart), e.g. POST /api/transcribe on Ollama host.
@@ -1887,6 +1906,7 @@ async def api_transcribe(
             detail=f"Audio too large (max {TRANSCRIBE_MAX_UPLOAD_BYTES // (1024 * 1024)} MB).",
         )
     lang = (language or TRANSCRIBE_DEFAULT_LANGUAGE).strip() or TRANSCRIBE_DEFAULT_LANGUAGE
+    slice_request = (slice or "").strip().lower() in ("1", "true", "yes", "on")
 
     def _form_int(raw: str, default: int) -> str:
         s = (raw or "").strip()
@@ -1897,23 +1917,39 @@ async def api_transcribe(
         except ValueError:
             return str(default)
 
+    resolved_mode = (mode or TRANSCRIBE_MODE).strip().lower() or TRANSCRIBE_MODE
+    # Short live slices: sequential + no chunk window (chunked + chunk_length_s=1 → 422 upstream).
+    if slice_request:
+        resolved_mode = "sequential"
+    slice_model = (
+        TRANSCRIBE_SLICE_MODEL_ID
+        or (model_id or "").strip()
+        or TRANSCRIBE_MODEL_ID
+    )
     form: dict[str, str] = {
         "stride_length_s": (stride_length_s or "").strip() or TRANSCRIBE_STRIDE_LENGTH_S,
-        "mode": (mode or TRANSCRIBE_MODE).strip().lower() or TRANSCRIBE_MODE,
+        "mode": resolved_mode,
         "task": (task or TRANSCRIBE_TASK).strip() or TRANSCRIBE_TASK,
-        "batch_size": _form_int(batch_size, TRANSCRIBE_BATCH_SIZE),
+        "batch_size": str(TRANSCRIBE_SLICE_BATCH_SIZE)
+        if slice_request
+        else _form_int(batch_size, TRANSCRIBE_BATCH_SIZE),
         "num_beams": _form_int(num_beams, TRANSCRIBE_NUM_BEAMS),
-        "chunk_length_s": _transcribe_chunk_length_s(chunk_length_s, mode),
-        "model_id": (model_id or TRANSCRIBE_MODEL_ID).strip() or TRANSCRIBE_MODEL_ID,
+        "chunk_length_s": "0"
+        if slice_request
+        else _transcribe_chunk_length_s(chunk_length_s, resolved_mode, slice_request=False),
+        "model_id": slice_model if slice_request else (model_id or TRANSCRIBE_MODEL_ID).strip() or TRANSCRIBE_MODEL_ID,
         "temperature": (temperature or TRANSCRIBE_TEMPERATURE).strip() or TRANSCRIBE_TEMPERATURE,
-        "max_new_tokens": _form_int(max_new_tokens, TRANSCRIBE_MAX_NEW_TOKENS),
+        "max_new_tokens": str(TRANSCRIBE_SLICE_MAX_NEW_TOKENS)
+        if slice_request
+        else _form_int(max_new_tokens, TRANSCRIBE_MAX_NEW_TOKENS),
         "timestamp": (timestamp or TRANSCRIBE_TIMESTAMP).strip() or TRANSCRIBE_TIMESTAMP,
         "language": lang,
     }
     filename = file.filename or "mic.webm"
     content_type = file.content_type or "application/octet-stream"
     files = {"file": (filename, raw, content_type)}
-    timeout = httpx.Timeout(TRANSCRIBE_TIMEOUT_SEC, connect=15.0)
+    timeout_sec = TRANSCRIBE_SLICE_TIMEOUT_SEC if slice_request else TRANSCRIBE_TIMEOUT_SEC
+    timeout = httpx.Timeout(timeout_sec, connect=15.0)
     t0 = time.perf_counter()
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -1924,6 +1960,21 @@ async def api_transcribe(
         logger.warning("Transcribe proxy request failed: %s", e)
         raise HTTPException(status_code=502, detail=f"Transcribe service unreachable: {e}") from e
     if r.status_code >= 400:
+        if slice_request and r.status_code in (400, 413, 422):
+            logger.debug(
+                "Slice transcribe skipped (%s, %s bytes): %s",
+                r.status_code,
+                len(raw),
+                (r.text or "")[:200],
+            )
+            proxy_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+            return {
+                "text": "",
+                "metadata": None,
+                "chunks": [],
+                "latency_ms": proxy_ms,
+                "skipped": True,
+            }
         raise HTTPException(
             status_code=r.status_code,
             detail=r.text[:500] or "Transcribe service error",
