@@ -94,6 +94,10 @@ const micListening = ref(false);
 const voiceThinking = ref(false);
 const mediaVisible = ref(false);
 const ENV_MIC_LANG_RAW = String(import.meta.env.VITE_VOICE_DEFAULT_LANG || "en-US").trim();
+/** Voice pipeline API (default: TTS → humanaudio; does not use /api/voice-turn). */
+const VOICE_PIPELINE_API = String(
+  import.meta.env.VITE_VOICE_PIPELINE_API || "/api/voice-stream"
+).trim();
 /** BCP 47–ish tag from env, or "auto" for navigator.language. */
 const DEFAULT_MIC_LANG = (() => {
   const r = ENV_MIC_LANG_RAW;
@@ -2112,7 +2116,7 @@ async function runVoicePipeline(userText, stt = null) {
     payload.stt_chunk_count = Math.round(sttMetrics.chunkCount);
   }
   try {
-    const res = await fetch(signalingUrl("/api/voice-turn"), {
+    const res = await fetch(signalingUrl(VOICE_PIPELINE_API), {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify(payload),
@@ -2141,7 +2145,7 @@ async function runVoicePipeline(userText, stt = null) {
         applyShowImageFromVoiceTurn(data);
       } catch {
         clearFeaturedMenuImage();
-        if (answer) {
+        if (answer && VOICE_PIPELINE_API.includes("voice-turn")) {
           const sidCached = String(sessionId.value || "").trim();
           if (sidCached && sidCached !== "0") {
             postHuman(stripReceiptForSpeech(answer));
@@ -2168,22 +2172,41 @@ async function runVoicePipeline(userText, stt = null) {
     const humanDispatched = Boolean(data.human_dispatched);
     const streamHuman = Boolean(data.rag?.stream_human);
     const expectsWebRtcPlayback = Boolean(spoken) || humanDispatched || streamHuman;
-    console.info("[voice-turn] complete — audio comes from LiveTalking /human + WebRTC, not this response", {
+    const streamLat = data.rag?.stream_dispatch_latency;
+    const latSummary = streamLat?.summary;
+    console.info(`[${VOICE_PIPELINE_API}] complete — TTS→humanaudio + WebRTC (latency ms)`, {
       human_dispatched: humanDispatched,
       stream_human: streamHuman,
+      dispatch_mode: data.rag?.dispatch_mode,
       stream_human_unit: data.rag?.stream_human_unit,
       stream_human_words_per_chunk: data.rag?.stream_human_words_per_chunk,
-      rag_first_sentence_ms: data.rag?.rag_first_chunk_ms ?? data.rag?.rag_first_sentence_ms,
+      rag_latency_ms: data.rag?.rag_latency_ms,
+      rag_first_chunk_enqueued_ms:
+        latSummary?.first_chunk_enqueued_ms ??
+        data.rag?.rag_first_chunk_ms ??
+        data.rag?.rag_first_sentence_ms,
+      first_chunk_completed_ms: latSummary?.first_chunk_completed_ms,
+      first_chunk_tts_ms: latSummary?.first_chunk_tts_ms,
+      first_chunk_humanaudio_ms: latSummary?.first_chunk_humanaudio_ms,
+      first_chunk_total_ms: latSummary?.first_chunk_total_ms,
+      avg_total_ms: latSummary?.avg_total_ms,
+      sum_total_ms: latSummary?.sum_total_ms,
       human_chunk_count: data.rag?.human_chunk_count ?? data.rag?.human_sentence_count,
+      stream_chunks: streamLat?.chunks,
       speak_chars: spoken.length,
       total_request_ms: data.total_request_ms,
+      stt_latency_ms: sttLatencyMs,
       sessionid: sid || null,
     });
 
     if (spoken) {
-      if (!humanDispatched) {
+      const useLegacyHuman =
+        VOICE_PIPELINE_API.includes("voice-turn") && !humanDispatched && !streamHuman;
+      if (useLegacyHuman) {
         if (!sid || sid === "0") {
-          console.warn("[voice-turn] no valid WebRTC sessionid — /human not sent; connect hologram first");
+          console.warn(
+            `[${VOICE_PIPELINE_API}] no valid WebRTC sessionid — connect hologram first`
+          );
         } else {
           postHuman(spoken);
         }

@@ -18,3 +18,8 @@ def trace(msg: str) -> None:
         return
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
     print(f"[hologram {ts}] {msg}", file=sys.stderr, flush=True)
+
+
+def voice_trace(msg: str) -> None:
+    """Voice-stream / TTS / humanaudio pipeline (grep terminal for ``voice |``)."""
+    trace(f"voice | {msg}")

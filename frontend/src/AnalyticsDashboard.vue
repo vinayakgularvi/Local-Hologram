@@ -193,9 +193,76 @@ const PIPELINE_STEPS = [
     empty: "Voice turns using RAG_GENERATE_STREAM_URL only.",
   },
   {
-    id: "server",
+    id: "rag-chunk",
     step: 8,
-    title: "Server voice-turn",
+    title: "RAG → first sentence",
+    sub: "Stream start → first complete sentence enqueued for TTS",
+    field: "rag_first_chunk_enqueued_ms",
+    track: "rag",
+    empty: "Voice-stream turns with sentence dispatch (VOICE_STREAM_HUMAN_UNIT=sentence).",
+  },
+  {
+    id: "tts-sentence-1",
+    step: 9,
+    title: "Sentence TTS (1st)",
+    sub: "POST /v1/tts/reference latency for the first streamed sentence",
+    field: "stream_first_tts_ms",
+    track: "stream-tts",
+    highlight: true,
+    empty: "Voice-stream with VOICE_DISPATCH_MODE=humanaudio.",
+  },
+  {
+    id: "ha-1",
+    step: 10,
+    title: "humanaudio (1st sentence)",
+    sub: "POST /humanaudiowithpath for first sentence",
+    field: "stream_first_humanaudio_ms",
+    track: "humanaudio",
+    highlight: true,
+    empty: "Voice-stream with VOICE_DISPATCH_MODE=humanaudio.",
+  },
+  {
+    id: "sentence-total-1",
+    step: 11,
+    title: "1st sentence TTS + humanaudio",
+    sub: "Sum of /v1/tts/reference + /humanaudiowithpath for first sentence",
+    field: "stream_first_chunk_total_ms",
+    track: "stream-tts",
+    highlight: true,
+    empty: "Voice-stream with VOICE_DISPATCH_MODE=humanaudio.",
+  },
+  {
+    id: "rag-first-audio",
+    step: 12,
+    title: "RAG → first sentence audio",
+    sub: "RAG stream start → first sentence sent to avatar (wall clock)",
+    field: "stream_first_chunk_completed_ms",
+    track: "rag",
+    highlight: true,
+    empty: "Voice-stream with sentence dispatch and humanaudio.",
+  },
+  {
+    id: "tts-sentence-avg",
+    step: 13,
+    title: "Sentence TTS (avg)",
+    sub: "Average /v1/tts/reference latency per streamed sentence",
+    field: "stream_avg_tts_ms",
+    track: "stream-tts",
+    empty: "Voice-stream with multiple sentences in one reply.",
+  },
+  {
+    id: "ha-avg",
+    step: 14,
+    title: "humanaudio (avg / sentence)",
+    sub: "Average /humanaudiowithpath POST latency per sentence",
+    field: "stream_avg_humanaudio_ms",
+    track: "humanaudio",
+    empty: "Voice-stream with multiple sentences in one reply.",
+  },
+  {
+    id: "server",
+    step: 15,
+    title: "Server voice-stream",
     sub: "API wall time (until JSON returned)",
     field: "total_request_ms",
     track: "default",
@@ -203,25 +270,25 @@ const PIPELINE_STEPS = [
   },
   {
     id: "human",
-    step: 9,
+    step: 16,
     title: "Human dispatch",
-    sub: "Server POST LiveTalking /human",
+    sub: "Server POST LiveTalking /human (legacy)",
     field: "human_dispatch_ms",
     track: "webrtc",
-    empty: "Requires VOICE_DISPATCH_HUMAN.",
+    empty: "Requires VOICE_DISPATCH_MODE=human.",
   },
   {
     id: "tts",
-    step: 10,
+    step: 17,
     title: "Server complete → WebRTC audio",
-    sub: "Voice-turn JSON received → audible audio on stream",
+    sub: "Voice-stream JSON received → audible audio on stream",
     field: "tts_latency_ms",
     track: "tts",
     empty: "Complete a spoken turn with TTS.",
   },
   {
     id: "realpb",
-    step: 11,
+    step: 18,
     title: "Server complete → real WebRTC playback",
     sub: "Audible audio + lip-sync video (timestamp = later of the two)",
     field: "webrtc_real_playback_ms",
@@ -231,7 +298,7 @@ const PIPELINE_STEPS = [
   },
   {
     id: "avatar",
-    step: 12,
+    step: 19,
     title: "Server complete → lip-sync video",
     sub: "Voice-turn JSON received → avatar visibly playing",
     field: "lip_sync_avatar_play_ms",
@@ -241,7 +308,7 @@ const PIPELINE_STEPS = [
   },
   {
     id: "vfirst",
-    step: 13,
+    step: 20,
     title: "Video stream first tick",
     sub: "Early timeline bump (may be stale frames)",
     field: "video_stream_first_ms",
@@ -250,7 +317,7 @@ const PIPELINE_STEPS = [
   },
   {
     id: "gap",
-    step: 14,
+    step: 21,
     title: "Stream tick → avatar play",
     sub: "Gap after first tick until lip-synced avatar plays",
     field: "stream_start_to_avatar_ms",
@@ -259,7 +326,7 @@ const PIPELINE_STEPS = [
   },
   {
     id: "lip",
-    step: 15,
+    step: 22,
     title: "Audio → lip-sync video",
     sub: "First audio → lip-synced avatar playing",
     field: "lip_sync_latency_ms",
@@ -268,7 +335,7 @@ const PIPELINE_STEPS = [
   },
   {
     id: "ttfv",
-    step: 16,
+    step: 23,
     title: "Time to first voice",
     sub: "STT + RAG (or server) + WebRTC audio (sum)",
     field: "time_to_first_voice_ms",
@@ -442,7 +509,7 @@ async function submitReset() {
       <header class="pipeline-section__head">
         <h2 class="pipeline-section__title">Voice pipeline</h2>
         <p class="pipeline-section__sub">
-          Unique metrics, mic tap → lip-sync avatar; steps ⑧–⑩ after server voice-turn completes
+          Unique metrics, mic tap → lip-sync avatar; steps ⑧–⑫ are per-sentence TTS / humanaudio
         </p>
       </header>
 
@@ -971,6 +1038,22 @@ async function submitReset() {
 
 .bar-row__track--rag {
   background: #dbeafe;
+}
+
+.bar-row__track--stream-tts {
+  background: #ffedd5;
+}
+
+.bar-row__fill--stream-tts {
+  background: linear-gradient(90deg, #ea580c, #f97316);
+}
+
+.bar-row__track--humanaudio {
+  background: #cffafe;
+}
+
+.bar-row__fill--humanaudio {
+  background: linear-gradient(90deg, #0891b2, #06b6d4);
 }
 
 .bar-row__fill--rag {

@@ -71,6 +71,26 @@ def _ensure_voice_turn_columns(cx: sqlite3.Connection) -> None:
         cx.execute("ALTER TABLE voice_turns ADD COLUMN video_stream_first_ms REAL")
     if "webrtc_real_playback_ms" not in cols:
         cx.execute("ALTER TABLE voice_turns ADD COLUMN webrtc_real_playback_ms REAL")
+    if "stream_chunk_count" not in cols:
+        cx.execute("ALTER TABLE voice_turns ADD COLUMN stream_chunk_count INTEGER")
+    if "rag_first_chunk_enqueued_ms" not in cols:
+        cx.execute("ALTER TABLE voice_turns ADD COLUMN rag_first_chunk_enqueued_ms REAL")
+    if "stream_first_tts_ms" not in cols:
+        cx.execute("ALTER TABLE voice_turns ADD COLUMN stream_first_tts_ms REAL")
+    if "stream_first_humanaudio_ms" not in cols:
+        cx.execute("ALTER TABLE voice_turns ADD COLUMN stream_first_humanaudio_ms REAL")
+    if "stream_first_chunk_total_ms" not in cols:
+        cx.execute("ALTER TABLE voice_turns ADD COLUMN stream_first_chunk_total_ms REAL")
+    if "stream_first_chunk_completed_ms" not in cols:
+        cx.execute("ALTER TABLE voice_turns ADD COLUMN stream_first_chunk_completed_ms REAL")
+    if "stream_avg_tts_ms" not in cols:
+        cx.execute("ALTER TABLE voice_turns ADD COLUMN stream_avg_tts_ms REAL")
+    if "stream_avg_humanaudio_ms" not in cols:
+        cx.execute("ALTER TABLE voice_turns ADD COLUMN stream_avg_humanaudio_ms REAL")
+    if "stream_sum_tts_ms" not in cols:
+        cx.execute("ALTER TABLE voice_turns ADD COLUMN stream_sum_tts_ms REAL")
+    if "stream_sum_humanaudio_ms" not in cols:
+        cx.execute("ALTER TABLE voice_turns ADD COLUMN stream_sum_humanaudio_ms REAL")
     cx.execute(
         """
         UPDATE voice_turns
@@ -271,6 +291,66 @@ def mark_voice_turn_human_dispatched(turn_id: int) -> bool:
             return cur.rowcount > 0
 
 
+def update_voice_turn_stream_latency(
+    turn_id: int,
+    *,
+    stream_chunk_count: int | None = None,
+    rag_first_chunk_enqueued_ms: float | None = None,
+    stream_first_tts_ms: float | None = None,
+    stream_first_humanaudio_ms: float | None = None,
+    stream_first_chunk_total_ms: float | None = None,
+    stream_first_chunk_completed_ms: float | None = None,
+    stream_avg_tts_ms: float | None = None,
+    stream_avg_humanaudio_ms: float | None = None,
+    stream_sum_tts_ms: float | None = None,
+    stream_sum_humanaudio_ms: float | None = None,
+) -> bool:
+    """Server-reported per-sentence TTS and humanaudio timings from RAG stream dispatch."""
+    init_db()
+    chunks = stream_chunk_count
+    if chunks is not None and (chunks < 0 or chunks > 10_000):
+        chunks = None
+    fields = {
+        "rag_first_chunk_enqueued_ms": _valid_ms(rag_first_chunk_enqueued_ms),
+        "stream_first_tts_ms": _valid_ms(stream_first_tts_ms),
+        "stream_first_humanaudio_ms": _valid_ms(stream_first_humanaudio_ms),
+        "stream_first_chunk_total_ms": _valid_ms(stream_first_chunk_total_ms),
+        "stream_first_chunk_completed_ms": _valid_ms(stream_first_chunk_completed_ms),
+        "stream_avg_tts_ms": _valid_ms(stream_avg_tts_ms),
+        "stream_avg_humanaudio_ms": _valid_ms(stream_avg_humanaudio_ms),
+        "stream_sum_tts_ms": _valid_ms(stream_sum_tts_ms),
+        "stream_sum_humanaudio_ms": _valid_ms(stream_sum_humanaudio_ms),
+    }
+    if not any(v is not None for v in fields.values()) and chunks is None:
+        return False
+    with _lock:
+        with _connect() as cx:
+            row = cx.execute(
+                "SELECT stream_first_tts_ms FROM voice_turns WHERE id = ?",
+                (int(turn_id),),
+            ).fetchone()
+            if not row:
+                return False
+            sets: list[str] = []
+            vals: list[Any] = []
+            if chunks is not None:
+                sets.append("stream_chunk_count = ?")
+                vals.append(int(chunks))
+            for col, val in fields.items():
+                if val is not None:
+                    sets.append(f"{col} = ?")
+                    vals.append(val)
+            if not sets:
+                return False
+            vals.append(int(turn_id))
+            cur = cx.execute(
+                f"UPDATE voice_turns SET {', '.join(sets)} WHERE id = ?",
+                vals,
+            )
+            cx.commit()
+            return cur.rowcount > 0
+
+
 def update_voice_turn_human_dispatch_ms(turn_id: int, human_dispatch_ms: float) -> bool:
     """Server-reported LiveTalking /human POST duration."""
     init_db()
@@ -435,7 +515,31 @@ def get_summary() -> dict[str, Any]:
                 MAX(video_stream_first_ms) AS max_video_stream_first_ms,
                 AVG(webrtc_real_playback_ms) AS avg_webrtc_real_playback_ms,
                 MIN(webrtc_real_playback_ms) AS min_webrtc_real_playback_ms,
-                MAX(webrtc_real_playback_ms) AS max_webrtc_real_playback_ms
+                MAX(webrtc_real_playback_ms) AS max_webrtc_real_playback_ms,
+                AVG(stream_chunk_count) AS avg_stream_chunk_count,
+                AVG(rag_first_chunk_enqueued_ms) AS avg_rag_first_chunk_enqueued_ms,
+                MIN(rag_first_chunk_enqueued_ms) AS min_rag_first_chunk_enqueued_ms,
+                MAX(rag_first_chunk_enqueued_ms) AS max_rag_first_chunk_enqueued_ms,
+                AVG(stream_first_tts_ms) AS avg_stream_first_tts_ms,
+                MIN(stream_first_tts_ms) AS min_stream_first_tts_ms,
+                MAX(stream_first_tts_ms) AS max_stream_first_tts_ms,
+                AVG(stream_first_humanaudio_ms) AS avg_stream_first_humanaudio_ms,
+                MIN(stream_first_humanaudio_ms) AS min_stream_first_humanaudio_ms,
+                MAX(stream_first_humanaudio_ms) AS max_stream_first_humanaudio_ms,
+                AVG(stream_first_chunk_total_ms) AS avg_stream_first_chunk_total_ms,
+                MIN(stream_first_chunk_total_ms) AS min_stream_first_chunk_total_ms,
+                MAX(stream_first_chunk_total_ms) AS max_stream_first_chunk_total_ms,
+                AVG(stream_first_chunk_completed_ms) AS avg_stream_first_chunk_completed_ms,
+                MIN(stream_first_chunk_completed_ms) AS min_stream_first_chunk_completed_ms,
+                MAX(stream_first_chunk_completed_ms) AS max_stream_first_chunk_completed_ms,
+                AVG(stream_avg_tts_ms) AS avg_stream_avg_tts_ms,
+                MIN(stream_avg_tts_ms) AS min_stream_avg_tts_ms,
+                MAX(stream_avg_tts_ms) AS max_stream_avg_tts_ms,
+                AVG(stream_avg_humanaudio_ms) AS avg_stream_avg_humanaudio_ms,
+                MIN(stream_avg_humanaudio_ms) AS min_stream_avg_humanaudio_ms,
+                MAX(stream_avg_humanaudio_ms) AS max_stream_avg_humanaudio_ms,
+                AVG(stream_sum_tts_ms) AS avg_stream_sum_tts_ms,
+                AVG(stream_sum_humanaudio_ms) AS avg_stream_sum_humanaudio_ms
             FROM voice_turns
             """
         ).fetchone()
@@ -524,6 +628,30 @@ def _empty_summary() -> dict[str, Any]:
         "avg_webrtc_real_playback_ms": None,
         "min_webrtc_real_playback_ms": None,
         "max_webrtc_real_playback_ms": None,
+        "avg_stream_chunk_count": None,
+        "avg_rag_first_chunk_enqueued_ms": None,
+        "min_rag_first_chunk_enqueued_ms": None,
+        "max_rag_first_chunk_enqueued_ms": None,
+        "avg_stream_first_tts_ms": None,
+        "min_stream_first_tts_ms": None,
+        "max_stream_first_tts_ms": None,
+        "avg_stream_first_humanaudio_ms": None,
+        "min_stream_first_humanaudio_ms": None,
+        "max_stream_first_humanaudio_ms": None,
+        "avg_stream_first_chunk_total_ms": None,
+        "min_stream_first_chunk_total_ms": None,
+        "max_stream_first_chunk_total_ms": None,
+        "avg_stream_first_chunk_completed_ms": None,
+        "min_stream_first_chunk_completed_ms": None,
+        "max_stream_first_chunk_completed_ms": None,
+        "avg_stream_avg_tts_ms": None,
+        "min_stream_avg_tts_ms": None,
+        "max_stream_avg_tts_ms": None,
+        "avg_stream_avg_humanaudio_ms": None,
+        "min_stream_avg_humanaudio_ms": None,
+        "max_stream_avg_humanaudio_ms": None,
+        "avg_stream_sum_tts_ms": None,
+        "avg_stream_sum_humanaudio_ms": None,
         "first_event_ts": None,
         "last_event_ts": None,
     }
@@ -547,7 +675,12 @@ def get_voice_turn(turn_id: int) -> dict[str, Any] | None:
                    client_voice_turn_ms, human_dispatch_ms, human_dispatched,
                    time_to_audio_playback_ms, time_to_video_playback_ms, mic_to_video_playback_ms,
                    lip_sync_avatar_play_ms, stream_start_to_avatar_ms, video_stream_first_ms,
-                   webrtc_real_playback_ms
+                   webrtc_real_playback_ms,
+                   stream_chunk_count, rag_first_chunk_enqueued_ms,
+                   stream_first_tts_ms, stream_first_humanaudio_ms, stream_first_chunk_total_ms,
+                   stream_first_chunk_completed_ms,
+                   stream_avg_tts_ms, stream_avg_humanaudio_ms,
+                   stream_sum_tts_ms, stream_sum_humanaudio_ms
             FROM voice_turns WHERE id = ?
             """,
             (tid,),
@@ -570,7 +703,12 @@ def get_recent_voice_turns(limit: int = 50) -> list[dict[str, Any]]:
                    client_voice_turn_ms, human_dispatch_ms, human_dispatched,
                    time_to_audio_playback_ms, time_to_video_playback_ms, mic_to_video_playback_ms,
                    lip_sync_avatar_play_ms, stream_start_to_avatar_ms, video_stream_first_ms,
-                   webrtc_real_playback_ms
+                   webrtc_real_playback_ms,
+                   stream_chunk_count, rag_first_chunk_enqueued_ms,
+                   stream_first_tts_ms, stream_first_humanaudio_ms, stream_first_chunk_total_ms,
+                   stream_first_chunk_completed_ms,
+                   stream_avg_tts_ms, stream_avg_humanaudio_ms,
+                   stream_sum_tts_ms, stream_sum_humanaudio_ms
             FROM voice_turns
             ORDER BY id DESC
             LIMIT ?

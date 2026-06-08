@@ -39,12 +39,25 @@ from analytics_store import (
     record_voice_turn,
     update_voice_turn_human_dispatch_ms,
     update_voice_turn_lip_sync_latency,
+    update_voice_turn_stream_latency,
     update_voice_turn_webrtc_first_voice,
 )
+from hologram_trace import voice_trace
 from mongodb_analytics import (
     public_config as mongodb_public_config,
     schedule_record_avatar_turn,
     schedule_sync_avatar_turn,
+)
+from voice_tts_client import (
+    HumanaudioPipelineQueue,
+    HumanaudioWorkItem,
+    VoiceDispatchTiming,
+    dispatch_voice_to_livetalking,
+    record_chunk_latency,
+    speak_after_tts,
+    tts_max_parallel,
+    voice_dispatch_mode,
+    voice_stream_parallel_enabled,
 )
 from mongodb_export_trigger import (
     change_stream_enabled,
@@ -288,6 +301,17 @@ VOICE_STREAM_HUMAN_MIN_CHARS = max(
         "VOICE_STREAM_HUMAN_MIN_CHARS",
         default=1 if VOICE_STREAM_HUMAN_UNIT == "word" else 4,
     ),
+)
+# humanaudio + word stream: dispatch full sentences before partial word chunks (avoids duplicate speech).
+VOICE_TTS_FLUSH_SENTENCE = os.environ.get("VOICE_TTS_FLUSH_SENTENCE", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+VOICE_TTS_WORD_STREAM = os.environ.get("VOICE_TTS_WORD_STREAM", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
 )
 
 
@@ -966,6 +990,10 @@ class _HumanDispatchItem:
     interrupt: bool
     analytics_turn_id: int | None
     record_analytics: bool
+    latency_sink: list[dict[str, Any]] | None = None
+    stream_start: float | None = None
+    chunk_index: int = 0
+    enqueued_at: float | None = None
 
 
 class _LiveTalkingHumanQueue:
@@ -986,8 +1014,18 @@ class _LiveTalkingHumanQueue:
         self.sessionid = sessionid
         self._queue: asyncio.Queue[_HumanDispatchItem | None] = asyncio.Queue()
         self._worker: asyncio.Task | None = None
+        self._pipeline_seq = 0
+
+    def _use_parallel_humanaudio(self) -> bool:
+        return (
+            voice_dispatch_mode() == "humanaudio"
+            and voice_stream_parallel_enabled()
+            and bool(WEBRTC_SIGNALING_BASE)
+        )
 
     def _ensure_worker(self) -> None:
+        if self._use_parallel_humanaudio():
+            return
         if self._worker is None or self._worker.done():
             self._worker = asyncio.create_task(self._run())
 
@@ -1009,9 +1047,40 @@ class _LiveTalkingHumanQueue:
         interrupt: bool = False,
         analytics_turn_id: int | None = None,
         record_analytics: bool = True,
+        latency_sink: list[dict[str, Any]] | None = None,
+        stream_start: float | None = None,
+        chunk_index: int = 0,
     ) -> None:
         speak = text.strip()
         if not speak:
+            return
+        if self._use_parallel_humanaudio():
+            pipe = HumanaudioPipelineQueue.for_session(
+                self.sessionid, WEBRTC_SIGNALING_BASE or ""
+            )
+            if interrupt:
+                dropped = await pipe.reset_pending()
+                self._pipeline_seq = 0
+                if dropped:
+                    logger.info(
+                        "humanaudio pipeline sessionid=%s interrupt cleared %d item(s)",
+                        self.sessionid,
+                        dropped,
+                    )
+            self._pipeline_seq += 1
+            await pipe.submit(
+                HumanaudioWorkItem(
+                    seq=self._pipeline_seq,
+                    text=speak,
+                    interrupt=interrupt,
+                    chunk_index=chunk_index,
+                    analytics_turn_id=analytics_turn_id,
+                    record_analytics=record_analytics,
+                    latency_sink=latency_sink,
+                    stream_start=stream_start,
+                    enqueued_at=time.perf_counter(),
+                )
+            )
             return
         self._ensure_worker()
         if interrupt:
@@ -1028,10 +1097,20 @@ class _LiveTalkingHumanQueue:
                 interrupt=interrupt,
                 analytics_turn_id=analytics_turn_id,
                 record_analytics=record_analytics,
+                latency_sink=latency_sink,
+                stream_start=stream_start,
+                chunk_index=chunk_index,
+                enqueued_at=time.perf_counter(),
             )
         )
 
     async def drain(self) -> None:
+        if self._use_parallel_humanaudio():
+            pipe = HumanaudioPipelineQueue.for_session(
+                self.sessionid, WEBRTC_SIGNALING_BASE or ""
+            )
+            await pipe.drain()
+            return
         if self._worker is None:
             return
         await self._queue.join()
@@ -1042,15 +1121,113 @@ class _LiveTalkingHumanQueue:
             try:
                 if item is None:
                     continue
-                await _dispatch_livetalking_human(
+                _ms, timing = await _dispatch_livetalking_human(
                     item.text,
                     self.sessionid,
                     analytics_turn_id=item.analytics_turn_id,
                     interrupt=item.interrupt,
                     record_analytics=item.record_analytics,
                 )
+                if item.latency_sink is not None and timing is not None:
+                    _append_chunk_latency(
+                        item.latency_sink,
+                        item,
+                        timing,
+                    )
             finally:
                 self._queue.task_done()
+
+
+def _append_chunk_latency(
+    sink: list[dict[str, Any]],
+    item: _HumanDispatchItem,
+    timing: VoiceDispatchTiming,
+) -> None:
+    now = time.perf_counter()
+    entry: dict[str, Any] = {
+        "chunk": item.chunk_index,
+        **timing.as_dict(),
+    }
+    if item.stream_start is not None:
+        entry["enqueued_ms"] = round(
+            ((item.enqueued_at or item.stream_start) - item.stream_start) * 1000.0, 1
+        )
+        entry["completed_ms"] = round((now - item.stream_start) * 1000.0, 1)
+    if item.enqueued_at is not None:
+        entry["queue_wait_ms"] = round((now - item.enqueued_at) * 1000.0, 1)
+    sink.append(entry)
+
+
+def _chunk_stage_total_ms(chunk: dict[str, Any]) -> float | None:
+    """Per-sentence TTS + humanaudio (or legacy total_ms / human dispatch)."""
+    tts = chunk.get("tts_ms")
+    ha = chunk.get("humanaudio_ms")
+    if tts is not None and ha is not None:
+        return round(float(tts) + float(ha), 1)
+    if chunk.get("total_ms") is not None:
+        return round(float(chunk["total_ms"]), 1)
+    if chunk.get("human_dispatch_ms") is not None:
+        return round(float(chunk["human_dispatch_ms"]), 1)
+    return None
+
+
+def _summarize_chunk_latencies(chunks: list[dict[str, Any]]) -> dict[str, Any]:
+    if not chunks:
+        return {}
+    totals = [
+        t for c in chunks if (t := _chunk_stage_total_ms(c)) is not None
+    ]
+    tts_vals = [float(c["tts_ms"]) for c in chunks if c.get("tts_ms") is not None]
+    ha_vals = [
+        float(c["humanaudio_ms"]) for c in chunks if c.get("humanaudio_ms") is not None
+    ]
+    human_vals = [
+        float(c["human_dispatch_ms"]) for c in chunks if c.get("human_dispatch_ms") is not None
+    ]
+    first = chunks[0]
+    first_total = _chunk_stage_total_ms(first)
+    summary: dict[str, Any] = {
+        "chunk_count": len(chunks),
+        "first_chunk_enqueued_ms": first.get("enqueued_ms"),
+        "first_chunk_completed_ms": first.get("completed_ms"),
+        "first_chunk_tts_ms": first.get("tts_ms"),
+        "first_chunk_humanaudio_ms": first.get("humanaudio_ms"),
+        "first_chunk_total_ms": first_total,
+        "first_chunk_human_dispatch_ms": first.get("human_dispatch_ms"),
+    }
+    if totals:
+        summary["avg_total_ms"] = round(sum(totals) / len(totals), 1)
+        summary["sum_total_ms"] = round(sum(totals), 1)
+    if tts_vals:
+        summary["avg_tts_ms"] = round(sum(tts_vals) / len(tts_vals), 1)
+        summary["sum_tts_ms"] = round(sum(tts_vals), 1)
+    if ha_vals:
+        summary["avg_humanaudio_ms"] = round(sum(ha_vals) / len(ha_vals), 1)
+        summary["sum_humanaudio_ms"] = round(sum(ha_vals), 1)
+    if human_vals:
+        summary["avg_human_dispatch_ms"] = round(sum(human_vals) / len(human_vals), 1)
+    return summary
+
+
+def _stream_latency_fields(stream_human_meta: dict[str, Any]) -> dict[str, Any]:
+    """Extract per-turn word-stream TTS / humanaudio metrics for analytics."""
+    lat = stream_human_meta.get("stream_dispatch_latency") or {}
+    summary = lat.get("summary") or {}
+    if not summary and not lat:
+        return {}
+    return {
+        "stream_chunk_count": summary.get("chunk_count"),
+        "rag_first_chunk_enqueued_ms": lat.get("rag_first_chunk_enqueued_ms")
+        or summary.get("first_chunk_enqueued_ms"),
+        "stream_first_tts_ms": summary.get("first_chunk_tts_ms"),
+        "stream_first_humanaudio_ms": summary.get("first_chunk_humanaudio_ms"),
+        "stream_first_chunk_total_ms": summary.get("first_chunk_total_ms"),
+        "stream_first_chunk_completed_ms": summary.get("first_chunk_completed_ms"),
+        "stream_avg_tts_ms": summary.get("avg_tts_ms"),
+        "stream_avg_humanaudio_ms": summary.get("avg_humanaudio_ms"),
+        "stream_sum_tts_ms": summary.get("sum_tts_ms"),
+        "stream_sum_humanaudio_ms": summary.get("sum_humanaudio_ms"),
+    }
 
 
 async def _enqueue_livetalking_human(
@@ -1060,6 +1237,9 @@ async def _enqueue_livetalking_human(
     analytics_turn_id: int | None = None,
     interrupt: bool = True,
     record_analytics: bool = True,
+    latency_sink: list[dict[str, Any]] | None = None,
+    stream_start: float | None = None,
+    chunk_index: int = 0,
 ) -> None:
     sid = str(sessionid or "").strip()
     if not sid or not speak_text.strip():
@@ -1069,6 +1249,9 @@ async def _enqueue_livetalking_human(
         interrupt=interrupt,
         analytics_turn_id=analytics_turn_id,
         record_analytics=record_analytics,
+        latency_sink=latency_sink,
+        stream_start=stream_start,
+        chunk_index=chunk_index,
     )
 
 
@@ -1079,14 +1262,31 @@ async def _dispatch_livetalking_human(
     analytics_turn_id: int | None = None,
     interrupt: bool = True,
     record_analytics: bool = True,
-) -> float | None:
-    """Fire TTS/lip-sync on LiveTalking. Returns POST round-trip ms, or None on skip/error."""
+) -> tuple[float | None, VoiceDispatchTiming | None]:
+    """Fire TTS/lip-sync on LiveTalking. Returns (round-trip ms, timing detail) or (None, None)."""
     if not WEBRTC_SIGNALING_BASE:
-        return None
+        return None, None
     text = speak_text.strip()
     sid = str(sessionid or "").strip()
     if not text or not sid:
-        return None
+        return None, None
+    if voice_dispatch_mode() == "humanaudio":
+        ms, timing = await speak_after_tts(
+            text,
+            sid,
+            webrtc_base=WEBRTC_SIGNALING_BASE,
+            interrupt=interrupt,
+        )
+        if (
+            record_analytics
+            and analytics_turn_id is not None
+            and analytics_turn_id > 0
+            and ms is not None
+        ):
+            if update_voice_turn_human_dispatch_ms(int(analytics_turn_id), ms):
+                schedule_sync_avatar_turn(analytics_turn_id)
+                await _publish_analytics_snapshot()
+        return ms, timing
     url = f"{WEBRTC_SIGNALING_BASE}/human"
     payload = {
         "text": text,
@@ -1110,26 +1310,31 @@ async def _dispatch_livetalking_human(
             )
     except Exception as e:
         logger.warning("LiveTalking /human dispatch failed: %s", e)
-    finally:
-        ms = (time.perf_counter() - t0) * 1000.0
-        logger.info(
-            "LiveTalking /human finished sessionid=%s dispatch_ms=%.0f status=%s interrupt=%s chars=%d",
-            sid,
-            ms,
-            status_code if status_code is not None else "error",
-            interrupt,
-            len(text),
-        )
-        if (
-            record_analytics
-            and analytics_turn_id is not None
-            and analytics_turn_id > 0
-            and ms is not None
-        ):
-            if update_voice_turn_human_dispatch_ms(int(analytics_turn_id), ms):
-                schedule_sync_avatar_turn(analytics_turn_id)
-                await _publish_analytics_snapshot()
-    return ms
+    ms = (time.perf_counter() - t0) * 1000.0
+    logger.info(
+        "LiveTalking /human finished sessionid=%s dispatch_ms=%.0f status=%s interrupt=%s chars=%d",
+        sid,
+        ms,
+        status_code if status_code is not None else "error",
+        interrupt,
+        len(text),
+    )
+    if (
+        record_analytics
+        and analytics_turn_id is not None
+        and analytics_turn_id > 0
+        and ms is not None
+    ):
+        if update_voice_turn_human_dispatch_ms(int(analytics_turn_id), ms):
+            schedule_sync_avatar_turn(analytics_turn_id)
+            await _publish_analytics_snapshot()
+    timing = VoiceDispatchTiming(
+        mode="human",
+        chars=len(text),
+        human_dispatch_ms=round(ms, 1),
+        total_ms=round(ms, 1),
+    )
+    return ms, timing
 
 
 @app.post("/record")
@@ -1897,6 +2102,7 @@ async def webrtc_proxy_status():
         "voice_stream_human_words_per_chunk": VOICE_STREAM_HUMAN_WORDS_PER_CHUNK,
         "voice_stream_human_unit_label": _voice_stream_human_unit_label(),
         "voice_stream_human_min_chars": VOICE_STREAM_HUMAN_MIN_CHARS,
+        "voice_dispatch_mode": voice_dispatch_mode(),
         "idle_loop_video": IDLE_LOOP_VIDEO,
     }
 
@@ -2504,16 +2710,24 @@ def _pop_complete_sentences(buf: str) -> tuple[list[str], str]:
     rest = buf
     while rest:
         m = re.search(r'[.!?。！？]+["\']?', rest)
-        if not m:
-            break
-        end = m.end()
-        if end < len(rest) and not rest[end].isspace():
-            break
-        candidate = rest[:end].strip()
-        if len(candidate) < VOICE_STREAM_HUMAN_MIN_CHARS:
-            break
-        sentences.append(candidate)
-        rest = rest[end:].lstrip()
+        if m:
+            end = m.end()
+            if end < len(rest) and not rest[end].isspace():
+                break
+            candidate = rest[:end].strip()
+            if len(candidate) < VOICE_STREAM_HUMAN_MIN_CHARS:
+                break
+            sentences.append(candidate)
+            rest = rest[end:].lstrip()
+            continue
+        nl = rest.find("\n")
+        if nl >= 0:
+            candidate = rest[:nl].strip()
+            if len(candidate) >= VOICE_STREAM_HUMAN_MIN_CHARS:
+                sentences.append(candidate)
+                rest = rest[nl + 1 :].lstrip()
+                continue
+        break
     return sentences, rest
 
 
@@ -2570,6 +2784,8 @@ class _StreamHumanDispatcher:
         self.first_sentence_ms: float | None = None
         self.first_dispatch_http_ms: float | None = None
         self.show_image: dict[str, Any] | None = None
+        self.chunk_latencies: list[dict[str, Any]] = []
+        self._dispatch_lock = asyncio.Lock()
 
     def set_show_image(self, payload: dict[str, Any] | None) -> None:
         if payload:
@@ -2584,40 +2800,120 @@ class _StreamHumanDispatcher:
     async def finish(self) -> None:
         await self._flush_chunks(final=True)
         await _LiveTalkingHumanQueue.for_session(self.sessionid).drain()
+        self._log_latency_summary()
+
+    def latency_meta(self) -> dict[str, Any]:
+        summary = _summarize_chunk_latencies(self.chunk_latencies)
+        return {
+            "dispatch_mode": voice_dispatch_mode(),
+            "parallel_pipeline": voice_stream_parallel_enabled(),
+            "tts_max_parallel": (
+                tts_max_parallel() if voice_stream_parallel_enabled() else 1
+            ),
+            "rag_first_chunk_enqueued_ms": (
+                round(self.first_sentence_ms, 1)
+                if self.first_sentence_ms is not None
+                else None
+            ),
+            "chunks": self.chunk_latencies[-32:],
+            "summary": summary,
+        }
+
+    def _log_latency_summary(self) -> None:
+        if not self.chunk_latencies:
+            voice_trace(
+                f"stream DONE session={self.sessionid[:8]}… chunks=0 (no speakable text)"
+            )
+            return
+        summary = _summarize_chunk_latencies(self.chunk_latencies)
+        voice_trace(
+            f"stream DONE session={self.sessionid[:8]}… chunks={summary.get('chunk_count', 0)} "
+            f"first_tts_ms={summary.get('first_chunk_tts_ms')} "
+            f"first_ha_ms={summary.get('first_chunk_humanaudio_ms')} "
+            f"avg_total_ms={summary.get('avg_total_ms')} "
+            f"sum_tts_ms={summary.get('sum_tts_ms')} sum_ha_ms={summary.get('sum_humanaudio_ms')}"
+        )
+        logger.info(
+            "voice-turn stream LATENCY sessionid=%s mode=%s unit=%s chunks=%d "
+            "first_enqueued_ms=%s first_completed_ms=%s first_tts_ms=%s "
+            "first_humanaudio_ms=%s first_total_ms=%s avg_total_ms=%s sum_total_ms=%s",
+            self.sessionid,
+            voice_dispatch_mode(),
+            self.chunk_unit,
+            summary.get("chunk_count", 0),
+            summary.get("first_chunk_enqueued_ms"),
+            summary.get("first_chunk_completed_ms"),
+            summary.get("first_chunk_tts_ms"),
+            summary.get("first_chunk_humanaudio_ms"),
+            summary.get("first_chunk_total_ms"),
+            summary.get("avg_total_ms"),
+            summary.get("sum_total_ms"),
+        )
 
     async def _flush_chunks(self, *, final: bool) -> None:
         prefix = _speakable_stream_prefix(self.buffer)
         safe_tail = self.buffer[len(prefix) :]
-        chunks, remainder = _pop_stream_chunks(prefix)
-        self.buffer = remainder + safe_tail
-        for chunk in chunks:
-            await self._dispatch_one(chunk)
+        pending: list[str] = []
+        if VOICE_STREAM_HUMAN_UNIT == "sentence":
+            sentences, remainder = _pop_complete_sentences(prefix)
+            pending.extend(sentences)
+            self.buffer = remainder + safe_tail
+        else:
+            humanaudio_word = voice_dispatch_mode() == "humanaudio"
+            if humanaudio_word and VOICE_TTS_FLUSH_SENTENCE:
+                sentences, prefix = _pop_complete_sentences(prefix)
+                pending.extend(sentences)
+            chunks, remainder = _pop_stream_chunks(prefix)
+            if humanaudio_word and VOICE_TTS_FLUSH_SENTENCE and not VOICE_TTS_WORD_STREAM:
+                chunks = []
+            self.buffer = remainder + safe_tail
+            pending.extend(chunks)
         if final and self.buffer.strip():
-            tail = self.buffer.strip()
+            pending.append(self.buffer.strip())
             self.buffer = ""
-            await self._dispatch_one(tail)
+        parallel = voice_stream_parallel_enabled() and voice_dispatch_mode() == "humanaudio"
+        if pending:
+            voice_trace(
+                f"flush n={len(pending)} final={final} parallel={parallel} "
+                f"session={self.sessionid[:8]}…"
+            )
+        if parallel and pending:
+            await asyncio.gather(*(self._dispatch_one(text) for text in pending))
+        else:
+            for text in pending:
+                await self._dispatch_one(text)
 
     async def _dispatch_one(self, raw_chunk: str) -> None:
         speak = _prepare_stream_sentence_for_human(raw_chunk, self.show_image)
         if len(speak) < VOICE_STREAM_HUMAN_MIN_CHARS:
             return
-        interrupt = self.sentence_count == 0
-        if self.first_sentence_ms is None:
-            self.first_sentence_ms = (time.perf_counter() - self.stream_start) * 1000.0
-        self.sentence_count += 1
+        async with self._dispatch_lock:
+            interrupt = self.sentence_count == 0
+            if self.first_sentence_ms is None:
+                self.first_sentence_ms = (time.perf_counter() - self.stream_start) * 1000.0
+            self.sentence_count += 1
+            chunk_index = self.sentence_count
+        dispatch_label = (
+            "humanaudio" if voice_dispatch_mode() == "humanaudio" else "/human"
+        )
         logger.info(
-            "voice-turn stream /human %s #%d interrupt=%s chars=%d preview=%r",
+            "voice-turn stream %s %s #%d interrupt=%s chars=%d preview=%r parallel=%s",
+            dispatch_label,
             self.chunk_unit,
-            self.sentence_count,
+            chunk_index,
             interrupt,
             len(speak),
             speak[:80],
+            voice_stream_parallel_enabled(),
         )
         await _enqueue_livetalking_human(
             speak,
             self.sessionid,
             interrupt=interrupt,
             record_analytics=False,
+            latency_sink=self.chunk_latencies,
+            stream_start=self.stream_start,
+            chunk_index=chunk_index,
         )
 
 
@@ -2707,10 +3003,10 @@ def _show_image_has_items(payload: dict[str, Any] | None) -> bool:
     return isinstance(items, list) and len(items) > 0
 
 
-@app.post("/api/voice-turn")
-async def voice_turn(body: VoiceTurnBody):
+async def _voice_pipeline(body: VoiceTurnBody, *, humanaudio_only: bool = False) -> dict[str, Any]:
     """
-    Browser STT text → Video Q&A Qdrant (>= threshold) plays stored clip; else Chroma RAG + LLM + LiveTalking.
+    Browser STT text → Video Q&A cache or Chroma RAG + LLM.
+    humanaudio_only: stream chunks and final speak via /v1/tts/reference → /humanaudiowithpath.
     """
     user_text = body.text.strip()
     if not user_text:
@@ -2720,8 +3016,22 @@ async def voice_turn(body: VoiceTurnBody):
 
     from hologram_trace import trace as hologram_trace
 
+    pipeline_label = "voice-stream" if humanaudio_only else "voice-turn"
+    rag_host = (
+        urlparse(RAG_GENERATE_STREAM_URL).netloc
+        if RAG_GENERATE_STREAM_URL
+        else "(none)"
+    )
+    sid_short = f"{sid[:8]}…" if len(sid) > 8 else (sid or "none")
+    voice_trace(
+        f"START {pipeline_label} session={sid_short} dispatch={voice_dispatch_mode()} "
+        f"parallel={voice_stream_parallel_enabled()} "
+        f"tts_workers={tts_max_parallel() if voice_stream_parallel_enabled() else 1} "
+        f"rag_host={rag_host} chroma={'on' if VOICE_RAG_ENABLED else 'off'} "
+        f"text={user_text[:72]!r}"
+    )
     hologram_trace(
-        f"voice-turn: START sessionid={sid or '(none)'} text={user_text[:100]!r}"
+        f"{pipeline_label}: START sessionid={sid or '(none)'} text={user_text[:100]!r}"
     )
 
     video_hit = None
@@ -2844,15 +3154,23 @@ async def voice_turn(body: VoiceTurnBody):
     if (
         use_rag_stream
         and VOICE_STREAM_HUMAN
-        and VOICE_DISPATCH_HUMAN
         and WEBRTC_SIGNALING_BASE
         and sid
         and sid != "0"
+        and (humanaudio_only or VOICE_DISPATCH_HUMAN)
     ):
         stream_human_sessionid = sid
+        voice_trace(
+            f"RAG+TTS stream enabled session={sid_short} unit={VOICE_STREAM_HUMAN_UNIT} "
+            f"words_per_chunk={VOICE_STREAM_HUMAN_WORDS_PER_CHUNK}"
+        )
     if use_rag_stream:
         rag_meta["llm"] = "rag_generate_stream"
         conversation = _build_voice_rag_stream_conversation(user_text, chroma_hits)
+        voice_trace(
+            f"RAG POST → {rag_host} messages={len(conversation)} "
+            f"context_msgs={sum(1 for m in conversation if m.get('role') == 'system')}"
+        )
         t_rag = time.perf_counter()
         try:
             stream_result = await _collect_rag_generate_stream(
@@ -2865,9 +3183,11 @@ async def voice_turn(body: VoiceTurnBody):
             stream_show_image = stream_result[1]
             if len(stream_result) > 2 and isinstance(stream_result[2], dict):
                 stream_human_meta = stream_result[2]
-        except HTTPException:
+        except HTTPException as he:
+            voice_trace(f"RAG HTTP {he.status_code} detail={str(he.detail)[:200]}")
             raise
         except Exception as e:
+            voice_trace(f"RAG FAILED host={rag_host} error={e!s}")
             logger.warning("RAG generate stream (voice-turn) failed: %s", e)
             raise HTTPException(status_code=502, detail=f"RAG generate stream failed: {e}") from e
         finally:
@@ -2878,8 +3198,18 @@ async def voice_turn(body: VoiceTurnBody):
         if stream_human_meta.get("stream_human"):
             rag_meta["stream_human"] = True
             rag_meta["human_sentence_count"] = stream_human_meta.get("human_sentence_count", 0)
+            rag_meta["human_chunk_count"] = stream_human_meta.get("human_chunk_count", 0)
+            rag_meta["stream_human_unit"] = stream_human_meta.get("stream_human_unit")
+            rag_meta["dispatch_mode"] = stream_human_meta.get("dispatch_mode")
+            if stream_human_meta.get("rag_first_sentence_ms") is not None:
+                rag_meta["rag_first_chunk_ms"] = stream_human_meta["rag_first_sentence_ms"]
+            if stream_human_meta.get("stream_dispatch_latency"):
+                rag_meta["stream_dispatch_latency"] = stream_human_meta[
+                    "stream_dispatch_latency"
+                ]
     else:
         rag_meta["llm"] = "ollama"
+        voice_trace("LLM fallback=ollama (RAG stream URL not configured)")
         answer = await ollama_generate(prompt, ollama_metrics, max_tokens=VOICE_MAX_TOKENS)
         stream_show_image = None
     if not (answer or "").strip():
@@ -2939,15 +3269,60 @@ async def voice_turn(body: VoiceTurnBody):
         human_dispatched = True
         if analytics_turn_id is not None:
             mark_voice_turn_human_dispatched(analytics_turn_id)
+            stream_lat_fields = _stream_latency_fields(stream_human_meta)
+            if stream_lat_fields:
+                if update_voice_turn_stream_latency(
+                    analytics_turn_id,
+                    **stream_lat_fields,
+                ):
+                    await _publish_analytics_snapshot()
             schedule_sync_avatar_turn(analytics_turn_id)
+        lat_summary = (
+            (stream_human_meta.get("stream_dispatch_latency") or {}).get("summary") or {}
+        )
         logger.info(
-            "voice-turn: stream /human dispatched %d sentence(s) sessionid=%s first_sentence_ms=%s",
+            "voice-turn: stream voice dispatched %d chunk(s) sessionid=%s "
+            "mode=%s first_enqueued_ms=%s first_completed_ms=%s first_tts_ms=%s "
+            "first_humanaudio_ms=%s first_total_ms=%s avg_total_ms=%s",
             int(stream_human_meta.get("human_sentence_count") or 0),
             sid,
-            stream_human_meta.get("rag_first_sentence_ms"),
+            stream_human_meta.get("dispatch_mode"),
+            lat_summary.get("first_chunk_enqueued_ms"),
+            lat_summary.get("first_chunk_completed_ms"),
+            lat_summary.get("first_chunk_tts_ms"),
+            lat_summary.get("first_chunk_humanaudio_ms"),
+            lat_summary.get("first_chunk_total_ms"),
+            lat_summary.get("avg_total_ms"),
         )
     elif (
-        VOICE_DISPATCH_HUMAN
+        humanaudio_only
+        and WEBRTC_SIGNALING_BASE
+        and speak_len > 0
+        and sid
+        and sid != "0"
+    ):
+        asyncio.create_task(
+            _enqueue_livetalking_human(
+                speak_text,
+                sid,
+                analytics_turn_id=analytics_turn_id,
+            )
+        )
+        human_dispatched = True
+        if analytics_turn_id is not None:
+            mark_voice_turn_human_dispatched(analytics_turn_id)
+            schedule_sync_avatar_turn(analytics_turn_id)
+        hologram_trace(
+            f"voice-stream: queued TTS→humanaudiowithpath sessionid={sid} speak_chars={speak_len}"
+        )
+        logger.info(
+            "voice-stream: queued TTS→humanaudiowithpath sessionid=%s speak_chars=%d",
+            sid,
+            speak_len,
+        )
+    elif (
+        not humanaudio_only
+        and VOICE_DISPATCH_HUMAN
         and WEBRTC_SIGNALING_BASE
         and speak_len > 0
         and sid
@@ -3005,6 +3380,16 @@ async def voice_turn(body: VoiceTurnBody):
         f"voice-turn: DONE livetalking human_dispatched={human_dispatched} "
         f"total_ms={round(total_ms, 1)} answer_chars={speak_len}"
     )
+    stream_chunks = int(stream_human_meta.get("human_sentence_count") or 0)
+    lat = (stream_human_meta.get("stream_dispatch_latency") or {}).get("summary") or {}
+    voice_trace(
+        f"DONE {pipeline_label} session={sid_short} total_ms={round(total_ms, 0)} "
+        f"rag_ms={round(rag_latency_ms, 0) if rag_latency_ms is not None else '-'} "
+        f"answer_chars={speak_len} speak_chunks={stream_chunks} "
+        f"human_dispatched={human_dispatched} "
+        f"first_tts_ms={lat.get('first_chunk_tts_ms')} "
+        f"first_ha_ms={lat.get('first_chunk_humanaudio_ms')}"
+    )
     return {
         "answer": answer,
         "speak_text": speak_text,
@@ -3016,7 +3401,25 @@ async def voice_turn(body: VoiceTurnBody):
         "analytics_turn_id": analytics_turn_id,
         "total_request_ms": round(total_ms, 1),
         "human_dispatched": human_dispatched,
+        "pipeline": "voice-stream" if humanaudio_only else "voice-turn",
     }
+
+
+@app.post("/api/voice-turn")
+async def voice_turn(body: VoiceTurnBody):
+    """Legacy: may use LiveTalking /human when VOICE_DISPATCH_MODE=human."""
+    return await _voice_pipeline(body, humanaudio_only=False)
+
+
+@app.post("/api/voice-stream")
+async def voice_stream(body: VoiceTurnBody):
+    """STT text → RAG stream → /v1/tts/reference → /humanaudiowithpath (no /human)."""
+    if voice_dispatch_mode() != "humanaudio":
+        raise HTTPException(
+            status_code=400,
+            detail="Set VOICE_DISPATCH_MODE=humanaudio to use /api/voice-stream.",
+        )
+    return await _voice_pipeline(body, humanaudio_only=True)
 
 
 @app.get("/api/analytics/summary")
@@ -3311,8 +3714,11 @@ async def _collect_rag_generate_stream(
     total = 0
     stream_start = time.perf_counter()
     human_dispatcher: _StreamHumanDispatcher | None = None
+    rag_host = urlparse(url).netloc or url
+    first_token_logged = False
     if voice_turn and stream_human_sessionid:
         human_dispatcher = _StreamHumanDispatcher(stream_human_sessionid, stream_start)
+        voice_trace(f"RAG connecting host={rag_host} session={stream_human_sessionid[:8]}…")
 
     def _note_stream_show_image(data: dict[str, Any]) -> None:
         nonlocal stream_show_image
@@ -3326,9 +3732,15 @@ async def _collect_rag_generate_stream(
                 human_dispatcher.set_show_image(norm)
 
     async def _append(s: str) -> bool:
-        nonlocal total
+        nonlocal total, first_token_logged
         if not s:
             return True
+        if voice_turn and not first_token_logged:
+            first_token_logged = True
+            voice_trace(
+                f"RAG first token +{(time.perf_counter() - stream_start) * 1000:.0f}ms "
+                f"piece_len={len(s)} host={rag_host}"
+            )
         total += len(s)
         if total > RAG_GENERATE_STREAM_MAX_CHARS:
             return False
@@ -3336,6 +3748,15 @@ async def _collect_rag_generate_stream(
         if human_dispatcher:
             await human_dispatcher.feed(s)
         return True
+
+    def _log_rag_stream_done(answer_text: str) -> None:
+        if not voice_turn:
+            return
+        chunks = human_dispatcher.sentence_count if human_dispatcher else 0
+        voice_trace(
+            f"RAG stream end host={rag_host} chars={len(answer_text)} "
+            f"ms={(time.perf_counter() - stream_start) * 1000:.0f} speak_chunks={chunks}"
+        )
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         async with client.stream("POST", url, json=payload, headers=headers) as response:
@@ -3365,6 +3786,7 @@ async def _collect_rag_generate_stream(
                 out = "".join(pieces).strip()
                 if human_dispatcher:
                     await human_dispatcher.finish()
+                _log_rag_stream_done(out)
                 return _rag_stream_voice_result(out, stream_show_image, human_dispatcher, voice_turn)
 
             async for raw in response.aiter_lines():
@@ -3400,6 +3822,7 @@ async def _collect_rag_generate_stream(
     out = "".join(pieces).strip()
     if human_dispatcher:
         await human_dispatcher.finish()
+    _log_rag_stream_done(out)
     return _rag_stream_voice_result(out, stream_show_image, human_dispatcher, voice_turn)
 
 
@@ -3413,22 +3836,17 @@ def _rag_stream_voice_result(
         return answer
     meta: dict[str, Any] = {}
     if human_dispatcher:
+        lat = human_dispatcher.latency_meta()
         meta = {
             "stream_human": True,
             "stream_human_unit": human_dispatcher.chunk_unit,
             "stream_human_words_per_chunk": human_dispatcher.words_per_chunk,
             "human_sentence_count": human_dispatcher.sentence_count,
             "human_chunk_count": human_dispatcher.sentence_count,
-            "rag_first_sentence_ms": (
-                round(human_dispatcher.first_sentence_ms, 1)
-                if human_dispatcher.first_sentence_ms is not None
-                else None
-            ),
-            "rag_first_chunk_ms": (
-                round(human_dispatcher.first_sentence_ms, 1)
-                if human_dispatcher.first_sentence_ms is not None
-                else None
-            ),
+            "rag_first_sentence_ms": lat.get("rag_first_chunk_enqueued_ms"),
+            "rag_first_chunk_ms": lat.get("rag_first_chunk_enqueued_ms"),
+            "dispatch_mode": lat.get("dispatch_mode"),
+            "stream_dispatch_latency": lat,
         }
     return answer, stream_show_image, meta
 

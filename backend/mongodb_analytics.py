@@ -130,8 +130,11 @@ def _sanitize_rag_meta(rag: dict[str, Any] | None) -> dict[str, Any] | None:
         "llm",
         "rag_latency_ms",
         "rag_first_sentence_ms",
+        "rag_first_chunk_ms",
         "stream_human",
         "human_sentence_count",
+        "dispatch_mode",
+        "stream_dispatch_latency",
     )
     slim = {k: rag[k] for k in allowed if k in rag}
     return slim or None
