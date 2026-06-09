@@ -1,49 +1,26 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
+import { getSelectedAvatarId, setSelectedAvatarId } from "./selectedAvatar.js";
 
-const languages = ["Auto", "Chinese", "English", "German", "Italian", "Portuguese", "Spanish", "Japanese", "Korean", "French", "Russian"];
-
-const avatarVoiceName = ref("Avatar Voice");
 const promptText = ref("");
 const voiceAudioUploadInput = ref(null);
 const audioScriptUploadInput = ref(null);
 const VOICE_AUDIO_ACCEPT = "audio/*,.wav,.webm,.mp3,.m4a,.ogg,.aac";
 const customerRecordFile = ref(null);
 const customerRecordPreview = ref("");
-const customerSaveUrl = ref("");
+const referenceId = ref("ref101");
+const referenceAudioSaved = ref(null);
+const activeVoiceReferenceId = ref("");
+const setVoiceReferenceBusy = ref(false);
 const customerStatus = ref("");
 const customerRecording = ref(false);
 const customerRecordBusy = ref(false);
-const customerCloneBusy = ref(false);
 
-const voicesAvailable = ref([]);
-const selectedVoiceUrl = ref("");
-const selectedVoiceFile = ref(null);
-const voiceProfileUrl = ref("");
-const voiceProfileStatus = ref("");
-
-const generateText = ref("Hello, good morning. How are you?");
-const generateLang = ref("English");
-const generateBusy = ref(false);
-const generateStatus = ref("");
-const generateAudioUrl = ref("");
-
-const voiceCount = computed(() => voicesAvailable.value.length);
 const avatarVideoSucceeded = computed(
   () => avatarVideoJobStatus.value === "succeeded" && Boolean(avatarVideoUrl.value),
 );
 
-function hologramAssetLabel(item, idKey) {
-  if (!item) return "";
-  const id = item[idKey] || "";
-  const name = item.filename;
-  return name ? `${id} (${name})` : id;
-}
-
-const hasSavedRecording = computed(() => Boolean(customerSaveUrl.value));
 const hasVoiceSourceAudio = computed(() => Boolean(customerRecordFile.value));
-const hasVoiceProfile = computed(() => Boolean(voiceProfileUrl.value));
-const hasVoiceFileReady = computed(() => Boolean(selectedVoiceFile.value));
 
 const ragFileInput = ref(null);
 const ragChunkCount = ref(null);
@@ -70,9 +47,6 @@ const dropboxConfig = ref(null);
 const dropboxSyncBusy = ref(false);
 const dropboxSyncSummary = ref("");
 
-/** Avatar voice hub: which step panel is open (1–3) */
-const openVoiceStudioStep = ref(null);
-
 const avatarVideoImageFile = ref(null);
 const avatarVideoImagePreview = ref("");
 const avatarVideoRefFile = ref(null);
@@ -85,24 +59,25 @@ const avatarVideoUrl = ref("");
 
 const hologramAvatarConfigured = ref(false);
 const hologramGeneratedVideoId = ref("gen_video_1");
-const hologramAudioId = ref("ref_audio_1");
 const hologramUploadGeneratedVideoBusy = ref(false);
-const hologramUploadAudioBusy = ref(false);
 const hologramUploadGeneratedVideoStatus = ref("");
-const hologramUploadAudioStatus = ref("");
-const hologramSavedVideos = ref([]);
-const hologramSavedAudios = ref([]);
-const hologramPrepareForm = ref({
-  profile_id: "new_profile",
+
+const avatarTaskForm = ref({
+  model: "wav2lip",
   avatar_id: "new_avatar",
-  video_id: "",
-  audio_id: "",
-  ref_text: "",
-  force_regenerate: false,
-  set_as_default: true,
+  img_size: "256",
+  bbox_shift: "0",
+  pads: "0 10 0 0",
+  face_det_batch_size: "4",
 });
-const hologramPrepareBusy = ref(false);
-const hologramPrepareStatus = ref("");
+const avatarTaskVideoFile = ref(null);
+const avatarTaskVideoInput = ref(null);
+const avatarTaskBusy = ref(false);
+const avatarTaskStatus = ref("");
+const avatarTasks = ref([]);
+const avatarTasksLoadError = ref("");
+const selectedLiveAvatarId = ref(getSelectedAvatarId());
+const setAvatarStatus = ref("");
 
 /** Knowledge hub: grid + detail panel */
 const activeKbSource = ref(null);
@@ -285,27 +260,108 @@ async function postJson(path, body) {
   return data;
 }
 
-async function loadHologramAvatarAssets() {
+function triggerAvatarTaskVideoUpload() {
+  avatarTaskVideoInput.value?.click();
+}
+
+function onAvatarTaskVideo(ev) {
+  const f = ev.target.files?.[0];
+  avatarTaskVideoFile.value = f || null;
+}
+
+async function loadAvatarTasks() {
   try {
-    const res = await fetch(apiUrl("/api/avatar/hologram/assets"));
+    const res = await fetch(apiUrl("/api/avatar/tasks"));
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) return;
-    hologramAvatarConfigured.value = data.hologram_avatar_configured === true;
-    hologramSavedVideos.value = Array.isArray(data.videos) ? data.videos : [];
-    hologramSavedAudios.value = Array.isArray(data.audios) ? data.audios : [];
-    const pf = hologramPrepareForm.value;
-    if (!pf.video_id && hologramSavedVideos.value.length) {
-      pf.video_id = hologramSavedVideos.value[0].video_id || "";
-    }
-    if (!pf.audio_id && hologramSavedAudios.value.length) {
-      pf.audio_id = hologramSavedAudios.value[0].audio_id || "";
-    }
-    const latest = data.latest_prepare;
-    if (latest?.profile_id && !pf.profile_id) pf.profile_id = latest.profile_id;
-    if (latest?.avatar_id && pf.avatar_id === "new_avatar") pf.avatar_id = latest.avatar_id;
-  } catch {
-    hologramAvatarConfigured.value = false;
+    if (!res.ok) throw new Error(apiErrorMessage(data, res.status));
+    avatarTasks.value = Array.isArray(data.tasks) ? data.tasks : [];
+    avatarTasksLoadError.value = "";
+  } catch (e) {
+    avatarTasksLoadError.value = e instanceof Error ? e.message : String(e);
   }
+}
+
+async function submitAvatarTask() {
+  const f = avatarTaskForm.value;
+  if (!f.avatar_id.trim()) {
+    avatarTaskStatus.value = "Avatar ID is required.";
+    return;
+  }
+  if (!avatarTaskVideoFile.value) {
+    avatarTaskStatus.value = "Video file is required.";
+    return;
+  }
+  if (!hologramAvatarConfigured.value) {
+    avatarTaskStatus.value = "Avatar service is unavailable.";
+    return;
+  }
+  avatarTaskBusy.value = true;
+  avatarTaskStatus.value = "Submitting…";
+  try {
+    const fd = new FormData();
+    fd.append("model", f.model);
+    fd.append("avatar_id", f.avatar_id.trim());
+    fd.append("video_file", avatarTaskVideoFile.value);
+    fd.append("img_size", String(f.img_size).trim());
+    fd.append("bbox_shift", String(f.bbox_shift).trim());
+    fd.append("pads", String(f.pads).trim());
+    fd.append("face_det_batch_size", String(f.face_det_batch_size).trim());
+    const out = await postForm("/api/avatar/task", fd);
+    const taskId = out.task_id || out.taskId;
+    avatarTaskStatus.value = taskId ? "Avatar job submitted." : "Submitted.";
+    await loadAvatarTasks();
+  } catch (e) {
+    avatarTaskStatus.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    avatarTaskBusy.value = false;
+  }
+}
+
+let avatarTasksPollId = null;
+
+function startAvatarTasksPolling() {
+  stopAvatarTasksPolling();
+  void loadAvatarTasks();
+  avatarTasksPollId = window.setInterval(() => void loadAvatarTasks(), 4000);
+}
+
+function stopAvatarTasksPolling() {
+  if (avatarTasksPollId != null) {
+    window.clearInterval(avatarTasksPollId);
+    avatarTasksPollId = null;
+  }
+}
+
+function avatarTaskStatusClass(status) {
+  const s = String(status || "").toLowerCase();
+  if (s === "completed" || s === "succeeded") return "avatar-task-status--ok";
+  if (s === "failed" || s === "error") return "avatar-task-status--err";
+  if (s === "running" || s === "processing") return "avatar-task-status--run";
+  return "avatar-task-status--pending";
+}
+
+function isAvatarTaskCompleted(task) {
+  const s = String(task?.status || "").toLowerCase();
+  return s === "completed" || s === "succeeded";
+}
+
+function setLiveAvatar(task) {
+  const id = String(task?.avatar_id || "").trim();
+  if (!id) {
+    setAvatarStatus.value = "Row has no avatar ID.";
+    return;
+  }
+  if (!isAvatarTaskCompleted(task)) {
+    setAvatarStatus.value = "Wait until the avatar task is completed.";
+    return;
+  }
+  setSelectedAvatarId(id);
+  selectedLiveAvatarId.value = id;
+  setAvatarStatus.value = "Live avatar updated.";
+}
+
+function onHologramAvatarSelected(ev) {
+  selectedLiveAvatarId.value = String(ev?.detail?.avatarId || getSelectedAvatarId());
 }
 
 async function uploadHologramGeneratedVideo() {
@@ -330,86 +386,10 @@ async function uploadHologramGeneratedVideo() {
     fd.append("video_id", vid);
     const out = await postForm("/api/avatar/hologram/upload/video", fd);
     hologramUploadGeneratedVideoStatus.value = `Saved as "${vid}".`;
-    hologramPrepareForm.value.video_id = vid;
-    await loadHologramAvatarAssets();
   } catch (e) {
     hologramUploadGeneratedVideoStatus.value = e instanceof Error ? e.message : String(e);
   } finally {
     hologramUploadGeneratedVideoBusy.value = false;
-  }
-}
-
-async function resolveVoiceFileForHologramAvatar() {
-  if (selectedVoiceFile.value) return selectedVoiceFile.value;
-  if (voiceProfileUrl.value) {
-    const res = await fetch(apiUrl(voiceProfileUrl.value));
-    if (!res.ok) throw new Error(`Unable to fetch voice profile (${res.status}).`);
-    const blob = await res.blob();
-    return new File([blob], "voice_profile.pt", { type: blob.type || "application/octet-stream" });
-  }
-  return null;
-}
-
-async function uploadHologramVoiceAudio() {
-  if (!hologramAudioId.value.trim()) {
-    hologramUploadAudioStatus.value = "Audio ID is required.";
-    return;
-  }
-  hologramUploadAudioBusy.value = true;
-  hologramUploadAudioStatus.value = "Uploading audio…";
-  try {
-    const file = await resolveVoiceFileForHologramAvatar();
-    if (!file) {
-      hologramUploadAudioStatus.value = "Load or create a voice profile (.pt) first.";
-      return;
-    }
-    const aid = hologramAudioId.value.trim();
-    const fd = new FormData();
-    fd.append("file", file);
-    fd.append("audio_id", aid);
-    await postForm("/api/avatar/hologram/upload/audio", fd);
-    hologramUploadAudioStatus.value = `Saved as "${aid}".`;
-    hologramPrepareForm.value.audio_id = aid;
-    await loadHologramAvatarAssets();
-  } catch (e) {
-    hologramUploadAudioStatus.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    hologramUploadAudioBusy.value = false;
-  }
-}
-
-async function prepareHologramAvatar() {
-  const f = hologramPrepareForm.value;
-  if (!f.profile_id.trim() || !f.avatar_id.trim() || !f.video_id.trim() || !f.audio_id.trim()) {
-    hologramPrepareStatus.value = "Profile, avatar, and saved video/audio IDs are required.";
-    return;
-  }
-  if (!hologramAvatarConfigured.value) {
-    hologramPrepareStatus.value = "Hologram server is not configured.";
-    return;
-  }
-  hologramPrepareBusy.value = true;
-  hologramPrepareStatus.value = "Preparing…";
-  try {
-    const out = await postJson("/api/avatar/hologram/prepare", {
-      profile_id: f.profile_id.trim(),
-      avatar_id: f.avatar_id.trim(),
-      video_id: f.video_id.trim(),
-      audio_id: f.audio_id.trim(),
-      ref_text: f.ref_text.trim(),
-      force_regenerate: f.force_regenerate,
-      set_as_default: f.set_as_default,
-    });
-    hologramPrepareStatus.value = out.default_profile_updated
-      ? "Prepared and set as default."
-      : out.generated_now
-        ? "Generated."
-        : "Already prepared.";
-    await loadHologramAvatarAssets();
-  } catch (e) {
-    hologramPrepareStatus.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    hologramPrepareBusy.value = false;
   }
 }
 
@@ -424,6 +404,10 @@ async function loadConfig() {
     const data = await res.json();
     promptText.value = String(data.sample_text || "").trim();
     hologramAvatarConfigured.value = data.hologram_avatar_configured === true;
+    if (data.reference_id_default) referenceId.value = String(data.reference_id_default);
+    activeVoiceReferenceId.value = String(
+      data.voice_tts_reference_id || data.reference_id_default || "",
+    ).trim();
   } catch {
     promptText.value = "Please read this script clearly while recording your voice.";
     hologramAvatarConfigured.value = false;
@@ -533,19 +517,6 @@ async function loadDropboxConfig() {
 
 function toggleKbSource(id) {
   activeKbSource.value = activeKbSource.value === id ? null : id;
-}
-
-function openVoiceHubStep(step) {
-  if (step !== 1 && step !== 2 && step !== 3) return;
-  if (openVoiceStudioStep.value === step) {
-    openVoiceStudioStep.value = null;
-    return;
-  }
-  openVoiceStudioStep.value = step;
-  nextTick(() => {
-    const el = document.getElementById(`studio-voice-step${step}`);
-    el?.scrollIntoView({ behavior: "smooth", block: "nearest" });
-  });
 }
 
 function toggleLlmSource(id) {
@@ -1283,18 +1254,6 @@ async function runRagQuery() {
   }
 }
 
-async function loadVoices() {
-  try {
-    const res = await fetch(apiUrl("/api/avatar/voices"));
-    if (!res.ok) throw new Error("Unable to load voices.");
-    const data = await res.json();
-    voicesAvailable.value = Array.isArray(data.items) ? data.items : [];
-    if (!selectedVoiceUrl.value && voicesAvailable.value.length) selectedVoiceUrl.value = voicesAvailable.value[0].url;
-  } catch {
-    voicesAvailable.value = [];
-  }
-}
-
 async function startRecording() {
   customerStatus.value = "";
   try {
@@ -1310,15 +1269,16 @@ async function startRecording() {
       const file = new File([blob], "avatar_voice_recording.webm", { type: blob.type });
       customerRecordFile.value = file;
       customerRecordPreview.value = toPreview(file);
+      referenceAudioSaved.value = null;
       customerRecording.value = false;
       if (mediaStream) mediaStream.getTracks().forEach((t) => t.stop());
       mediaStream = null;
       mediaRecorder = null;
-      customerStatus.value = "Recording ready. Save it to continue.";
+      customerStatus.value = "";
     };
     mediaRecorder.start();
     customerRecording.value = true;
-    customerStatus.value = "Recording...";
+    customerStatus.value = "Recording…";
   } catch (e) {
     customerStatus.value = e instanceof Error ? e.message : "Microphone access failed.";
   }
@@ -1332,14 +1292,14 @@ function onUploadVoiceAudio(ev) {
   const f = ev.target.files?.[0];
   if (!f) return;
   if (customerRecording.value) {
-    customerStatus.value = "Stop the microphone recording before uploading a file.";
+    customerStatus.value = "Stop recording before uploading a file.";
     ev.target.value = "";
     return;
   }
   customerRecordFile.value = f;
   customerRecordPreview.value = toPreview(f);
-  customerSaveUrl.value = "";
-  customerStatus.value = `Uploaded ${f.name}. Save it to continue, or go to step 2 to clone.`;
+  referenceAudioSaved.value = null;
+  customerStatus.value = "";
   ev.target.value = "";
 }
 
@@ -1353,7 +1313,7 @@ function onUploadAudioScript(ev) {
   const reader = new FileReader();
   reader.onload = () => {
     promptText.value = String(reader.result || "").trim();
-    customerStatus.value = f.name ? `Audio script loaded from ${f.name}.` : "Audio script loaded from file.";
+    customerStatus.value = "";
   };
   reader.onerror = () => {
     customerStatus.value = "Could not read the script file.";
@@ -1366,95 +1326,54 @@ function triggerAudioScriptUpload() {
   audioScriptUploadInput.value?.click();
 }
 
+async function setVoiceReference() {
+  const refId = referenceId.value.trim();
+  if (!refId) {
+    customerStatus.value = "Voice ID is required.";
+    return;
+  }
+  setVoiceReferenceBusy.value = true;
+  customerStatus.value = "";
+  try {
+    const out = await postJson("/api/avatar/voice-reference-id", { reference_id: refId });
+    activeVoiceReferenceId.value = String(out.voice_tts_reference_id || out.reference_id || refId);
+    customerStatus.value = "Active voice updated.";
+  } catch (e) {
+    customerStatus.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    setVoiceReferenceBusy.value = false;
+  }
+}
+
 async function saveRecording() {
-  if (!customerRecordFile.value) return void (customerStatus.value = "Please record or upload audio first.");
+  if (!customerRecordFile.value) {
+    customerStatus.value = "Please record or upload audio first.";
+    return;
+  }
+  if (!promptText.value.trim()) {
+    customerStatus.value = "Script must match the spoken audio.";
+    return;
+  }
+  const refId = referenceId.value.trim();
+  if (!refId) {
+    customerStatus.value = "Voice ID is required.";
+    return;
+  }
   customerRecordBusy.value = true;
-  customerStatus.value = "Saving recording...";
+  customerStatus.value = "";
   try {
     const fd = new FormData();
-    fd.append("audio", customerRecordFile.value);
-    fd.append("customer_name", avatarVoiceName.value || "Avatar Voice");
-    fd.append("prompt_text", promptText.value || "");
-    const out = await postForm("/api/avatar/save-customer-recording", fd);
-    customerSaveUrl.value = apiUrl(out.audio_url || "");
-    customerStatus.value = String(out.status || "Recording saved.");
+    fd.append("ref_audio", customerRecordFile.value);
+    fd.append("ref_text", promptText.value.trim());
+    fd.append("reference_id", refId);
+    fd.append("overwrite", "false");
+    const out = await postForm("/api/avatar/reference-audio", fd);
+    referenceAudioSaved.value = out;
+    customerStatus.value = "Voice saved.";
   } catch (e) {
     customerStatus.value = e instanceof Error ? e.message : String(e);
   } finally {
     customerRecordBusy.value = false;
-  }
-}
-
-async function cloneAndSaveVoice() {
-  if (!promptText.value.trim()) {
-    voiceProfileStatus.value = "Audio script is required (text must match the spoken audio).";
-    openVoiceStudioStep.value = 1;
-    return;
-  }
-  customerCloneBusy.value = true;
-  voiceProfileStatus.value = "Creating reusable voice profile...";
-  try {
-    let refFile = customerRecordFile.value;
-    if (!refFile && customerSaveUrl.value) {
-      const res = await fetch(customerSaveUrl.value);
-      if (!res.ok) throw new Error(`Unable to load saved recording (${res.status}).`);
-      const blob = await res.blob();
-      refFile = new File(
-        [blob],
-        blob.type.includes("wav") ? "avatar_source.wav" : "avatar_source.webm",
-        { type: blob.type || "audio/webm" },
-      );
-    }
-    if (!refFile) {
-      voiceProfileStatus.value = "Record or upload audio in step 1 first.";
-      return;
-    }
-    const fd = new FormData();
-    fd.append("ref_aud", refFile);
-    fd.append("ref_txt", promptText.value.trim());
-    fd.append("use_xvec", "false");
-    fd.append("voice_name", avatarVoiceName.value || "Avatar Voice");
-    const out = await postForm("/api/avatar/save-voice", fd);
-    voiceProfileUrl.value = apiUrl(out.voice_file_url || "");
-    voiceProfileStatus.value = cleanStatusText(out.status) || "Voice profile ready.";
-    await loadVoices();
-  } catch (e) {
-    voiceProfileStatus.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    customerCloneBusy.value = false;
-  }
-}
-
-async function useSelectedVoice() {
-  if (!selectedVoiceUrl.value) return void (generateStatus.value = "Select a saved voice profile first.");
-  try {
-    const res = await fetch(apiUrl(selectedVoiceUrl.value));
-    if (!res.ok) throw new Error(`Unable to fetch selected voice profile (${res.status}).`);
-    const blob = await res.blob();
-    selectedVoiceFile.value = new File([blob], "selected_voice_prompt.pt", { type: blob.type || "application/octet-stream" });
-    generateStatus.value = "Voice profile selected.";
-  } catch (e) {
-    generateStatus.value = e instanceof Error ? e.message : String(e);
-  }
-}
-
-async function generateVoice() {
-  if (!selectedVoiceFile.value) return void (generateStatus.value = "Select a voice profile first.");
-  if (!generateText.value.trim()) return void (generateStatus.value = "Target text is required.");
-  generateBusy.value = true;
-  generateStatus.value = "Generating audio...";
-  try {
-    const fd = new FormData();
-    fd.append("file_obj", selectedVoiceFile.value);
-    fd.append("text", generateText.value);
-    fd.append("lang_disp", generateLang.value);
-    const out = await postForm("/api/avatar/load-and-generate", fd);
-    generateAudioUrl.value = apiUrl(out.audio_url || "");
-    generateStatus.value = cleanStatusText(out.status) || "Done.";
-  } catch (e) {
-    generateStatus.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    generateBusy.value = false;
   }
 }
 
@@ -1547,8 +1466,8 @@ async function startAvatarVideo() {
 
 onMounted(() => {
   void loadConfig();
-  void loadHologramAvatarAssets();
-  void loadVoices();
+  startAvatarTasksPolling();
+  window.addEventListener("hologram-avatar-selected", onHologramAvatarSelected);
   void loadRagStatus();
   void loadSharepointConfig();
   void loadGoogleDriveConfig();
@@ -1572,6 +1491,8 @@ onMounted(() => {
 
 onUnmounted(() => {
   stopAvatarVideoPolling();
+  stopAvatarTasksPolling();
+  window.removeEventListener("hologram-avatar-selected", onHologramAvatarSelected);
   if (syncSourcesPollId != null) {
     window.clearInterval(syncSourcesPollId);
     syncSourcesPollId = null;
@@ -1605,9 +1526,8 @@ function formatIso(iso) {
         </nav>
         <div class="hero__title-row">
           <h1>Avatar Studio</h1>
-          <span v-if="voiceCount" class="chip">{{ voiceCount }} voice{{ voiceCount === 1 ? "" : "s" }} on server</span>
         </div>
-        <p class="hero__lede">Avatar video, voice, hologram setup, and knowledge-base tools.</p>
+        <p class="hero__lede">Configure avatar, voice, and knowledge base.</p>
       </header>
 
       <div class="studio-stack">
@@ -1729,97 +1649,35 @@ function formatIso(iso) {
               <h3>Avatar voice</h3>
             </div>
           </div>
-          <div class="studio-hub-grid" role="group" aria-label="Avatar voice shortcuts">
-            <button
-              type="button"
-              class="kb-tile"
-              :class="{ 'kb-tile--active': openVoiceStudioStep === 1 }"
-              :aria-expanded="openVoiceStudioStep === 1"
-              aria-controls="studio-voice-step1"
-              @click="openVoiceHubStep(1)"
-            >
-              <div class="kb-tile__main">
-                <span class="kb-tile__brand kb-tile__brand--voice-rec">Record</span>
-                <span class="kb-tile__title">Record &amp; upload</span>
-                <span class="kb-tile__meta">Audio + script</span>
+          <article
+            id="studio-voice-step1"
+            class="flow-card"
+            :class="{ 'flow-card--live': customerRecording }"
+          >
+            <div class="flow-card__head">
+              <div>
+                <h3>Record or upload avatar voice</h3>
               </div>
-              <span class="kb-tile__icon kb-tile__icon--voice-rec" aria-hidden="true">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3Z" />
-                  <path d="M19 10v1a7 7 0 0 1-14 0v-1M12 18v4M8 22h8" />
-                </svg>
-              </span>
-            </button>
-            <button
-              type="button"
-              class="kb-tile"
-              :class="{ 'kb-tile--active': openVoiceStudioStep === 2 }"
-              :aria-expanded="openVoiceStudioStep === 2"
-              aria-controls="studio-voice-step2"
-              @click="openVoiceHubStep(2)"
-            >
-              <div class="kb-tile__main">
-                <span class="kb-tile__brand kb-tile__brand--voice-clone">Clone</span>
-                <span class="kb-tile__title">Voice profile</span>
-                <span class="kb-tile__meta">Build profile</span>
-              </div>
-              <span class="kb-tile__icon kb-tile__icon--voice-clone" aria-hidden="true">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M12 3a7 7 0 1 0 7 7" />
-                  <path d="M12 11a2 2 0 1 0 2 2" />
-                  <path d="M5 21h6M16 16l5 5" />
-                </svg>
-              </span>
-            </button>
-            <button
-              type="button"
-              class="kb-tile"
-              :class="{ 'kb-tile--active': openVoiceStudioStep === 3 }"
-              :aria-expanded="openVoiceStudioStep === 3"
-              aria-controls="studio-voice-step3"
-              @click="openVoiceHubStep(3)"
-            >
-              <div class="kb-tile__main">
-                <span class="kb-tile__brand kb-tile__brand--voice-gen">Generate</span>
-                <span class="kb-tile__title">Speech from profile</span>
-                <span class="kb-tile__meta">Synthesize</span>
-              </div>
-              <span class="kb-tile__icon kb-tile__icon--voice-gen" aria-hidden="true">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M9 18V5l12-2v13" />
-                  <circle cx="6" cy="18" r="3" />
-                  <circle cx="18" cy="16" r="3" />
-                </svg>
-              </span>
-            </button>
-          </div>
-
-          <div class="voice-hub-panels">
-            <article
-              v-show="openVoiceStudioStep === 1"
-              id="studio-voice-step1"
-              class="flow-card"
-              :class="{ 'flow-card--live': customerRecording }"
-            >
-              <div class="flow-card__head">
-                <span class="step-badge">1</span>
-                <div>
-                  <h3>Record or upload avatar voice</h3>
-                </div>
-                <span v-if="customerRecording" class="rec-dot" aria-hidden="true"><span class="rec-dot__pulse" /></span>
-              </div>
+              <span v-if="customerRecording" class="rec-dot" aria-hidden="true"><span class="rec-dot__pulse" /></span>
+            </div>
 
               <label class="field">
-                <span>Avatar voice name</span>
-                <input v-model="avatarVoiceName" type="text" placeholder="e.g. Concierge North" autocomplete="off" />
+                <span>Voice ID</span>
+                <input
+                  v-model="referenceId"
+                  type="text"
+                  placeholder="e.g. ref102"
+                  autocomplete="off"
+                  spellcheck="false"
+                />
               </label>
 
               <label class="field">
-                <span>Audio script</span>
+                <span>Script</span>
                 <textarea
                   v-model="promptText"
                   rows="5"
-                  placeholder="Text spoken in the recording or upload — required for voice cloning."
+                  placeholder="Exact words spoken in the recording."
                 />
               </label>
               <div class="actions">
@@ -1883,177 +1741,151 @@ function formatIso(iso) {
                 >
                   {{ customerRecordBusy ? "Saving…" : "Save audio" }}
                 </button>
-                <a
-                  v-if="customerSaveUrl"
-                  class="pill pill--link"
-                  :href="customerSaveUrl"
-                  target="_blank"
-                  rel="noopener noreferrer"
+                <button
+                  type="button"
+                  class="btn btn--secondary"
+                  :disabled="setVoiceReferenceBusy || !referenceId.trim()"
+                  @click="setVoiceReference"
                 >
-                  Open saved file
-                </a>
-                <span v-if="hasVoiceSourceAudio && !customerSaveUrl" class="chip">Audio ready</span>
+                  {{ setVoiceReferenceBusy ? "Setting…" : "Set audio" }}
+                </button>
+                <span v-if="activeVoiceReferenceId" class="chip chip--ok">
+                  Active · {{ activeVoiceReferenceId }}
+                </span>
+                <span v-else-if="referenceAudioSaved?.reference_id" class="chip chip--ok">
+                  Saved · {{ referenceAudioSaved.reference_id }}
+                </span>
+                <span v-else-if="hasVoiceSourceAudio" class="chip">Ready</span>
               </div>
 
               <div v-if="customerRecordPreview" class="audio-shell">
                 <audio :src="customerRecordPreview" controls class="audio" />
               </div>
-              <p v-if="customerStatus" class="status">{{ customerStatus }}</p>
-            </article>
-
-            <article v-show="openVoiceStudioStep === 2" id="studio-voice-step2" class="flow-card">
-              <div class="flow-card__head">
-                <span class="step-badge">2</span>
-                <div>
-                  <h3>Create voice profile</h3>
-                </div>
-              </div>
-
-              <div class="actions">
-                <button
-                  type="button"
-                  class="btn"
-                  :disabled="customerCloneBusy || (!hasVoiceSourceAudio && !hasSavedRecording)"
-                  @click="cloneAndSaveVoice"
-                >
-                  {{ customerCloneBusy ? "Cloning…" : "Clone & save profile" }}
-                </button>
-                <a
-                  v-if="voiceProfileUrl"
-                  class="pill pill--link"
-                  :href="voiceProfileUrl"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                >
-                  Download profile
-                </a>
-              </div>
-              <p v-if="voiceProfileStatus" class="status">{{ voiceProfileStatus }}</p>
-            </article>
-
-            <article v-show="openVoiceStudioStep === 3" id="studio-voice-step3" class="flow-card">
-              <div class="flow-card__head">
-                <span class="step-badge">3</span>
-                <div>
-                  <h3>Generate with saved voice</h3>
-                </div>
-              </div>
-
-              <label class="field">
-                <span>Voices available</span>
-                <select v-model="selectedVoiceUrl">
-                  <option value="">Select a saved voice…</option>
-                  <option v-for="v in voicesAvailable" :key="`${v.url}-${v.name}`" :value="v.url">{{ v.name }}</option>
-                </select>
-              </label>
-              <div class="actions">
-                <button type="button" class="btn btn--secondary" :disabled="!selectedVoiceUrl" @click="useSelectedVoice">
-                  Load selected profile
-                </button>
-                <span v-if="hasVoiceFileReady" class="chip chip--ok">Ready to generate</span>
-              </div>
-
-              <div class="hologram-avatar-voice-block">
-                <label class="field">
-                  <span>Audio ID</span>
-                  <input v-model="hologramAudioId" type="text" autocomplete="off" placeholder="e.g. new_audiotest" />
-                </label>
-                <button
-                  type="button"
-                  class="btn btn--secondary"
-                  :disabled="hologramUploadAudioBusy || !hologramAvatarConfigured"
-                  @click="uploadHologramVoiceAudio"
-                >
-                  {{ hologramUploadAudioBusy ? "Saving…" : "Save audio" }}
-                </button>
-                <p v-if="hologramUploadAudioStatus" class="status">{{ hologramUploadAudioStatus }}</p>
-              </div>
-
-              <label class="field">
-                <span>Target text</span>
-                <textarea v-model="generateText" rows="4" placeholder="What should the avatar say?" />
-              </label>
-              <label class="field field--inline">
-                <span>Language</span>
-                <select v-model="generateLang">
-                  <option v-for="l in languages" :key="l" :value="l">{{ l }}</option>
-                </select>
-              </label>
-
-              <div class="actions">
-                <button type="button" class="btn" :disabled="generateBusy" @click="generateVoice">
-                  {{ generateBusy ? "Generating…" : "Generate speech" }}
-                </button>
-              </div>
-
-              <div v-if="generateAudioUrl" class="audio-shell audio-shell--accent">
-                <audio :src="generateAudioUrl" controls class="audio" />
-              </div>
-              <p v-if="generateStatus" class="status">{{ generateStatus }}</p>
-            </article>
-          </div>
+            <p v-if="customerStatus" class="status">{{ customerStatus }}</p>
+          </article>
         </article>
 
-        <article class="flow-card flow-card--hologram-avatar">
+        <article class="flow-card flow-card--avatar-task">
           <div class="flow-card__head flow-card__head--rag">
-            <span class="step-badge step-badge--hologram-avatar">HA</span>
+            <span class="step-badge step-badge--avatar-task">AT</span>
             <div>
-              <h3>Hologram Avatar</h3>
+              <h3>Create Avatar</h3>
             </div>
           </div>
 
-          <div class="hologram-avatar-prepare-grid">
+          <div class="avatar-task-form-grid">
             <label class="field">
-              <span>Profile ID</span>
-              <input v-model="hologramPrepareForm.profile_id" type="text" autocomplete="off" />
+              <span>Model</span>
+              <select v-model="avatarTaskForm.model">
+                <option value="wav2lip">Wav2Lip</option>
+                <option value="musetalk">MuseTalk</option>
+              </select>
             </label>
             <label class="field">
               <span>Avatar ID</span>
-              <input v-model="hologramPrepareForm.avatar_id" type="text" autocomplete="off" />
+              <input v-model="avatarTaskForm.avatar_id" type="text" autocomplete="off" placeholder="new_avatar" />
             </label>
-            <label class="field">
-              <span>Saved video</span>
-              <select v-model="hologramPrepareForm.video_id">
-                <option value="">Select uploaded video…</option>
-                <option v-for="v in hologramSavedVideos" :key="v.video_id" :value="v.video_id">
-                  {{ hologramAssetLabel(v, "video_id") }}
-                </option>
-              </select>
-            </label>
-            <label class="field">
-              <span>Saved audio</span>
-              <select v-model="hologramPrepareForm.audio_id">
-                <option value="">Select uploaded audio…</option>
-                <option v-for="a in hologramSavedAudios" :key="a.audio_id" :value="a.audio_id">
-                  {{ hologramAssetLabel(a, "audio_id") }}
-                </option>
-              </select>
+            <label class="field field--span2">
+              <span>Video file</span>
+              <div class="actions">
+                <button type="button" class="btn btn--secondary" @click="triggerAvatarTaskVideoUpload">
+                  Choose video
+                </button>
+                <span v-if="avatarTaskVideoFile" class="chip">{{ avatarTaskVideoFile.name }}</span>
+                <input
+                  ref="avatarTaskVideoInput"
+                  type="file"
+                  accept="video/*,.mp4,.mov,.webm"
+                  class="sr-only"
+                  @change="onAvatarTaskVideo"
+                />
+              </div>
             </label>
           </div>
 
-          <label class="field">
-            <span>Ref text (optional)</span>
-            <textarea v-model="hologramPrepareForm.ref_text" rows="2" />
-          </label>
-
-          <div class="hologram-avatar-prepare-checks">
-            <label class="hologram-avatar-check">
-              <input v-model="hologramPrepareForm.set_as_default" type="checkbox" />
-              Set as default profile
-            </label>
-            <label class="hologram-avatar-check">
-              <input v-model="hologramPrepareForm.force_regenerate" type="checkbox" />
-              Force regenerate
-            </label>
-          </div>
+          <details class="avatar-task-advanced">
+            <summary>Advanced</summary>
+            <div class="avatar-task-form-grid avatar-task-form-grid--advanced">
+              <label class="field">
+                <span>Image size</span>
+                <input v-model="avatarTaskForm.img_size" type="number" min="64" max="2048" step="1" />
+              </label>
+              <label class="field">
+                <span>BBox shift</span>
+                <input v-model="avatarTaskForm.bbox_shift" type="number" min="-100" max="100" step="1" />
+              </label>
+              <label class="field">
+                <span>Pads</span>
+                <input v-model="avatarTaskForm.pads" type="text" placeholder="0 10 0 0" autocomplete="off" />
+              </label>
+              <label class="field">
+                <span>Face detection batch size</span>
+                <input v-model="avatarTaskForm.face_det_batch_size" type="number" min="1" max="64" step="1" />
+              </label>
+            </div>
+          </details>
 
           <div class="actions">
-            <button type="button" class="btn" :disabled="hologramPrepareBusy || !hologramAvatarConfigured" @click="prepareHologramAvatar">
-              {{ hologramPrepareBusy ? "Preparing…" : "Prepare" }}
+            <button
+              type="button"
+              class="btn"
+              :disabled="avatarTaskBusy || !hologramAvatarConfigured"
+              @click="submitAvatarTask"
+            >
+              {{ avatarTaskBusy ? "Submitting…" : "Submit" }}
             </button>
           </div>
+          <p v-if="avatarTaskStatus" class="status">{{ avatarTaskStatus }}</p>
 
-          <p v-if="hologramPrepareStatus" class="status">{{ hologramPrepareStatus }}</p>
+          <div class="avatar-task-list">
+            <div class="avatar-task-list__head">
+              <h4>Jobs</h4>
+              <span v-if="selectedLiveAvatarId" class="chip chip--ok">Active · {{ selectedLiveAvatarId }}</span>
+            </div>
+            <p v-if="setAvatarStatus" class="status">{{ setAvatarStatus }}</p>
+            <p v-if="avatarTasksLoadError" class="status">{{ avatarTasksLoadError }}</p>
+            <div v-else class="avatar-task-table-wrap">
+              <table class="avatar-task-table">
+                <thead>
+                  <tr>
+                    <th>Avatar</th>
+                    <th>Status</th>
+                    <th>Progress</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr
+                    v-for="t in avatarTasks"
+                    :key="t.task_id"
+                    :class="{ 'avatar-task-table__row--active': t.avatar_id === selectedLiveAvatarId }"
+                  >
+                    <td>{{ t.avatar_id || "—" }}</td>
+                    <td>
+                      <span class="avatar-task-status" :class="avatarTaskStatusClass(t.status)">
+                        {{ t.status || "—" }}
+                      </span>
+                      <span v-if="t.error_msg" class="avatar-task-table__err-inline">{{ t.error_msg }}</span>
+                    </td>
+                    <td>{{ t.progress != null ? `${t.progress}%` : "—" }}</td>
+                    <td class="avatar-task-table__actions">
+                      <button
+                        type="button"
+                        class="btn btn--secondary btn--table"
+                        :disabled="!isAvatarTaskCompleted(t)"
+                        @click="setLiveAvatar(t)"
+                      >
+                        Set avatar
+                      </button>
+                    </td>
+                  </tr>
+                  <tr v-if="!avatarTasks.length">
+                    <td colspan="4" class="avatar-task-table__empty">No jobs yet.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
         </article>
 
 
@@ -3814,6 +3646,16 @@ function formatIso(iso) {
   color: #475569;
 }
 
+.field-hint {
+  margin: -0.35rem 0 0.75rem;
+  font-size: 0.82rem;
+  color: #64748b;
+}
+
+.field-hint code {
+  font-size: 0.8em;
+}
+
 textarea,
 select,
 input[type="text"],
@@ -4112,68 +3954,155 @@ input[type="password"]:focus {
   font-size: 0.75rem;
 }
 
-.flow-card--hologram-avatar::before {
+.flow-card--avatar-task::before {
   background: linear-gradient(180deg, #0ea5e9, #6366f1);
 }
 
-.step-badge--hologram-avatar {
+.step-badge--avatar-task {
   font-size: 0.72rem;
   background: linear-gradient(145deg, #0ea5e9, #6366f1);
   box-shadow: 0 6px 16px rgba(99, 102, 241, 0.28);
 }
 
-.hologram-avatar-prepare-grid {
+.avatar-task-form-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0.65rem;
   margin-bottom: 0.65rem;
 }
 
+.avatar-task-form-grid--advanced {
+  margin-top: 0.65rem;
+}
+
+.field--span2 {
+  grid-column: 1 / -1;
+}
+
 @media (max-width: 640px) {
-  .hologram-avatar-prepare-grid {
+  .avatar-task-form-grid {
     grid-template-columns: 1fr;
+  }
+  .field--span2 {
+    grid-column: auto;
   }
 }
 
-.hologram-avatar-voice-block {
-  margin: 0.75rem 0;
-  padding: 0.75rem 0;
+.avatar-task-advanced {
+  margin-bottom: 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0.5rem 0.75rem;
+  background: rgba(248, 250, 252, 0.6);
+}
+
+.avatar-task-advanced summary {
+  cursor: pointer;
+  font-size: 0.84rem;
+  font-weight: 600;
+  color: var(--ink);
+  list-style-position: inside;
+}
+
+.avatar-task-list {
+  margin-top: 1rem;
+  padding-top: 0.85rem;
   border-top: 1px solid var(--line);
-  border-bottom: 1px solid var(--line);
 }
 
-.hologram-avatar-prepare-checks {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.65rem 1.25rem;
-  margin-bottom: 0.65rem;
-}
-
-.hologram-avatar-check {
+.avatar-task-list__head {
   display: flex;
   align-items: center;
-  gap: 0.35rem;
-  font-size: 0.82rem;
-  color: var(--muted);
-  cursor: pointer;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
 }
 
-.hologram-avatar-prepare-details {
-  margin-top: 0.75rem;
-  font-size: 0.78rem;
+.avatar-task-list__head h4 {
+  margin: 0;
+  font-size: 0.92rem;
 }
 
-.hologram-avatar-prepare-pre {
-  margin: 0.5rem 0 0;
-  padding: 0.5rem;
-  max-height: 14rem;
+.avatar-task-table-wrap {
   overflow: auto;
-  border-radius: 8px;
-  background: #f8fafc;
   border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.avatar-task-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.76rem;
+}
+
+.avatar-task-table th,
+.avatar-task-table td {
+  padding: 0.45rem 0.55rem;
+  text-align: left;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+
+.avatar-task-table th {
+  background: #f8fafc;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.avatar-task-table__empty {
+  text-align: center;
+  color: var(--muted);
+  padding: 1rem !important;
+}
+
+.avatar-task-table__err-inline {
+  display: block;
+  margin-top: 0.25rem;
   font-size: 0.68rem;
-  white-space: pre-wrap;
+  color: #b91c1c;
   word-break: break-word;
+}
+
+.avatar-task-status {
+  display: inline-block;
+  padding: 0.1rem 0.4rem;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: lowercase;
+}
+
+.avatar-task-status--ok {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.avatar-task-status--err {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.avatar-task-status--run {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+.avatar-task-status--pending {
+  background: #f1f5f9;
+  color: #475569;
+}
+
+.avatar-task-table__row--active {
+  background: rgba(14, 165, 233, 0.08);
+}
+
+.avatar-task-table__actions {
+  white-space: nowrap;
+}
+
+.btn--table {
+  padding: 0.25rem 0.5rem;
+  font-size: 0.72rem;
 }
 
 .flow-card--voice-hub::before {

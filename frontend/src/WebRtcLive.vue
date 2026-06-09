@@ -1,5 +1,6 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, nextTick } from "vue";
+import { getSelectedAvatarId, SELECTED_AVATAR_STORAGE_KEY } from "./selectedAvatar.js";
 
 const busy = ref(false);
 /** True once the remote video is actually rendering (not only SDP done). */
@@ -37,9 +38,32 @@ const IDLE_LOOP_VIDEO_SRC = resolveIdleLoopVideoUrl(
 );
 /** Runtime override from GET /api/webrtc (Docker / root .env without frontend rebuild). */
 let idleLoopVideoFromServer = null;
+/** Set when user picks an avatar in Studio → frontend/public/{id}.mp4 */
+let idleLoopVideoFromAvatar = null;
 
 function getIdleLoopVideoSrc() {
-  return idleLoopVideoFromServer || IDLE_LOOP_VIDEO_SRC;
+  return idleLoopVideoFromAvatar || idleLoopVideoFromServer || IDLE_LOOP_VIDEO_SRC;
+}
+
+function applySelectedAvatarIdleVideo(avatarId) {
+  const id = String(avatarId || "").trim();
+  if (!id) return;
+  const path = resolveIdleLoopVideoUrl(`/${id}.mp4`);
+  if (idleLoopVideoFromAvatar === path) return;
+  idleLoopVideoFromAvatar = path;
+  idleLoopGeneration += 1;
+  if (mediaVisible.value) {
+    void startIdleLoop();
+  }
+}
+
+function onHologramAvatarSelected(ev) {
+  applySelectedAvatarIdleVideo(ev?.detail?.avatarId || getSelectedAvatarId());
+}
+
+function onHologramAvatarStorage(ev) {
+  if (ev.key !== SELECTED_AVATAR_STORAGE_KEY || !ev.newValue) return;
+  applySelectedAvatarIdleVideo(ev.newValue);
 }
 
 /** @type {RTCPeerConnection | null} */
@@ -883,7 +907,7 @@ fetch(signalingUrl("/api/webrtc"))
       if (resolved !== idleLoopVideoFromServer) {
         idleLoopVideoFromServer = resolved;
         idleLoopGeneration += 1;
-        if (mediaVisible.value) {
+        if (mediaVisible.value && !idleLoopVideoFromAvatar) {
           void startIdleLoop();
         }
       }
@@ -928,6 +952,25 @@ function waitIceGatheringFast(conn) {
   });
 }
 
+async function applySessionAvatar(avatarId, sessionid) {
+  const id = String(avatarId || "").trim();
+  const sid = String(sessionid || "").trim();
+  if (!id || !sid || sid === "0") return;
+  try {
+    const res = await fetch(signalingUrl("/session/avatar"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ sessionid: sid, avatar_id: id, interrupt: true }),
+    });
+    if (!res.ok) {
+      const t = await res.text();
+      console.warn("[session/avatar] failed:", t.slice(0, 200) || res.status);
+    }
+  } catch (e) {
+    console.warn("[session/avatar] error:", e);
+  }
+}
+
 async function negotiate() {
   if (!pc) throw new Error("Peer connection not created");
   pc.addTransceiver("video", { direction: "recvonly" });
@@ -938,10 +981,14 @@ async function negotiate() {
   const local = pc.localDescription;
   if (!local) throw new Error("Missing local description");
 
+  const avatarId = getSelectedAvatarId();
+  const payload = { sdp: local.sdp, type: local.type };
+  if (avatarId) payload.avatar = avatarId;
+
   const res = await fetch(signalingUrl("/offer"), {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify({ sdp: local.sdp, type: local.type }),
+    body: JSON.stringify(payload),
   });
   if (!res.ok) {
     const t = await res.text();
@@ -952,6 +999,9 @@ async function negotiate() {
     sessionId.value = String(answer.sessionid);
   }
   await pc.setRemoteDescription(answer);
+  if (avatarId) {
+    await applySessionAvatar(avatarId, sessionId.value);
+  }
 }
 
 function markVideoReadyOnce() {
@@ -2865,11 +2915,16 @@ function formatBillMoney(n) {
 }
 
 onMounted(() => {
+  applySelectedAvatarIdleVideo(getSelectedAvatarId());
+  window.addEventListener("hologram-avatar-selected", onHologramAvatarSelected);
+  window.addEventListener("storage", onHologramAvatarStorage);
   void connect();
   showMedia();
 });
 
 onUnmounted(() => {
+  window.removeEventListener("hologram-avatar-selected", onHologramAvatarSelected);
+  window.removeEventListener("storage", onHologramAvatarStorage);
   if (orderPlacedHideTimer != null) {
     window.clearTimeout(orderPlacedHideTimer);
     orderPlacedHideTimer = null;

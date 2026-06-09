@@ -56,6 +56,7 @@ from voice_tts_client import (
     record_chunk_latency,
     speak_after_tts,
     tts_max_parallel,
+    tts_reference_id,
     voice_dispatch_mode,
     voice_stream_parallel_enabled,
 )
@@ -362,6 +363,7 @@ IDLE_LOOP_VIDEO = (
 HOLOGRAM_UPLOAD_TIMEOUT_SEC = max(60.0, float(_env_first_int("HOLOGRAM_UPLOAD_TIMEOUT_SEC", default=600)))
 HOLOGRAM_PREPARE_TIMEOUT_SEC = max(120.0, float(_env_first_int("HOLOGRAM_PREPARE_TIMEOUT_SEC", default=900)))
 _HOLOGRAM_ASSET_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
+_TTS_REFERENCE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _HOLOGRAM_SERVER_PATH_RE = re.compile(r"^/[\w./-]+$")
 AVATAR_API_BASE = os.environ.get("AVATAR_API_BASE", "http://10.29.145.124:9000").strip().rstrip("/")
 AVATAR_VIDEO_API_BASE = os.environ.get("AVATAR_VIDEO_API_BASE", "http://10.29.145.124:8002").strip().rstrip("/")
@@ -973,6 +975,11 @@ async def webrtc_offer_proxy(request: Request) -> Response:
     return await _forward_webrtc_post("/offer", request)
 
 
+@app.post("/session/avatar")
+async def webrtc_session_avatar_proxy(request: Request) -> Response:
+    return await _forward_webrtc_post("/session/avatar", request)
+
+
 @app.post("/human")
 async def webrtc_human_proxy(request: Request) -> Response:
     return await _forward_webrtc_post("/human", request)
@@ -1209,24 +1216,54 @@ def _summarize_chunk_latencies(chunks: list[dict[str, Any]]) -> dict[str, Any]:
     return summary
 
 
+def _sentence_chunks_for_analytics(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Per-sentence rows: RAG stream start → sentence, TTS elapsed_ms, humanaudiowithpath."""
+    rows: list[dict[str, Any]] = []
+    for c in sorted(chunks, key=lambda x: int(x.get("chunk") or 0)):
+        entry: dict[str, Any] = {"sentence": int(c.get("chunk") or len(rows) + 1)}
+        if c.get("enqueued_ms") is not None:
+            entry["rag_sentence_ms"] = round(float(c["enqueued_ms"]), 1)
+        if c.get("tts_ms") is not None:
+            entry["tts_ms"] = round(float(c["tts_ms"]), 1)
+        if c.get("humanaudio_ms") is not None:
+            entry["humanaudio_ms"] = round(float(c["humanaudio_ms"]), 1)
+        parts = [
+            entry.get("rag_sentence_ms"),
+            entry.get("tts_ms"),
+            entry.get("humanaudio_ms"),
+        ]
+        nums = [float(p) for p in parts if p is not None]
+        if nums:
+            entry["total_ms"] = round(sum(nums), 1)
+        rows.append(entry)
+    return rows
+
+
+def _avg_ms(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return round(sum(values) / len(values), 1)
+
+
 def _stream_latency_fields(stream_human_meta: dict[str, Any]) -> dict[str, Any]:
-    """Extract per-turn word-stream TTS / humanaudio metrics for analytics."""
+    """Extract per-turn sentence analytics for SQLite."""
     lat = stream_human_meta.get("stream_dispatch_latency") or {}
     summary = lat.get("summary") or {}
-    if not summary and not lat:
+    raw_chunks = lat.get("chunks") or []
+    sentence_chunks = _sentence_chunks_for_analytics(raw_chunks)
+    rag_sentence_vals = [
+        float(s["rag_sentence_ms"])
+        for s in sentence_chunks
+        if s.get("rag_sentence_ms") is not None
+    ]
+    if not summary and not lat and not sentence_chunks:
         return {}
     return {
-        "stream_chunk_count": summary.get("chunk_count"),
-        "rag_first_chunk_enqueued_ms": lat.get("rag_first_chunk_enqueued_ms")
-        or summary.get("first_chunk_enqueued_ms"),
-        "stream_first_tts_ms": summary.get("first_chunk_tts_ms"),
-        "stream_first_humanaudio_ms": summary.get("first_chunk_humanaudio_ms"),
-        "stream_first_chunk_total_ms": summary.get("first_chunk_total_ms"),
-        "stream_first_chunk_completed_ms": summary.get("first_chunk_completed_ms"),
+        "stream_chunk_count": summary.get("chunk_count") or len(sentence_chunks) or None,
+        "stream_sentence_chunks": sentence_chunks,
+        "stream_avg_rag_sentence_ms": _avg_ms(rag_sentence_vals),
         "stream_avg_tts_ms": summary.get("avg_tts_ms"),
         "stream_avg_humanaudio_ms": summary.get("avg_humanaudio_ms"),
-        "stream_sum_tts_ms": summary.get("sum_tts_ms"),
-        "stream_sum_humanaudio_ms": summary.get("sum_humanaudio_ms"),
     }
 
 
@@ -2425,6 +2462,129 @@ async def avatar_hologram_upload_audio(
         remote_stored_at=remote.get("stored_at") if isinstance(remote.get("stored_at"), int) else None,
     )
     return {"saved": _public_audio_asset(saved)}
+
+
+_AVATAR_TASK_MODELS = frozenset({"wav2lip", "musetalk"})
+_PADS_RE = re.compile(r"^-?\d+\s+-?\d+\s+-?\d+\s+-?\d+$")
+
+
+def _avatar_task_int(value: str, field: str, *, min_v: int, max_v: int) -> str:
+    try:
+        n = int(str(value).strip())
+    except (TypeError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=f"Invalid {field}.") from e
+    if n < min_v or n > max_v:
+        raise HTTPException(status_code=400, detail=f"{field} must be between {min_v} and {max_v}.")
+    return str(n)
+
+
+def _avatar_task_pads(value: str) -> str:
+    v = " ".join((value or "").split())
+    if not _PADS_RE.fullmatch(v):
+        raise HTTPException(
+            status_code=400,
+            detail="pads must be four integers separated by spaces (top bottom left right).",
+        )
+    return v
+
+
+_FRONTEND_PUBLIC_DIR = _REPO_ROOT / "frontend" / "public"
+
+
+def _save_avatar_video_to_public(*, avatar_id: str, source: Path) -> dict[str, str]:
+    dest_dir = _FRONTEND_PUBLIC_DIR
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"{avatar_id}.mp4"
+    dest = dest_dir / filename
+    shutil.copy2(source, dest)
+    return {
+        "public_video_filename": filename,
+        "public_video_url": f"/{filename}",
+    }
+
+
+@app.post("/api/avatar/task")
+async def avatar_create_task(
+    model: str = Form(...),
+    avatar_id: str = Form(...),
+    video_file: UploadFile = File(...),
+    img_size: str = Form("256"),
+    bbox_shift: str = Form("0"),
+    pads: str = Form("0 10 0 0"),
+    face_det_batch_size: str = Form("4"),
+):
+    model_key = (model or "").strip().lower()
+    if model_key not in _AVATAR_TASK_MODELS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid model (allowed: {', '.join(sorted(_AVATAR_TASK_MODELS))}).",
+        )
+    aid = _hologram_asset_id(avatar_id, "avatar_id")
+    img_size_s = _avatar_task_int(img_size, "img_size", min_v=64, max_v=2048)
+    bbox_shift_s = _avatar_task_int(bbox_shift, "bbox_shift", min_v=-100, max_v=100)
+    pads_s = _avatar_task_pads(pads)
+    face_det_batch_size_s = _avatar_task_int(
+        face_det_batch_size, "face_det_batch_size", min_v=1, max_v=64
+    )
+    base = _livetalking_base()
+    work = Path(tempfile.mkdtemp(prefix="lt_task_"))
+    try:
+        ext = Path(video_file.filename or "video.mp4").suffix or ".mp4"
+        local_path = work / f"upload{ext}"
+        with local_path.open("wb") as f:
+            shutil.copyfileobj(video_file.file, f)
+        fname = video_file.filename or f"upload{ext}"
+        ctype = video_file.content_type or "video/mp4"
+        data = {
+            "model": model_key,
+            "avatar_id": aid,
+            "img_size": img_size_s,
+            "bbox_shift": bbox_shift_s,
+            "pads": pads_s,
+            "face_det_batch_size": face_det_batch_size_s,
+        }
+        timeout = httpx.Timeout(HOLOGRAM_UPLOAD_TIMEOUT_SEC, connect=30.0)
+        try:
+            with local_path.open("rb") as fh:
+                files = [("video_file", (fname, fh, ctype))]
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    r = await client.post(
+                        f"{base}/api/avatar/task",
+                        data=data,
+                        files=files,
+                    )
+        except httpx.HTTPError as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Avatar task submit unreachable: {e}",
+            ) from e
+        result = _livetalking_json_response(r, context="avatar task")
+        public_info = _save_avatar_video_to_public(avatar_id=aid, source=local_path)
+        return {**result, **public_info}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@app.get("/api/avatar/tasks")
+async def avatar_list_tasks():
+    base = _livetalking_base()
+    timeout = httpx.Timeout(60.0, connect=30.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(
+                f"{base}/api/avatar/tasks",
+                headers={"Accept": "application/json"},
+            )
+    except httpx.HTTPError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Avatar tasks list unreachable: {e}",
+        ) from e
+    data = _livetalking_json_response(r, context="avatar tasks")
+    tasks = data.get("tasks") if isinstance(data, dict) else None
+    if not isinstance(tasks, list):
+        tasks = []
+    return {"tasks": tasks}
 
 
 @app.post("/api/avatar/hologram/prepare")
@@ -4706,9 +4866,60 @@ async def avatar_run_voice_clone(
 
 @app.get("/api/avatar/config")
 async def avatar_config():
+    ref_id = ""
+    try:
+        ref_id = tts_reference_id()
+    except RuntimeError:
+        ref_id = (os.environ.get("VOICE_TTS_REFERENCE_ID") or "ref101").strip() or "ref101"
     return {
         "sample_text": AVATAR_SAMPLE_TEXT,
         "hologram_avatar_configured": bool(WEBRTC_SIGNALING_BASE),
+        "avatar_api_base": AVATAR_API_BASE,
+        "reference_id_default": ref_id,
+        "voice_tts_reference_id": ref_id,
+    }
+
+
+def _update_dotenv_key(key: str, value: str) -> None:
+    env_path = _REPO_ROOT / ".env"
+    key_prefix = f"{key}="
+    lines: list[str] = env_path.read_text(encoding="utf-8").splitlines() if env_path.is_file() else []
+    updated = False
+    out: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith(key_prefix) and not stripped.startswith("#"):
+            out.append(f"{key}={value}")
+            updated = True
+        else:
+            out.append(line)
+    if not updated:
+        out.append(f"{key}={value}")
+    env_path.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
+
+
+class AvatarVoiceReferenceIdBody(BaseModel):
+    reference_id: str = Field(..., min_length=1, max_length=64)
+
+
+@app.post("/api/avatar/voice-reference-id")
+async def avatar_set_voice_reference_id(body: AvatarVoiceReferenceIdBody):
+    """Set runtime + .env VOICE_TTS_REFERENCE_ID for /v1/tts/reference."""
+    ref_id = (body.reference_id or "").strip()
+    if not _TTS_REFERENCE_ID_RE.fullmatch(ref_id):
+        raise HTTPException(
+            status_code=400,
+            detail="reference_id must be 1–64 alphanumeric characters, underscores, or hyphens.",
+        )
+    os.environ["VOICE_TTS_REFERENCE_ID"] = ref_id
+    try:
+        _update_dotenv_key("VOICE_TTS_REFERENCE_ID", ref_id)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Unable to update .env: {e}") from e
+    return {
+        "reference_id": ref_id,
+        "voice_tts_reference_id": ref_id,
+        "status": f"Active voice set to {ref_id}.",
     }
 
 
@@ -4868,6 +5079,80 @@ async def avatar_save_customer_recording(
     if prompt_text.strip():
         status = "Recording saved with prompt text."
     return {"audio_url": f"/outputs/{out_name}", "status": status}
+
+
+@app.post("/api/avatar/reference-audio")
+async def avatar_reference_audio(
+    ref_audio: UploadFile = File(...),
+    ref_text: str = Form(...),
+    reference_id: str = Form(...),
+    overwrite: str = Form("false"),
+):
+    """Register reference voice on TTS server (POST {AVATAR_API_BASE}/v1/reference-audio)."""
+    text = (ref_text or "").strip()
+    ref_id = (reference_id or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="ref_text is required.")
+    if not ref_id or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", ref_id):
+        raise HTTPException(
+            status_code=400,
+            detail="reference_id must be 1–64 alphanumeric characters, underscores, or hyphens.",
+        )
+    ow = (overwrite or "false").strip().lower() in ("1", "true", "yes")
+    audio_name = Path(ref_audio.filename or "reference.wav").name
+    audio_ct = ref_audio.content_type or "application/octet-stream"
+    url = f"{AVATAR_API_BASE}/v1/reference-audio"
+    tts_timeout = 120.0
+    try:
+        tts_timeout = float(os.environ.get("VOICE_TTS_TIMEOUT_SEC", "120") or 120)
+    except ValueError:
+        pass
+    timeout = httpx.Timeout(max(30.0, tts_timeout), connect=15.0)
+    try:
+        body = await ref_audio.read()
+        if not body:
+            raise HTTPException(status_code=400, detail="ref_audio is empty.")
+        files = {"ref_audio": (audio_name, body, audio_ct)}
+        data = {
+            "ref_text": text,
+            "reference_id": ref_id,
+            "overwrite": "true" if ow else "false",
+        }
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.post(url, data=data, files=files)
+    except HTTPException:
+        raise
+    except httpx.HTTPError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"TTS reference-audio unreachable: {e}",
+        ) from e
+    if r.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=r.text[:500] or f"reference-audio HTTP {r.status_code}",
+        )
+    try:
+        payload = r.json()
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=502, detail="reference-audio returned invalid JSON.") from e
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail="reference-audio returned non-object JSON.")
+    elapsed = payload.get("elapsed_ms")
+    status = (
+        f"Reference voice saved as {payload.get('reference_id') or ref_id}"
+        + (f" ({elapsed} ms)" if elapsed is not None else "")
+        + "."
+    )
+    return {
+        "status": status,
+        "reference_id": payload.get("reference_id") or ref_id,
+        "audio_path": payload.get("audio_path"),
+        "text_path": payload.get("text_path"),
+        "audio_bytes": payload.get("audio_bytes"),
+        "text_bytes": payload.get("text_bytes"),
+        "elapsed_ms": elapsed,
+    }
 
 
 @app.post("/api/lipsync")

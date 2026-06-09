@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -91,6 +92,10 @@ def _ensure_voice_turn_columns(cx: sqlite3.Connection) -> None:
         cx.execute("ALTER TABLE voice_turns ADD COLUMN stream_sum_tts_ms REAL")
     if "stream_sum_humanaudio_ms" not in cols:
         cx.execute("ALTER TABLE voice_turns ADD COLUMN stream_sum_humanaudio_ms REAL")
+    if "stream_avg_rag_sentence_ms" not in cols:
+        cx.execute("ALTER TABLE voice_turns ADD COLUMN stream_avg_rag_sentence_ms REAL")
+    if "stream_sentence_chunks" not in cols:
+        cx.execute("ALTER TABLE voice_turns ADD COLUMN stream_sentence_chunks TEXT")
     cx.execute(
         """
         UPDATE voice_turns
@@ -291,42 +296,78 @@ def mark_voice_turn_human_dispatched(turn_id: int) -> bool:
             return cur.rowcount > 0
 
 
+def _encode_sentence_chunks(chunks: list[dict[str, Any]] | None) -> str | None:
+    if not chunks:
+        return None
+    try:
+        return json.dumps(chunks, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _decode_sentence_chunks(raw: Any) -> list[dict[str, Any]]:
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return raw
+    if not isinstance(raw, str) or not raw.strip():
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def _voice_turn_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    d = dict(row)
+    d["stream_sentence_chunks"] = _decode_sentence_chunks(d.get("stream_sentence_chunks"))
+    return d
+
+
 def update_voice_turn_stream_latency(
     turn_id: int,
     *,
     stream_chunk_count: int | None = None,
+    stream_sentence_chunks: list[dict[str, Any]] | None = None,
+    stream_avg_rag_sentence_ms: float | None = None,
+    stream_avg_tts_ms: float | None = None,
+    stream_avg_humanaudio_ms: float | None = None,
+    # Legacy kwargs ignored (older callers / migrations)
     rag_first_chunk_enqueued_ms: float | None = None,
     stream_first_tts_ms: float | None = None,
     stream_first_humanaudio_ms: float | None = None,
     stream_first_chunk_total_ms: float | None = None,
     stream_first_chunk_completed_ms: float | None = None,
-    stream_avg_tts_ms: float | None = None,
-    stream_avg_humanaudio_ms: float | None = None,
     stream_sum_tts_ms: float | None = None,
     stream_sum_humanaudio_ms: float | None = None,
 ) -> bool:
-    """Server-reported per-sentence TTS and humanaudio timings from RAG stream dispatch."""
+    """Per-sentence RAG / TTS (elapsed_ms) / humanaudiowithpath timings for one voice turn."""
+    del (
+        rag_first_chunk_enqueued_ms,
+        stream_first_tts_ms,
+        stream_first_humanaudio_ms,
+        stream_first_chunk_total_ms,
+        stream_first_chunk_completed_ms,
+        stream_sum_tts_ms,
+        stream_sum_humanaudio_ms,
+    )
     init_db()
     chunks = stream_chunk_count
     if chunks is not None and (chunks < 0 or chunks > 10_000):
         chunks = None
+    encoded = _encode_sentence_chunks(stream_sentence_chunks)
     fields = {
-        "rag_first_chunk_enqueued_ms": _valid_ms(rag_first_chunk_enqueued_ms),
-        "stream_first_tts_ms": _valid_ms(stream_first_tts_ms),
-        "stream_first_humanaudio_ms": _valid_ms(stream_first_humanaudio_ms),
-        "stream_first_chunk_total_ms": _valid_ms(stream_first_chunk_total_ms),
-        "stream_first_chunk_completed_ms": _valid_ms(stream_first_chunk_completed_ms),
+        "stream_avg_rag_sentence_ms": _valid_ms(stream_avg_rag_sentence_ms),
         "stream_avg_tts_ms": _valid_ms(stream_avg_tts_ms),
         "stream_avg_humanaudio_ms": _valid_ms(stream_avg_humanaudio_ms),
-        "stream_sum_tts_ms": _valid_ms(stream_sum_tts_ms),
-        "stream_sum_humanaudio_ms": _valid_ms(stream_sum_humanaudio_ms),
     }
-    if not any(v is not None for v in fields.values()) and chunks is None:
+    if not any(v is not None for v in fields.values()) and chunks is None and not encoded:
         return False
     with _lock:
         with _connect() as cx:
             row = cx.execute(
-                "SELECT stream_first_tts_ms FROM voice_turns WHERE id = ?",
+                "SELECT id FROM voice_turns WHERE id = ?",
                 (int(turn_id),),
             ).fetchone()
             if not row:
@@ -336,6 +377,9 @@ def update_voice_turn_stream_latency(
             if chunks is not None:
                 sets.append("stream_chunk_count = ?")
                 vals.append(int(chunks))
+            if encoded is not None:
+                sets.append("stream_sentence_chunks = ?")
+                vals.append(encoded)
             for col, val in fields.items():
                 if val is not None:
                     sets.append(f"{col} = ?")
@@ -438,108 +482,18 @@ def update_voice_turn_lip_sync_latency(
 
 
 def get_summary() -> dict[str, Any]:
+    """Aggregate averages for transcribe + per-sentence RAG / TTS / humanaudio."""
     init_db()
     with _connect() as cx:
         row = cx.execute(
             """
             SELECT
                 COUNT(*) AS total_questions,
-                AVG(total_request_ms) AS avg_total_ms,
-                AVG(rag_latency_ms) AS avg_rag_latency_ms,
-                MIN(rag_latency_ms) AS min_rag_latency_ms,
-                MAX(rag_latency_ms) AS max_rag_latency_ms,
-                MIN(total_request_ms) AS min_total_ms,
-                MAX(total_request_ms) AS max_total_ms,
-                SUM(COALESCE(prompt_tokens, 0)) AS sum_prompt_tokens,
-                SUM(COALESCE(completion_tokens, 0)) AS sum_completion_tokens,
-                SUM(COALESCE(prompt_tokens, 0) + COALESCE(completion_tokens, 0)) AS sum_total_tokens,
-                AVG(heard_chars) AS avg_heard_chars,
-                AVG(answer_chars) AS avg_answer_chars,
-                AVG(webrtc_first_voice_ms) AS avg_webrtc_first_voice_ms,
-                MIN(webrtc_first_voice_ms) AS min_webrtc_first_voice_ms,
-                MAX(webrtc_first_voice_ms) AS max_webrtc_first_voice_ms,
                 AVG(stt_latency_ms) AS avg_stt_latency_ms,
-                MIN(stt_latency_ms) AS min_stt_latency_ms,
-                MAX(stt_latency_ms) AS max_stt_latency_ms,
-                AVG(stt_first_chunk_latency_ms) AS avg_stt_first_chunk_latency_ms,
-                MIN(stt_first_chunk_latency_ms) AS min_stt_first_chunk_latency_ms,
-                MAX(stt_first_chunk_latency_ms) AS max_stt_first_chunk_latency_ms,
-                AVG(stt_to_lip_sync_ms) AS avg_stt_to_lip_sync_ms,
-                MIN(stt_to_lip_sync_ms) AS min_stt_to_lip_sync_ms,
-                MAX(stt_to_lip_sync_ms) AS max_stt_to_lip_sync_ms,
-                AVG(time_to_first_voice_ms) AS avg_time_to_first_voice_ms,
-                MIN(time_to_first_voice_ms) AS min_time_to_first_voice_ms,
-                MAX(time_to_first_voice_ms) AS max_time_to_first_voice_ms,
-                AVG(mic_to_lip_sync_ms) AS avg_mic_to_lip_sync_ms,
-                MIN(mic_to_lip_sync_ms) AS min_mic_to_lip_sync_ms,
-                MAX(mic_to_lip_sync_ms) AS max_mic_to_lip_sync_ms,
-                AVG(mic_to_speaker_voice_ms) AS avg_mic_to_speaker_voice_ms,
-                MIN(mic_to_speaker_voice_ms) AS min_mic_to_speaker_voice_ms,
-                MAX(mic_to_speaker_voice_ms) AS max_mic_to_speaker_voice_ms,
-                AVG(tts_latency_ms) AS avg_tts_latency_ms,
-                MIN(tts_latency_ms) AS min_tts_latency_ms,
-                MAX(tts_latency_ms) AS max_tts_latency_ms,
-                AVG(lip_sync_latency_ms) AS avg_lip_sync_latency_ms,
-                MIN(lip_sync_latency_ms) AS min_lip_sync_latency_ms,
-                MAX(lip_sync_latency_ms) AS max_lip_sync_latency_ms,
-                AVG(lip_sync_to_video_stream_ms) AS avg_lip_sync_to_video_stream_ms,
-                MIN(lip_sync_to_video_stream_ms) AS min_lip_sync_to_video_stream_ms,
-                MAX(lip_sync_to_video_stream_ms) AS max_lip_sync_to_video_stream_ms,
-                AVG(mic_to_first_audio_ms) AS avg_mic_to_first_audio_ms,
-                MIN(mic_to_first_audio_ms) AS min_mic_to_first_audio_ms,
-                MAX(mic_to_first_audio_ms) AS max_mic_to_first_audio_ms,
-                AVG(client_voice_turn_ms) AS avg_client_voice_turn_ms,
-                MIN(client_voice_turn_ms) AS min_client_voice_turn_ms,
-                MAX(client_voice_turn_ms) AS max_client_voice_turn_ms,
-                AVG(human_dispatch_ms) AS avg_human_dispatch_ms,
-                MIN(human_dispatch_ms) AS min_human_dispatch_ms,
-                MAX(human_dispatch_ms) AS max_human_dispatch_ms,
-                SUM(CASE WHEN human_dispatched = 1 THEN 1 ELSE 0 END) AS human_dispatched_count,
-                AVG(time_to_audio_playback_ms) AS avg_time_to_audio_playback_ms,
-                MIN(time_to_audio_playback_ms) AS min_time_to_audio_playback_ms,
-                MAX(time_to_audio_playback_ms) AS max_time_to_audio_playback_ms,
-                AVG(time_to_video_playback_ms) AS avg_time_to_video_playback_ms,
-                MIN(time_to_video_playback_ms) AS min_time_to_video_playback_ms,
-                MAX(time_to_video_playback_ms) AS max_time_to_video_playback_ms,
-                AVG(mic_to_video_playback_ms) AS avg_mic_to_video_playback_ms,
-                MIN(mic_to_video_playback_ms) AS min_mic_to_video_playback_ms,
-                MAX(mic_to_video_playback_ms) AS max_mic_to_video_playback_ms,
-                AVG(lip_sync_avatar_play_ms) AS avg_lip_sync_avatar_play_ms,
-                MIN(lip_sync_avatar_play_ms) AS min_lip_sync_avatar_play_ms,
-                MAX(lip_sync_avatar_play_ms) AS max_lip_sync_avatar_play_ms,
-                AVG(stream_start_to_avatar_ms) AS avg_stream_start_to_avatar_ms,
-                MIN(stream_start_to_avatar_ms) AS min_stream_start_to_avatar_ms,
-                MAX(stream_start_to_avatar_ms) AS max_stream_start_to_avatar_ms,
-                AVG(video_stream_first_ms) AS avg_video_stream_first_ms,
-                MIN(video_stream_first_ms) AS min_video_stream_first_ms,
-                MAX(video_stream_first_ms) AS max_video_stream_first_ms,
-                AVG(webrtc_real_playback_ms) AS avg_webrtc_real_playback_ms,
-                MIN(webrtc_real_playback_ms) AS min_webrtc_real_playback_ms,
-                MAX(webrtc_real_playback_ms) AS max_webrtc_real_playback_ms,
-                AVG(stream_chunk_count) AS avg_stream_chunk_count,
-                AVG(rag_first_chunk_enqueued_ms) AS avg_rag_first_chunk_enqueued_ms,
-                MIN(rag_first_chunk_enqueued_ms) AS min_rag_first_chunk_enqueued_ms,
-                MAX(rag_first_chunk_enqueued_ms) AS max_rag_first_chunk_enqueued_ms,
-                AVG(stream_first_tts_ms) AS avg_stream_first_tts_ms,
-                MIN(stream_first_tts_ms) AS min_stream_first_tts_ms,
-                MAX(stream_first_tts_ms) AS max_stream_first_tts_ms,
-                AVG(stream_first_humanaudio_ms) AS avg_stream_first_humanaudio_ms,
-                MIN(stream_first_humanaudio_ms) AS min_stream_first_humanaudio_ms,
-                MAX(stream_first_humanaudio_ms) AS max_stream_first_humanaudio_ms,
-                AVG(stream_first_chunk_total_ms) AS avg_stream_first_chunk_total_ms,
-                MIN(stream_first_chunk_total_ms) AS min_stream_first_chunk_total_ms,
-                MAX(stream_first_chunk_total_ms) AS max_stream_first_chunk_total_ms,
-                AVG(stream_first_chunk_completed_ms) AS avg_stream_first_chunk_completed_ms,
-                MIN(stream_first_chunk_completed_ms) AS min_stream_first_chunk_completed_ms,
-                MAX(stream_first_chunk_completed_ms) AS max_stream_first_chunk_completed_ms,
+                AVG(stream_avg_rag_sentence_ms) AS avg_stream_avg_rag_sentence_ms,
                 AVG(stream_avg_tts_ms) AS avg_stream_avg_tts_ms,
-                MIN(stream_avg_tts_ms) AS min_stream_avg_tts_ms,
-                MAX(stream_avg_tts_ms) AS max_stream_avg_tts_ms,
                 AVG(stream_avg_humanaudio_ms) AS avg_stream_avg_humanaudio_ms,
-                MIN(stream_avg_humanaudio_ms) AS min_stream_avg_humanaudio_ms,
-                MAX(stream_avg_humanaudio_ms) AS max_stream_avg_humanaudio_ms,
-                AVG(stream_sum_tts_ms) AS avg_stream_sum_tts_ms,
-                AVG(stream_sum_humanaudio_ms) AS avg_stream_sum_humanaudio_ms
+                AVG(stream_chunk_count) AS avg_stream_chunk_count
             FROM voice_turns
             """
         ).fetchone()
@@ -556,102 +510,11 @@ def get_summary() -> dict[str, Any]:
 def _empty_summary() -> dict[str, Any]:
     return {
         "total_questions": 0,
-        "avg_total_ms": None,
-        "avg_rag_latency_ms": None,
-        "min_rag_latency_ms": None,
-        "max_rag_latency_ms": None,
-        "min_total_ms": None,
-        "max_total_ms": None,
-        "sum_prompt_tokens": 0,
-        "sum_completion_tokens": 0,
-        "sum_total_tokens": 0,
-        "avg_heard_chars": None,
-        "avg_answer_chars": None,
-        "avg_webrtc_first_voice_ms": None,
-        "min_webrtc_first_voice_ms": None,
-        "max_webrtc_first_voice_ms": None,
         "avg_stt_latency_ms": None,
-        "min_stt_latency_ms": None,
-        "max_stt_latency_ms": None,
-        "avg_stt_first_chunk_latency_ms": None,
-        "min_stt_first_chunk_latency_ms": None,
-        "max_stt_first_chunk_latency_ms": None,
-        "avg_stt_to_lip_sync_ms": None,
-        "min_stt_to_lip_sync_ms": None,
-        "max_stt_to_lip_sync_ms": None,
-        "avg_time_to_first_voice_ms": None,
-        "min_time_to_first_voice_ms": None,
-        "max_time_to_first_voice_ms": None,
-        "avg_mic_to_lip_sync_ms": None,
-        "min_mic_to_lip_sync_ms": None,
-        "max_mic_to_lip_sync_ms": None,
-        "avg_mic_to_speaker_voice_ms": None,
-        "min_mic_to_speaker_voice_ms": None,
-        "max_mic_to_speaker_voice_ms": None,
-        "avg_tts_latency_ms": None,
-        "min_tts_latency_ms": None,
-        "max_tts_latency_ms": None,
-        "avg_lip_sync_latency_ms": None,
-        "min_lip_sync_latency_ms": None,
-        "max_lip_sync_latency_ms": None,
-        "avg_lip_sync_to_video_stream_ms": None,
-        "min_lip_sync_to_video_stream_ms": None,
-        "max_lip_sync_to_video_stream_ms": None,
-        "avg_mic_to_first_audio_ms": None,
-        "min_mic_to_first_audio_ms": None,
-        "max_mic_to_first_audio_ms": None,
-        "avg_client_voice_turn_ms": None,
-        "min_client_voice_turn_ms": None,
-        "max_client_voice_turn_ms": None,
-        "avg_human_dispatch_ms": None,
-        "min_human_dispatch_ms": None,
-        "max_human_dispatch_ms": None,
-        "human_dispatched_count": 0,
-        "avg_time_to_audio_playback_ms": None,
-        "min_time_to_audio_playback_ms": None,
-        "max_time_to_audio_playback_ms": None,
-        "avg_time_to_video_playback_ms": None,
-        "min_time_to_video_playback_ms": None,
-        "max_time_to_video_playback_ms": None,
-        "avg_mic_to_video_playback_ms": None,
-        "min_mic_to_video_playback_ms": None,
-        "max_mic_to_video_playback_ms": None,
-        "avg_lip_sync_avatar_play_ms": None,
-        "min_lip_sync_avatar_play_ms": None,
-        "max_lip_sync_avatar_play_ms": None,
-        "avg_stream_start_to_avatar_ms": None,
-        "min_stream_start_to_avatar_ms": None,
-        "max_stream_start_to_avatar_ms": None,
-        "avg_video_stream_first_ms": None,
-        "min_video_stream_first_ms": None,
-        "max_video_stream_first_ms": None,
-        "avg_webrtc_real_playback_ms": None,
-        "min_webrtc_real_playback_ms": None,
-        "max_webrtc_real_playback_ms": None,
-        "avg_stream_chunk_count": None,
-        "avg_rag_first_chunk_enqueued_ms": None,
-        "min_rag_first_chunk_enqueued_ms": None,
-        "max_rag_first_chunk_enqueued_ms": None,
-        "avg_stream_first_tts_ms": None,
-        "min_stream_first_tts_ms": None,
-        "max_stream_first_tts_ms": None,
-        "avg_stream_first_humanaudio_ms": None,
-        "min_stream_first_humanaudio_ms": None,
-        "max_stream_first_humanaudio_ms": None,
-        "avg_stream_first_chunk_total_ms": None,
-        "min_stream_first_chunk_total_ms": None,
-        "max_stream_first_chunk_total_ms": None,
-        "avg_stream_first_chunk_completed_ms": None,
-        "min_stream_first_chunk_completed_ms": None,
-        "max_stream_first_chunk_completed_ms": None,
+        "avg_stream_avg_rag_sentence_ms": None,
         "avg_stream_avg_tts_ms": None,
-        "min_stream_avg_tts_ms": None,
-        "max_stream_avg_tts_ms": None,
         "avg_stream_avg_humanaudio_ms": None,
-        "min_stream_avg_humanaudio_ms": None,
-        "max_stream_avg_humanaudio_ms": None,
-        "avg_stream_sum_tts_ms": None,
-        "avg_stream_sum_humanaudio_ms": None,
+        "avg_stream_chunk_count": None,
         "first_event_ts": None,
         "last_event_ts": None,
     }
@@ -666,26 +529,14 @@ def get_voice_turn(turn_id: int) -> dict[str, Any] | None:
     with _connect() as cx:
         row = cx.execute(
             """
-            SELECT id, ts, heard_chars, answer_chars, total_request_ms,
-                   prompt_tokens, completion_tokens, webrtc_first_voice_ms, rag_latency_ms,
-                   stt_latency_ms, stt_first_chunk_latency_ms, stt_chunk_count, stt_to_lip_sync_ms,
-                   time_to_first_voice_ms, mic_to_speaker_voice_ms,
-                   tts_latency_ms, lip_sync_latency_ms, mic_to_lip_sync_ms,
-                   lip_sync_to_video_stream_ms, mic_to_first_audio_ms,
-                   client_voice_turn_ms, human_dispatch_ms, human_dispatched,
-                   time_to_audio_playback_ms, time_to_video_playback_ms, mic_to_video_playback_ms,
-                   lip_sync_avatar_play_ms, stream_start_to_avatar_ms, video_stream_first_ms,
-                   webrtc_real_playback_ms,
-                   stream_chunk_count, rag_first_chunk_enqueued_ms,
-                   stream_first_tts_ms, stream_first_humanaudio_ms, stream_first_chunk_total_ms,
-                   stream_first_chunk_completed_ms,
-                   stream_avg_tts_ms, stream_avg_humanaudio_ms,
-                   stream_sum_tts_ms, stream_sum_humanaudio_ms
+            SELECT id, ts, stt_latency_ms, stream_chunk_count,
+                   stream_avg_rag_sentence_ms, stream_avg_tts_ms, stream_avg_humanaudio_ms,
+                   stream_sentence_chunks
             FROM voice_turns WHERE id = ?
             """,
             (tid,),
         ).fetchone()
-    return dict(row) if row else None
+    return _voice_turn_row(row) if row else None
 
 
 def get_recent_voice_turns(limit: int = 50) -> list[dict[str, Any]]:
@@ -694,28 +545,16 @@ def get_recent_voice_turns(limit: int = 50) -> list[dict[str, Any]]:
     with _connect() as cx:
         cur = cx.execute(
             """
-            SELECT id, ts, heard_chars, answer_chars, total_request_ms,
-                   prompt_tokens, completion_tokens, webrtc_first_voice_ms, rag_latency_ms,
-                   stt_latency_ms, stt_first_chunk_latency_ms, stt_chunk_count, stt_to_lip_sync_ms,
-                   time_to_first_voice_ms, mic_to_speaker_voice_ms,
-                   tts_latency_ms, lip_sync_latency_ms, mic_to_lip_sync_ms,
-                   lip_sync_to_video_stream_ms, mic_to_first_audio_ms,
-                   client_voice_turn_ms, human_dispatch_ms, human_dispatched,
-                   time_to_audio_playback_ms, time_to_video_playback_ms, mic_to_video_playback_ms,
-                   lip_sync_avatar_play_ms, stream_start_to_avatar_ms, video_stream_first_ms,
-                   webrtc_real_playback_ms,
-                   stream_chunk_count, rag_first_chunk_enqueued_ms,
-                   stream_first_tts_ms, stream_first_humanaudio_ms, stream_first_chunk_total_ms,
-                   stream_first_chunk_completed_ms,
-                   stream_avg_tts_ms, stream_avg_humanaudio_ms,
-                   stream_sum_tts_ms, stream_sum_humanaudio_ms
+            SELECT id, ts, stt_latency_ms, stream_chunk_count,
+                   stream_avg_rag_sentence_ms, stream_avg_tts_ms, stream_avg_humanaudio_ms,
+                   stream_sentence_chunks
             FROM voice_turns
             ORDER BY id DESC
             LIMIT ?
             """,
             (limit,),
         )
-        return [dict(r) for r in cur.fetchall()]
+        return [_voice_turn_row(r) for r in cur.fetchall()]
 
 
 def clear_all() -> int:

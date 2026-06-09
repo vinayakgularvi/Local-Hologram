@@ -123,230 +123,54 @@ function latestChartRows(rows, limit = 24, predicate = () => true) {
   return out;
 }
 
-const recentTableRows = computed(() => recent.value);
-
-/** Unique pipeline metrics only (mic tap → lip-sync avatar). No duplicate aliases. */
+/** Transcribe + per-sentence RAG / TTS (elapsed_ms) / humanaudiowithpath only. */
 const PIPELINE_STEPS = [
   {
-    id: "mic",
-    step: 1,
-    title: "Mic tap → lip-sync avatar",
-    sub: "End-to-end until avatar is visibly playing",
-    field: "mic_to_lip_sync_ms",
-    track: "speaker",
-    hero: true,
-    empty: "Complete a spoken turn on Live with avatar video.",
-  },
-  {
-    id: "mica",
-    step: 2,
-    title: "Mic tap → first audio",
-    sub: "Until avatar speaks on speakers",
-    field: "mic_to_first_audio_ms",
-    track: "ttfv",
-    empty: "Complete a spoken turn with TTS.",
-  },
-  {
     id: "stt",
-    step: 3,
-    title: "Transcribe API (final)",
-    sub: "Final POST /api/transcribe request → response (ms)",
+    step: 1,
+    title: "Transcribe",
+    sub: "POST /api/transcribe (final transcript)",
     field: "stt_latency_ms",
+    summaryField: "avg_stt_latency_ms",
     track: "stt",
     empty: "Complete a spoken turn with server transcribe enabled.",
   },
   {
-    id: "stt-live",
-    step: 4,
-    title: "Live transcribe first chunk",
-    sub: "Mic tap → first partial caption (chunked STT while recording)",
-    field: "stt_first_chunk_latency_ms",
-    track: "stt",
-    empty: "Speak for a few seconds with live chunked transcribe enabled.",
-  },
-  {
-    id: "stt-lip",
-    step: 5,
-    title: "Transcribe → lip-sync video",
-    sub: "Final transcribe response → avatar visibly lip-syncing",
-    field: "stt_to_lip_sync_ms",
-    track: "stt",
-    highlight: true,
-    empty: "Complete a spoken turn with server transcribe and avatar video.",
-  },
-  {
-    id: "cvt",
-    step: 6,
-    title: "Client voice-turn",
-    sub: "Transcript sent → voice-turn JSON",
-    field: "client_voice_turn_ms",
+    id: "rag-sentence",
+    step: 2,
+    title: "RAG sentence",
+    sub: "RAG stream start → each sentence ready (per turn avg)",
+    field: "stream_avg_rag_sentence_ms",
+    summaryField: "avg_stream_avg_rag_sentence_ms",
     track: "rag",
-    empty: "Complete a spoken voice-turn on Live.",
+    empty: "Voice-stream with VOICE_STREAM_HUMAN_UNIT=sentence.",
   },
   {
-    id: "rag",
-    step: 7,
-    title: "RAG latency",
-    sub: "Stream request → response (when configured)",
-    field: "rag_latency_ms",
-    track: "rag",
-    empty: "Voice turns using RAG_GENERATE_STREAM_URL only.",
-  },
-  {
-    id: "rag-chunk",
-    step: 8,
-    title: "RAG → first sentence",
-    sub: "Stream start → first complete sentence enqueued for TTS",
-    field: "rag_first_chunk_enqueued_ms",
-    track: "rag",
-    empty: "Voice-stream turns with sentence dispatch (VOICE_STREAM_HUMAN_UNIT=sentence).",
-  },
-  {
-    id: "tts-sentence-1",
-    step: 9,
-    title: "Sentence TTS (1st)",
-    sub: "POST /v1/tts/reference latency for the first streamed sentence",
-    field: "stream_first_tts_ms",
-    track: "stream-tts",
-    highlight: true,
-    empty: "Voice-stream with VOICE_DISPATCH_MODE=humanaudio.",
-  },
-  {
-    id: "ha-1",
-    step: 10,
-    title: "humanaudio (1st sentence)",
-    sub: "POST /humanaudiowithpath for first sentence",
-    field: "stream_first_humanaudio_ms",
-    track: "humanaudio",
-    highlight: true,
-    empty: "Voice-stream with VOICE_DISPATCH_MODE=humanaudio.",
-  },
-  {
-    id: "sentence-total-1",
-    step: 11,
-    title: "1st sentence TTS + humanaudio",
-    sub: "Sum of /v1/tts/reference + /humanaudiowithpath for first sentence",
-    field: "stream_first_chunk_total_ms",
-    track: "stream-tts",
-    highlight: true,
-    empty: "Voice-stream with VOICE_DISPATCH_MODE=humanaudio.",
-  },
-  {
-    id: "rag-first-audio",
-    step: 12,
-    title: "RAG → first sentence audio",
-    sub: "RAG stream start → first sentence sent to avatar (wall clock)",
-    field: "stream_first_chunk_completed_ms",
-    track: "rag",
-    highlight: true,
-    empty: "Voice-stream with sentence dispatch and humanaudio.",
-  },
-  {
-    id: "tts-sentence-avg",
-    step: 13,
-    title: "Sentence TTS (avg)",
-    sub: "Average /v1/tts/reference latency per streamed sentence",
+    id: "tts-sentence",
+    step: 3,
+    title: "TTS sentence",
+    sub: "/v1/tts/reference elapsed_ms (per turn avg)",
     field: "stream_avg_tts_ms",
+    summaryField: "avg_stream_avg_tts_ms",
     track: "stream-tts",
-    empty: "Voice-stream with multiple sentences in one reply.",
+    highlight: true,
+    empty: "Voice-stream with VOICE_DISPATCH_MODE=humanaudio.",
   },
   {
-    id: "ha-avg",
-    step: 14,
-    title: "humanaudio (avg / sentence)",
-    sub: "Average /humanaudiowithpath POST latency per sentence",
+    id: "ha-sentence",
+    step: 4,
+    title: "humanaudiowithpath",
+    sub: "POST /humanaudiowithpath per sentence (per turn avg)",
     field: "stream_avg_humanaudio_ms",
+    summaryField: "avg_stream_avg_humanaudio_ms",
     track: "humanaudio",
-    empty: "Voice-stream with multiple sentences in one reply.",
-  },
-  {
-    id: "server",
-    step: 15,
-    title: "Server voice-stream",
-    sub: "API wall time (until JSON returned)",
-    field: "total_request_ms",
-    track: "default",
-    empty: null,
-  },
-  {
-    id: "human",
-    step: 16,
-    title: "Human dispatch",
-    sub: "Server POST LiveTalking /human (legacy)",
-    field: "human_dispatch_ms",
-    track: "webrtc",
-    empty: "Requires VOICE_DISPATCH_MODE=human.",
-  },
-  {
-    id: "tts",
-    step: 17,
-    title: "Server complete → WebRTC audio",
-    sub: "Voice-stream JSON received → audible audio on stream",
-    field: "tts_latency_ms",
-    track: "tts",
-    empty: "Complete a spoken turn with TTS.",
-  },
-  {
-    id: "realpb",
-    step: 18,
-    title: "Server complete → real WebRTC playback",
-    sub: "Audible audio + lip-sync video (timestamp = later of the two)",
-    field: "webrtc_real_playback_ms",
-    track: "speaker",
     highlight: true,
-    empty: "Complete a turn with avatar video and TTS.",
-  },
-  {
-    id: "avatar",
-    step: 19,
-    title: "Server complete → lip-sync video",
-    sub: "Voice-turn JSON received → avatar visibly playing",
-    field: "lip_sync_avatar_play_ms",
-    track: "speaker",
-    highlight: true,
-    empty: "Complete a turn with visible avatar video.",
-  },
-  {
-    id: "vfirst",
-    step: 20,
-    title: "Video stream first tick",
-    sub: "Early timeline bump (may be stale frames)",
-    field: "video_stream_first_ms",
-    track: "lvs",
-    empty: "Complete a turn with visible avatar video.",
-  },
-  {
-    id: "gap",
-    step: 21,
-    title: "Stream tick → avatar play",
-    sub: "Gap after first tick until lip-synced avatar plays",
-    field: "stream_start_to_avatar_ms",
-    track: "lip",
-    empty: "Complete a turn with visible avatar video.",
-  },
-  {
-    id: "lip",
-    step: 22,
-    title: "Audio → lip-sync video",
-    sub: "First audio → lip-synced avatar playing",
-    field: "lip_sync_latency_ms",
-    track: "lip",
-    empty: "Complete a turn with visible avatar video.",
-  },
-  {
-    id: "ttfv",
-    step: 23,
-    title: "Time to first voice",
-    sub: "STT + RAG (or server) + WebRTC audio (sum)",
-    field: "time_to_first_voice_ms",
-    track: "ttfv",
-    empty: "Complete a spoken turn with TTS.",
+    empty: "Voice-stream with VOICE_DISPATCH_MODE=humanaudio.",
   },
 ];
 
-function summaryAvgKey(field) {
-  if (field === "total_request_ms") return "avg_total_ms";
-  return `avg_${field}`;
+function summaryAvgKey(step) {
+  return step.summaryField || `avg_${step.field}`;
 }
 
 function barsForField(field, limit = 16) {
@@ -377,85 +201,102 @@ const pipelineCards = computed(() => {
   const cards = [
     { label: "Total questions", value: fmtNum(s.total_questions, 0) },
     {
-      label: "Server /human dispatched",
-      value: `${fmtNum(s.human_dispatched_count, 0)} / ${fmtNum(s.total_questions, 0)}`,
+      label: "Avg sentences / turn",
+      value: fmtNum(s.avg_stream_chunk_count, 1),
+    },
+    {
+      label: "First / last (UTC)",
+      value: `${fmtTs(s.first_event_ts)} → ${fmtTs(s.last_event_ts)}`,
+      wide: true,
     },
   ];
   for (const step of PIPELINE_STEPS) {
     cards.push({
       label: `${step.step}. ${step.title} (avg)`,
-      value: fmtMs(s[summaryAvgKey(step.field)]),
-      highlight: Boolean(step.hero || step.highlight),
+      value: fmtMs(s[summaryAvgKey(step)]),
+      highlight: Boolean(step.highlight),
     });
   }
   return cards;
 });
 
-const tableColumns = computed(() => [
-  { key: "id", label: "#", sticky: true },
-  { key: "ts", label: "Time (UTC)", sticky: true },
-  ...PIPELINE_STEPS.map((step) => ({
-    key: step.field,
-    label: String(step.step),
-    mono: true,
-    pipeline: true,
-    hero: Boolean(step.hero),
-  })),
-  { key: "human_dispatched", label: "Disp.", mono: true },
-  { key: "prompt_tokens", label: "Tokens", mono: true },
-  { key: "heard_chars", label: "Chars", mono: true },
-]);
-
-const secondaryCards = computed(() => {
-  const s = summary.value;
-  if (!s) return [];
-  return [
-    { label: "Prompt tokens (sum)", value: fmtNum(s.sum_prompt_tokens, 0) },
-    { label: "Completion tokens (sum)", value: fmtNum(s.sum_completion_tokens, 0) },
-    { label: "Total tokens (sum)", value: fmtNum(s.sum_total_tokens, 0) },
-    {
-      label: "Avg heard / answer chars",
-      value: `${fmtNum(s.avg_heard_chars, 1)} / ${fmtNum(s.avg_answer_chars, 1)}`,
-    },
-    {
-      label: "First / last event (UTC)",
-      value: `${fmtTs(s.first_event_ts)} → ${fmtTs(s.last_event_ts)}`,
-      wide: true,
-    },
-  ];
-});
-
-function tableCell(row, col) {
-  if (col.key === "id") return row.id;
-  if (col.key === "ts") return fmtTs(row.ts);
-  if (col.key === "human_dispatched") {
-    return row.human_dispatched === 1 ? "yes" : row.human_dispatched === 0 ? "no" : "—";
-  }
-  if (col.key === "prompt_tokens") {
-    return `${row.prompt_tokens ?? "—"} / ${row.completion_tokens ?? "—"}`;
-  }
-  if (col.key === "heard_chars") {
-    return `${row.heard_chars} / ${row.answer_chars}`;
-  }
-  return fmtMs(row[col.key]);
+function sentenceRows(row) {
+  const chunks = row?.stream_sentence_chunks;
+  return Array.isArray(chunks) ? chunks : [];
 }
 
-const recentTokenBars = computed(() => {
-  const rows = latestChartRows(recent.value);
-  const maxVal = Math.max(
-    1,
-    ...rows.map((r) => Number((r.prompt_tokens || 0) + (r.completion_tokens || 0)))
+function sentenceCount(row) {
+  const rows = sentenceRows(row);
+  if (rows.length > 0) return rows.length;
+  const n = Number(row?.stream_chunk_count);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+function sentenceTotalMs(s) {
+  if (s.total_ms != null && !Number.isNaN(Number(s.total_ms))) {
+    return Number(s.total_ms);
+  }
+  const parts = [s.rag_sentence_ms, s.tts_ms, s.humanaudio_ms].filter(
+    (v) => v != null && !Number.isNaN(Number(v))
   );
-  return rows.map((r) => {
-    const total = Number((r.prompt_tokens || 0) + (r.completion_tokens || 0));
-    return {
-      id: r.id,
-      label: `#${r.id}`,
-      total,
-      pct: Math.max(3, (total / maxVal) * 100),
-    };
-  });
+  if (!parts.length) return null;
+  return parts.reduce((a, b) => a + Number(b), 0);
+}
+
+/** One block per user question with sentence count + every sentence latency. */
+const questionTurns = computed(() =>
+  recent.value.map((row) => ({
+    id: row.id,
+    ts: row.ts,
+    sttMs: row.stt_latency_ms,
+    sentenceCount: sentenceCount(row),
+    sentences: sentenceRows(row),
+    avgRag: row.stream_avg_rag_sentence_ms,
+    avgTts: row.stream_avg_tts_ms,
+    avgHa: row.stream_avg_humanaudio_ms,
+  }))
+);
+
+/** Flat list: every sentence from every question (for scanning all latencies). */
+const flatSentenceRows = computed(() => {
+  const out = [];
+  for (const turn of questionTurns.value) {
+    if (!turn.sentences.length) {
+      out.push({
+        turnId: turn.id,
+        ts: turn.ts,
+        sentenceCount: turn.sentenceCount,
+        sentence: null,
+        sttMs: turn.sttMs,
+        ragMs: null,
+        ttsMs: null,
+        haMs: null,
+        totalMs: null,
+        placeholder: true,
+      });
+      continue;
+    }
+    for (const s of turn.sentences) {
+      out.push({
+        turnId: turn.id,
+        ts: turn.ts,
+        sentenceCount: turn.sentenceCount,
+        sentence: s.sentence,
+        sttMs: turn.sttMs,
+        ragMs: s.rag_sentence_ms,
+        ttsMs: s.tts_ms,
+        haMs: s.humanaudio_ms,
+        totalMs: sentenceTotalMs(s),
+        placeholder: false,
+      });
+    }
+  }
+  return out;
 });
+
+const totalSentenceRows = computed(() =>
+  flatSentenceRows.value.filter((r) => !r.placeholder).length
+);
 
 async function submitReset() {
   resetMsg.value = "";
@@ -507,9 +348,9 @@ async function submitReset() {
 
     <section v-if="!err && summary" class="pipeline-section">
       <header class="pipeline-section__head">
-        <h2 class="pipeline-section__title">Voice pipeline</h2>
+        <h2 class="pipeline-section__title">Voice latency</h2>
         <p class="pipeline-section__sub">
-          Unique metrics, mic tap → lip-sync avatar; steps ⑧–⑫ are per-sentence TTS / humanaudio
+          Transcribe, then per-sentence RAG → TTS (elapsed_ms) → humanaudiowithpath
         </p>
       </header>
 
@@ -519,9 +360,7 @@ async function submitReset() {
           :key="chart.id"
           class="viz-card"
           :class="{
-            'viz-card--hero': chart.hero,
             'viz-card--gap': chart.highlight,
-            'viz-card--end': chart.id === 'ttfv',
           }"
         >
           <div class="viz-card__head">
@@ -570,80 +409,110 @@ async function submitReset() {
       </div>
     </section>
 
-    <section v-if="!err && summary" class="secondary-section">
-      <h2 class="secondary-section__title">Tokens &amp; usage</h2>
-      <div class="viz-grid viz-grid--secondary">
-        <article class="viz-card viz-card--compact">
-          <h3 class="viz-card__title">Recent token usage</h3>
-          <div v-if="recentTokenBars.length" class="bars bars--compact">
-            <div
-              v-for="b in recentTokenBars"
-              :key="`t-${b.id}`"
-              class="bar-row"
-              :title="`${b.label}: ${fmtNum(b.total)}`"
-            >
-              <span class="bar-row__label">{{ b.label }}</span>
-              <div class="bar-row__track bar-row__track--tokens">
-                <div class="bar-row__fill bar-row__fill--tokens" :style="{ width: `${b.pct}%` }" />
-              </div>
-              <span class="bar-row__value">{{ fmtNum(b.total) }}</span>
-            </div>
-          </div>
-          <p v-else class="viz-card__empty">No token data yet.</p>
-        </article>
-      </div>
-      <div class="dash__grid dash__grid--secondary">
-        <article
-          v-for="(c, i) in secondaryCards"
-          :key="`s-${i}`"
-          class="card card--compact"
-          :class="{ 'card--wide': c.wide }"
-        >
-          <h2 class="card__label">{{ c.label }}</h2>
-          <p class="card__value" :class="{ 'card__value--small': c.wide }">{{ c.value }}</p>
-        </article>
-      </div>
-    </section>
-
     <section v-if="!err" class="table-section">
-      <h2 class="table-section__title">Recent voice turns</h2>
-      <p class="table-section__sub">Columns follow pipeline order (mic tap → lip sync video)</p>
+      <header class="table-section__head">
+        <div>
+          <h2 class="table-section__title">Per question · sentence latencies</h2>
+          <p class="table-section__sub">
+            Each question shows sentence count, transcribe once, then every sentence RAG / TTS / humanaudio ms
+          </p>
+        </div>
+        <p v-if="totalSentenceRows" class="table-section__stat mono">
+          {{ totalSentenceRows }} sentence row(s) across {{ questionTurns.length }} question(s)
+        </p>
+      </header>
+
+      <div v-if="!questionTurns.length && !loading" class="table__empty table__empty--block">
+        No data yet — use the mic on the Live page.
+      </div>
+
+      <div v-else class="turn-list">
+        <article v-for="turn in questionTurns" :key="turn.id" class="turn-card">
+          <header class="turn-card__head">
+            <div class="turn-card__title-row">
+              <h3 class="turn-card__title">Question #{{ turn.id }}</h3>
+              <span class="turn-card__badge">{{ turn.sentenceCount }} sentence{{ turn.sentenceCount === 1 ? "" : "s" }}</span>
+            </div>
+            <p class="turn-card__meta mono">
+              <span>{{ fmtTs(turn.ts) }}</span>
+              <span class="turn-card__sep">·</span>
+              <span>Transcribe {{ fmtMs(turn.sttMs) }}</span>
+              <template v-if="turn.avgTts != null">
+                <span class="turn-card__sep">·</span>
+                <span>avg TTS {{ fmtMs(turn.avgTts) }}</span>
+              </template>
+              <template v-if="turn.avgHa != null">
+                <span class="turn-card__sep">·</span>
+                <span>avg humanaudio {{ fmtMs(turn.avgHa) }}</span>
+              </template>
+            </p>
+          </header>
+
+          <div v-if="turn.sentences.length" class="table-wrap table-wrap--inset">
+            <table class="sentence-table sentence-table--full">
+              <thead>
+                <tr>
+                  <th>Sentence</th>
+                  <th>RAG sentence</th>
+                  <th>TTS elapsed_ms</th>
+                  <th>humanaudiowithpath</th>
+                  <th>Sum</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="s in turn.sentences" :key="`${turn.id}-s${s.sentence}`">
+                  <td class="mono">{{ s.sentence }}</td>
+                  <td class="mono">{{ fmtMs(s.rag_sentence_ms) }}</td>
+                  <td class="mono">{{ fmtMs(s.tts_ms) }}</td>
+                  <td class="mono">{{ fmtMs(s.humanaudio_ms) }}</td>
+                  <td class="mono">{{ fmtMs(sentenceTotalMs(s)) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p v-else class="turn-card__empty">
+            No per-sentence data
+            <template v-if="turn.sentenceCount > 0"> (count={{ turn.sentenceCount }} from server)</template>
+            — run voice-stream with humanaudio mode.
+          </p>
+        </article>
+      </div>
+
+      <h3 class="flat-table__title">All sentence latencies</h3>
+      <p class="flat-table__sub">One row per sentence — every question, every sentence</p>
       <div class="table-wrap">
-        <table class="table table--pipeline">
+        <table class="table table--flat">
           <thead>
             <tr>
-              <th
-                v-for="col in tableColumns"
-                :key="col.key"
-                :class="{
-                  mono: col.mono,
-                  'table__th--sticky': col.sticky,
-                  'table__th--pipe': col.pipeline,
-                }"
-              >
-                {{ col.label }}
-              </th>
+              <th class="table__th--sticky mono">Q#</th>
+              <th class="table__th--sticky">Time</th>
+              <th class="mono">Sentences</th>
+              <th class="mono">Sent #</th>
+              <th class="mono">Transcribe</th>
+              <th class="mono">RAG sentence</th>
+              <th class="mono">TTS elapsed_ms</th>
+              <th class="mono">humanaudiowithpath</th>
+              <th class="mono">Sum</th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="row in recentTableRows" :key="row.id">
-              <td
-                v-for="col in tableColumns"
-                :key="`${row.id}-${col.key}`"
-                :class="{
-                  mono: col.mono,
-                  'table__td--sticky': col.sticky,
-                  'table__td--pipe': col.pipeline,
-                  'table__td--hero': col.hero,
-                }"
-              >
-                {{ tableCell(row, col) }}
-              </td>
+            <tr
+              v-for="(r, idx) in flatSentenceRows"
+              :key="r.placeholder ? `ph-${r.turnId}` : `${r.turnId}-s${r.sentence}`"
+              :class="{ 'table__row--placeholder': r.placeholder }"
+            >
+              <td class="table__td--sticky mono">{{ r.turnId }}</td>
+              <td class="table__td--sticky">{{ fmtTs(r.ts) }}</td>
+              <td class="mono">{{ r.sentenceCount || "—" }}</td>
+              <td class="mono">{{ r.sentence ?? "—" }}</td>
+              <td class="mono">{{ fmtMs(r.sttMs) }}</td>
+              <td class="mono">{{ fmtMs(r.ragMs) }}</td>
+              <td class="mono">{{ fmtMs(r.ttsMs) }}</td>
+              <td class="mono">{{ fmtMs(r.haMs) }}</td>
+              <td class="mono">{{ fmtMs(r.totalMs) }}</td>
             </tr>
-            <tr v-if="!recentTableRows.length && !loading">
-              <td :colspan="tableColumns.length" class="table__empty">
-                No data yet — use the mic on the Live page.
-              </td>
+            <tr v-if="!flatSentenceRows.length && !loading">
+              <td colspan="9" class="table__empty">No sentence rows yet.</td>
             </tr>
           </tbody>
         </table>
@@ -1245,6 +1114,138 @@ async function submitReset() {
   text-align: center;
   color: #666;
   padding: 2rem !important;
+}
+
+.table-section__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+}
+
+.table-section__stat {
+  margin: 0;
+  font-size: 0.88rem;
+  color: #444;
+  padding: 0.35rem 0.75rem;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.7);
+  border: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+.table__empty--block {
+  margin-bottom: 1.5rem;
+}
+
+.turn-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  margin-bottom: 2rem;
+}
+
+.turn-card {
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.78);
+  border: 1px solid rgba(255, 255, 255, 0.85);
+  box-shadow: 0 4px 16px rgba(15, 23, 42, 0.05);
+  overflow: hidden;
+}
+
+.turn-card__head {
+  padding: 0.85rem 1rem;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.06);
+  background: linear-gradient(135deg, rgba(0, 180, 180, 0.08), rgba(107, 82, 216, 0.06));
+}
+
+.turn-card__title-row {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  flex-wrap: wrap;
+}
+
+.turn-card__title {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 700;
+}
+
+.turn-card__badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.15rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: #0e7490;
+  background: rgba(0, 180, 180, 0.14);
+  border: 1px solid rgba(0, 180, 180, 0.25);
+}
+
+.turn-card__meta {
+  margin: 0.35rem 0 0;
+  font-size: 0.82rem;
+  color: #555;
+}
+
+.turn-card__sep {
+  margin: 0 0.35rem;
+  opacity: 0.55;
+}
+
+.turn-card__empty {
+  margin: 0;
+  padding: 0.85rem 1rem;
+  font-size: 0.85rem;
+  color: #666;
+}
+
+.table-wrap--inset {
+  margin: 0;
+}
+
+.sentence-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+}
+
+.sentence-table--full th,
+.sentence-table--full td {
+  padding: 0.45rem 0.75rem;
+  text-align: left;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+.sentence-table th {
+  color: #555;
+  font-weight: 600;
+  background: rgba(255, 255, 255, 0.5);
+}
+
+.flat-table__title {
+  margin: 0 0 0.25rem;
+  font-size: 1.05rem;
+  font-weight: 700;
+}
+
+.flat-table__sub {
+  margin: 0 0 0.75rem;
+  font-size: 0.85rem;
+  color: #555;
+}
+
+.table--flat thead th {
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+
+.table__row--placeholder {
+  opacity: 0.65;
+  font-style: italic;
 }
 
 .mono {

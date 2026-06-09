@@ -143,7 +143,11 @@ def synthesize_speech(gen_text: str) -> tuple[str, float]:
     output_path = str(payload.get("output_path") or "").strip()
     if not output_path:
         raise RuntimeError("TTS reference response missing output_path")
-    tts_ms = float(payload.get("elapsed_ms") or latency_ms)
+    elapsed = payload.get("elapsed_ms")
+    if elapsed is None:
+        tts_ms = latency_ms
+    else:
+        tts_ms = float(elapsed)
     cache_hit = bool(payload.get("cache_hit"))
     logger.debug(
         "TTS reference chars=%d path=%s latency_ms=%.0f cache_hit=%s",

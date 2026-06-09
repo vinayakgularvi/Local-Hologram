@@ -43,6 +43,7 @@ export default defineConfig({
       "/api": { target: backendOrigin, changeOrigin: true },
       "/outputs": { target: backendOrigin, changeOrigin: true },
       "/offer": { target: backendOrigin, changeOrigin: true },
+      "/session": { target: backendOrigin, changeOrigin: true },
       "/human": { target: backendOrigin, changeOrigin: true },
       "/record": { target: backendOrigin, changeOrigin: true },
     },
