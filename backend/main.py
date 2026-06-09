@@ -114,7 +114,13 @@ from sharepoint_sync import is_configured as sharepoint_is_configured
 from sharepoint_sync import live_sync_mark_done, live_sync_mark_start
 from sharepoint_sync import public_config as sharepoint_public_config
 from sharepoint_sync import sync_to_chroma as sharepoint_sync_to_chroma
-from chunk_pipeline import ffmpeg_concat_videos, ffprobe_duration_seconds, run_chunked_lipsync
+from chunk_pipeline import (
+    ffmpeg_concat_videos,
+    ffmpeg_extract_audio_wav,
+    fit_image_to_avatar_stage,
+    ffprobe_duration_seconds,
+    run_chunked_lipsync,
+)
 from realtime_lipsync import process_segment_sync, split_next_segment
 from studio_integrations import (
     apply_studio_integrations_to_environ,
@@ -420,6 +426,12 @@ VOICE_RAG_MAX_CONTEXT_CHARS = max(400, _env_first_int("VOICE_RAG_MAX_CONTEXT_CHA
 RAG_GENERATE_STREAM_URL = os.environ.get("RAG_GENERATE_STREAM_URL", "").strip()
 RAG_GENERATE_STREAM_TIMEOUT_SEC = max(5.0, float(_env_first_int("RAG_GENERATE_STREAM_TIMEOUT_SEC", default=120)))
 RAG_GENERATE_STREAM_MAX_CHARS = max(2000, _env_first_int("RAG_GENERATE_STREAM_MAX_CHARS", default=400_000))
+_rag_chat_top_k_raw = _env_first_int("RAG_CHAT_TOP_K", default=0)
+RAG_CHAT_TOP_K = (
+    max(1, min(30, _rag_chat_top_k_raw))
+    if _rag_chat_top_k_raw > 0
+    else VOICE_RAG_N_RESULTS
+)
 
 # SharePoint → Chroma: background sync (see _sharepoint_live_loop)
 SHAREPOINT_LIVE_SYNC = os.environ.get("SHAREPOINT_LIVE_SYNC", "1").strip().lower() in (
@@ -3300,12 +3312,22 @@ async def _voice_pipeline(body: VoiceTurnBody, *, humanaudio_only: bool = False)
         }
 
     hologram_trace("voice-turn: LIVETALKING path (Qdrant miss or below threshold)")
-    prompt, rag_meta, chroma_hits = await asyncio.to_thread(_build_voice_llm_prompt, user_text)
     ollama_metrics: dict[str, Any] = {}
     use_rag_stream = bool(RAG_GENERATE_STREAM_URL) and _rag_generate_stream_url_valid(RAG_GENERATE_STREAM_URL)
+    use_v1_chat = use_rag_stream and _is_rag_v1_chat_url(RAG_GENERATE_STREAM_URL)
+    if use_v1_chat:
+        rag_meta = {"enabled": True, "used": True, "llm": "rag_v1_chat", "chunks": 0}
+        prompt = ""
+        chroma_hits: list[dict[str, Any]] = []
+    else:
+        prompt, rag_meta, chroma_hits = await asyncio.to_thread(_build_voice_llm_prompt, user_text)
+    llm_label = (
+        "rag_v1_chat"
+        if use_v1_chat
+        else ("rag_generate_stream" if use_rag_stream else "ollama")
+    )
     hologram_trace(
-        f"voice-turn: LLM={'rag_generate_stream' if use_rag_stream else 'ollama'} "
-        f"chroma_chunks={len(chroma_hits) if chroma_hits else 0}"
+        f"voice-turn: LLM={llm_label} chroma_chunks={len(chroma_hits) if chroma_hits else 0}"
     )
     stream_show_image: dict[str, Any] | None = None
     rag_latency_ms: float | None = None
@@ -3325,20 +3347,33 @@ async def _voice_pipeline(body: VoiceTurnBody, *, humanaudio_only: bool = False)
             f"words_per_chunk={VOICE_STREAM_HUMAN_WORDS_PER_CHUNK}"
         )
     if use_rag_stream:
-        rag_meta["llm"] = "rag_generate_stream"
-        conversation = _build_voice_rag_stream_conversation(user_text, chroma_hits)
-        voice_trace(
-            f"RAG POST → {rag_host} messages={len(conversation)} "
-            f"context_msgs={sum(1 for m in conversation if m.get('role') == 'system')}"
-        )
+        rag_meta["llm"] = llm_label
         t_rag = time.perf_counter()
         try:
-            stream_result = await _collect_rag_generate_stream(
-                RAG_GENERATE_STREAM_URL,
-                conversation,
-                voice_turn=True,
-                stream_human_sessionid=stream_human_sessionid,
-            )
+            if use_v1_chat:
+                voice_trace(
+                    f"RAG POST → {rag_host} /v1/chat top_k={RAG_CHAT_TOP_K} session={sid_short}"
+                )
+                stream_result = await _collect_rag_generate_stream(
+                    RAG_GENERATE_STREAM_URL,
+                    message=user_text,
+                    session_id=sid or "voice",
+                    top_k=RAG_CHAT_TOP_K,
+                    voice_turn=True,
+                    stream_human_sessionid=stream_human_sessionid,
+                )
+            else:
+                conversation = _build_voice_rag_stream_conversation(user_text, chroma_hits)
+                voice_trace(
+                    f"RAG POST → {rag_host} messages={len(conversation)} "
+                    f"context_msgs={sum(1 for m in conversation if m.get('role') == 'system')}"
+                )
+                stream_result = await _collect_rag_generate_stream(
+                    RAG_GENERATE_STREAM_URL,
+                    conversation=conversation,
+                    voice_turn=True,
+                    stream_human_sessionid=stream_human_sessionid,
+                )
             answer = stream_result[0]
             stream_show_image = stream_result[1]
             if len(stream_result) > 2 and isinstance(stream_result[2], dict):
@@ -3367,6 +3402,10 @@ async def _voice_pipeline(body: VoiceTurnBody, *, humanaudio_only: bool = False)
                 rag_meta["stream_dispatch_latency"] = stream_human_meta[
                     "stream_dispatch_latency"
                 ]
+            retrieved = stream_human_meta.get("v1_chat_retrieved")
+            if isinstance(retrieved, list) and retrieved:
+                rag_meta["chunks"] = len(retrieved)
+                rag_meta["v1_retrieved"] = retrieved
     else:
         rag_meta["llm"] = "ollama"
         voice_trace("LLM fallback=ollama (RAG stream URL not configured)")
@@ -3383,6 +3422,11 @@ async def _voice_pipeline(body: VoiceTurnBody, *, humanaudio_only: bool = False)
         names = [str(it.get("name", "")) for it in (show_image.get("items") or [])]
         hologram_trace(f"voice-turn: show_image items={names}")
     speak_text, receipt, order_done_num = split_voice_answer_receipt(answer)
+    v1_cart = stream_human_meta.get("v1_chat_cart")
+    if isinstance(v1_cart, list) and v1_cart:
+        receipt = {"items": v1_cart}
+    if stream_human_meta.get("v1_chat_order_done") is True:
+        order_done_num = 42
     speak_text = strip_show_image_markup(speak_text)
     speak_text = strip_show_image_item_names_from_speech(speak_text, show_image)
     if (
@@ -3801,6 +3845,53 @@ def _rag_generate_stream_url_valid(url: str) -> bool:
     return bool(p.netloc)
 
 
+def _is_rag_v1_chat_url(url: str) -> bool:
+    try:
+        path = (urlparse(url.strip()).path or "").rstrip("/")
+    except Exception:
+        return False
+    return path.endswith("/v1/chat") or path == "/v1/chat"
+
+
+def _message_from_rag_conversation(conversation: list[dict[str, str]]) -> str:
+    for m in reversed(conversation):
+        if isinstance(m, dict) and m.get("role") == "user":
+            return str(m.get("content") or "").strip()
+    return ""
+
+
+def _map_v1_chat_retrieved(retrieved: list[Any]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for r in retrieved:
+        if not isinstance(r, dict):
+            continue
+        text = str(r.get("text") or "").strip()
+        meta = {
+            k: v
+            for k, v in {
+                "doc_id": r.get("doc_id"),
+                "title": r.get("title"),
+                "category": r.get("category"),
+            }.items()
+            if v
+        }
+        hit: dict[str, Any] = {"text": text, "metadata": meta}
+        if r.get("score") is not None:
+            hit["score"] = r.get("score")
+        out.append(hit)
+    return out
+
+
+def _apply_v1_chat_final_fields(data: dict[str, Any], meta: dict[str, Any]) -> None:
+    if "cart" in data:
+        meta["v1_chat_cart"] = data.get("cart")
+    if "order_done" in data:
+        meta["v1_chat_order_done"] = data.get("order_done")
+    retrieved = data.get("retrieved")
+    if isinstance(retrieved, list):
+        meta["v1_chat_retrieved"] = retrieved
+
+
 def _rag_stream_json_text_piece(data: dict[str, Any]) -> str:
     """Best-effort token/text extraction from streamed JSON objects (SSE or NDJSON)."""
     if not isinstance(data, dict):
@@ -3856,14 +3947,30 @@ def _build_rag_generate_conversation(query: str, results: list[dict[str, Any]]) 
 
 async def _collect_rag_generate_stream(
     url: str,
-    conversation: list[dict[str, str]],
+    conversation: list[dict[str, str]] | None = None,
     *,
+    message: str | None = None,
+    session_id: str | None = None,
+    top_k: int | None = None,
     voice_turn: bool = False,
     stream_human_sessionid: str | None = None,
 ) -> str | tuple[str, dict[str, Any] | None] | tuple[str, dict[str, Any] | None, dict[str, Any]]:
-    payload: dict[str, Any] = {"conversation": conversation}
-    if voice_turn:
-        payload["for_voice_tts"] = True
+    use_v1_chat = _is_rag_v1_chat_url(url)
+    if use_v1_chat:
+        msg = (message or _message_from_rag_conversation(conversation or [])).strip()
+        if not msg:
+            raise HTTPException(status_code=400, detail="RAG /v1/chat requires a message.")
+        payload: dict[str, Any] = {
+            "session_id": (session_id or "default").strip() or "default",
+            "message": msg,
+            "top_k": top_k if top_k is not None else RAG_CHAT_TOP_K,
+        }
+    else:
+        if not conversation:
+            raise HTTPException(status_code=400, detail="RAG generate stream requires conversation.")
+        payload = {"conversation": conversation}
+        if voice_turn:
+            payload["for_voice_tts"] = True
     headers = {
         "Content-Type": "application/json",
         "Accept": "text/event-stream, application/json, text/plain, */*",
@@ -3871,6 +3978,7 @@ async def _collect_rag_generate_stream(
     timeout = httpx.Timeout(RAG_GENERATE_STREAM_TIMEOUT_SEC, connect=15.0)
     pieces: list[str] = []
     stream_show_image: dict[str, Any] | None = None
+    v1_chat_meta: dict[str, Any] = {}
     total = 0
     stream_start = time.perf_counter()
     human_dispatcher: _StreamHumanDispatcher | None = None
@@ -3918,6 +4026,30 @@ async def _collect_rag_generate_stream(
             f"ms={(time.perf_counter() - stream_start) * 1000:.0f} speak_chunks={chunks}"
         )
 
+    async def _handle_stream_dict(data: dict[str, Any], current_event: str | None) -> bool:
+        """Process one SSE JSON object. Returns False when the stream should stop."""
+        if data.get("error"):
+            raise HTTPException(status_code=502, detail=str(data.get("error")))
+        _note_stream_show_image(data)
+        if use_v1_chat and current_event == "final":
+            _apply_v1_chat_final_fields(data, v1_chat_meta)
+            final_answer = str(data.get("answer") or "").strip()
+            if final_answer and not pieces:
+                if not await _append(final_answer):
+                    return False
+            return False
+        if use_v1_chat and current_event == "delta":
+            piece = str(data.get("content") or "")
+            if piece and not await _append(piece):
+                return False
+            return True
+        if use_v1_chat and current_event == "start":
+            return True
+        piece = _rag_stream_json_text_piece(data)
+        if piece and not await _append(piece):
+            return False
+        return True
+
     async with httpx.AsyncClient(timeout=timeout) as client:
         async with client.stream("POST", url, json=payload, headers=headers) as response:
             if response.status_code >= 400:
@@ -3934,21 +4066,31 @@ async def _collect_rag_generate_stream(
                 except (json.JSONDecodeError, UnicodeDecodeError) as e:
                     raise HTTPException(status_code=502, detail=f"RAG generate: invalid JSON body: {e}") from e
                 if isinstance(obj, dict):
-                    _note_stream_show_image(obj)
-                    t = _rag_stream_json_text_piece(obj)
-                    if t:
-                        await _append(t)
-                    elif isinstance(obj.get("conversation"), list):
-                        # Unlikely echo; ignore
-                        pass
+                    if use_v1_chat:
+                        _apply_v1_chat_final_fields(obj, v1_chat_meta)
+                        final_answer = str(obj.get("answer") or "").strip()
+                        if final_answer:
+                            await _append(final_answer)
+                        else:
+                            piece = str(obj.get("content") or "")
+                            if piece:
+                                await _append(piece)
+                    else:
+                        _note_stream_show_image(obj)
+                        t = _rag_stream_json_text_piece(obj)
+                        if t:
+                            await _append(t)
                 elif isinstance(obj, str):
                     await _append(obj)
                 out = "".join(pieces).strip()
                 if human_dispatcher:
                     await human_dispatcher.finish()
                 _log_rag_stream_done(out)
-                return _rag_stream_voice_result(out, stream_show_image, human_dispatcher, voice_turn)
+                return _rag_stream_voice_result(
+                    out, stream_show_image, human_dispatcher, voice_turn, v1_chat_meta
+                )
 
+            current_event: str | None = None
             async for raw in response.aiter_lines():
                 if total > RAG_GENERATE_STREAM_MAX_CHARS:
                     break
@@ -3956,6 +4098,9 @@ async def _collect_rag_generate_stream(
                 if not line:
                     continue
                 if line.startswith(":"):
+                    continue
+                if line.startswith("event:"):
+                    current_event = line[6:].strip()
                     continue
                 chunk = line[5:].strip() if line.startswith("data:") else line
                 if not chunk or chunk == "[DONE]":
@@ -3972,18 +4117,16 @@ async def _collect_rag_generate_stream(
                     continue
                 if not isinstance(data, dict):
                     continue
-                if data.get("error"):
-                    raise HTTPException(status_code=502, detail=str(data.get("error")))
-                _note_stream_show_image(data)
-                piece = _rag_stream_json_text_piece(data)
-                if piece and not await _append(piece):
+                if not await _handle_stream_dict(data, current_event):
                     break
 
     out = "".join(pieces).strip()
     if human_dispatcher:
         await human_dispatcher.finish()
     _log_rag_stream_done(out)
-    return _rag_stream_voice_result(out, stream_show_image, human_dispatcher, voice_turn)
+    return _rag_stream_voice_result(
+        out, stream_show_image, human_dispatcher, voice_turn, v1_chat_meta
+    )
 
 
 def _rag_stream_voice_result(
@@ -3991,8 +4134,11 @@ def _rag_stream_voice_result(
     stream_show_image: dict[str, Any] | None,
     human_dispatcher: _StreamHumanDispatcher | None,
     voice_turn: bool,
+    v1_chat_meta: dict[str, Any] | None = None,
 ) -> str | tuple[str, dict[str, Any] | None] | tuple[str, dict[str, Any] | None, dict[str, Any]]:
     if not voice_turn:
+        if v1_chat_meta:
+            return answer, None, v1_chat_meta
         return answer
     meta: dict[str, Any] = {}
     if human_dispatcher:
@@ -4008,6 +4154,8 @@ def _rag_stream_voice_result(
             "dispatch_mode": lat.get("dispatch_mode"),
             "stream_dispatch_latency": lat,
         }
+    if v1_chat_meta:
+        meta.update(v1_chat_meta)
     return answer, stream_show_image, meta
 
 
@@ -4066,22 +4214,49 @@ async def rag_ingest(files: list[UploadFile] = File(...)):
 @app.post("/api/rag/query")
 async def rag_query(body: RagQueryBody):
     """Semantic search over ingested documents; optionally calls RAG_GENERATE_STREAM_URL for an answer."""
-    try:
-        out = query_documents(body.query.strip(), body.n_results)
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"RAG query failed: {e}") from e
-    out = dict(out)
-    out["answer"] = None
-    out["generate_error"] = None
+    use_v1_chat = bool(RAG_GENERATE_STREAM_URL) and _is_rag_v1_chat_url(RAG_GENERATE_STREAM_URL)
+    if use_v1_chat:
+        out: dict[str, Any] = {"results": [], "answer": None, "generate_error": None}
+    else:
+        try:
+            out = dict(query_documents(body.query.strip(), body.n_results))
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"RAG query failed: {e}") from e
+        out["answer"] = None
+        out["generate_error"] = None
     if not RAG_GENERATE_STREAM_URL:
+        if not use_v1_chat:
+            return out
+        out["generate_error"] = "RAG_GENERATE_STREAM_URL is not configured."
         return out
     if not _rag_generate_stream_url_valid(RAG_GENERATE_STREAM_URL):
         out["generate_error"] = "Invalid RAG_GENERATE_STREAM_URL (use http/https with a host)."
         return out
-    results = out.get("results") if isinstance(out.get("results"), list) else []
-    conversation = _build_rag_generate_conversation(body.query.strip(), results)
     try:
-        out["answer"] = await _collect_rag_generate_stream(RAG_GENERATE_STREAM_URL, conversation)
+        if use_v1_chat:
+            stream_result = await _collect_rag_generate_stream(
+                RAG_GENERATE_STREAM_URL,
+                message=body.query.strip(),
+                session_id="studio",
+                top_k=body.n_results,
+            )
+            if isinstance(stream_result, tuple):
+                out["answer"] = stream_result[0]
+                meta = stream_result[2] if len(stream_result) > 2 and isinstance(stream_result[2], dict) else {}
+            else:
+                out["answer"] = stream_result
+                meta = {}
+            retrieved = meta.get("v1_chat_retrieved")
+            if isinstance(retrieved, list):
+                out["results"] = _map_v1_chat_retrieved(retrieved)
+        else:
+            results = out.get("results") if isinstance(out.get("results"), list) else []
+            conversation = _build_rag_generate_conversation(body.query.strip(), results)
+            stream_result = await _collect_rag_generate_stream(
+                RAG_GENERATE_STREAM_URL,
+                conversation=conversation,
+            )
+            out["answer"] = stream_result[0] if isinstance(stream_result, tuple) else stream_result
     except HTTPException as e:
         out["generate_error"] = str(e.detail) if isinstance(e.detail, str) else json.dumps(e.detail)
     except Exception as e:
@@ -4957,13 +5132,24 @@ async def avatar_video_generate(
         with vid_path.open("wb") as f:
             shutil.copyfileobj(reference_video.file, f)
 
-        img_name = image.filename or f"image{img_ext}"
+        fitted_img_path = work / "image_staged.png"
+        try:
+            await asyncio.to_thread(fit_image_to_avatar_stage, str(img_path), str(fitted_img_path))
+        except Exception as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Source image resize failed: {e}",
+            ) from e
+        if not fitted_img_path.is_file():
+            raise HTTPException(status_code=502, detail="Source image resize produced no output.")
+
+        img_name = "avatar_source_2490x3840.png"
         vid_name = reference_video.filename or f"reference{vid_ext}"
-        img_ct = image.content_type or "application/octet-stream"
+        img_ct = "image/png"
         vid_ct = reference_video.content_type or "video/mp4"
         timeout = httpx.Timeout(AVATAR_VIDEO_GENERATE_TIMEOUT_SEC, connect=30.0)
         try:
-            with img_path.open("rb") as img_f, vid_path.open("rb") as vid_f:
+            with fitted_img_path.open("rb") as img_f, vid_path.open("rb") as vid_f:
                 files = [
                     ("image", (img_name, img_f, img_ct)),
                     ("reference_video", (vid_name, vid_f, vid_ct)),
@@ -5099,8 +5285,6 @@ async def avatar_reference_audio(
             detail="reference_id must be 1–64 alphanumeric characters, underscores, or hyphens.",
         )
     ow = (overwrite or "false").strip().lower() in ("1", "true", "yes")
-    audio_name = Path(ref_audio.filename or "reference.wav").name
-    audio_ct = ref_audio.content_type or "application/octet-stream"
     url = f"{AVATAR_API_BASE}/v1/reference-audio"
     tts_timeout = 120.0
     try:
@@ -5108,25 +5292,45 @@ async def avatar_reference_audio(
     except ValueError:
         pass
     timeout = httpx.Timeout(max(30.0, tts_timeout), connect=15.0)
+    work = Path(tempfile.mkdtemp(prefix="ref_aud_"))
     try:
         body = await ref_audio.read()
         if not body:
             raise HTTPException(status_code=400, detail="ref_audio is empty.")
+        src_name = Path(ref_audio.filename or "reference.wav").name
+        ext = Path(src_name).suffix.lower() or ".webm"
+        if ext != ".wav":
+            src_path = work / f"input{ext}"
+            wav_path = work / "reference.wav"
+            src_path.write_bytes(body)
+            try:
+                await asyncio.to_thread(ffmpeg_extract_audio_wav, str(src_path), str(wav_path))
+            except Exception as e:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Audio conversion to WAV failed: {e}",
+                ) from e
+            if not wav_path.is_file():
+                raise HTTPException(status_code=502, detail="Audio conversion produced no output.")
+            body = wav_path.read_bytes()
+        audio_name = "reference.wav"
+        audio_ct = "audio/wav"
         files = {"ref_audio": (audio_name, body, audio_ct)}
         data = {
             "ref_text": text,
             "reference_id": ref_id,
             "overwrite": "true" if ow else "false",
         }
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.post(url, data=data, files=files)
-    except HTTPException:
-        raise
-    except httpx.HTTPError as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"TTS reference-audio unreachable: {e}",
-        ) from e
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                r = await client.post(url, data=data, files=files)
+        except httpx.HTTPError as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"TTS reference-audio unreachable: {e}",
+            ) from e
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
     if r.status_code >= 400:
         raise HTTPException(
             status_code=502,
@@ -5812,12 +6016,23 @@ async def video_qa_ask_endpoint(body: VideoQaAskBody):
         source_item_id = str(matches[0].get("id") or "")
 
     use_rag_stream = bool(RAG_GENERATE_STREAM_URL) and _rag_generate_stream_url_valid(RAG_GENERATE_STREAM_URL)
-    if use_rag_stream and matches:
-        conversation = build_video_qa_conversation(question, matches)
+    use_v1_chat = use_rag_stream and _is_rag_v1_chat_url(RAG_GENERATE_STREAM_URL)
+    if use_rag_stream and (use_v1_chat or matches):
         try:
-            answer = await _collect_rag_generate_stream(RAG_GENERATE_STREAM_URL, conversation)
-            if isinstance(answer, tuple):
-                answer = answer[0]
+            if use_v1_chat:
+                stream_result = await _collect_rag_generate_stream(
+                    RAG_GENERATE_STREAM_URL,
+                    message=question,
+                    session_id="video-qa",
+                    top_k=body.limit,
+                )
+            else:
+                conversation = build_video_qa_conversation(question, matches)
+                stream_result = await _collect_rag_generate_stream(
+                    RAG_GENERATE_STREAM_URL,
+                    conversation=conversation,
+                )
+            answer = stream_result[0] if isinstance(stream_result, tuple) else stream_result
             answer = (answer or "").strip() or None
         except HTTPException as e:
             generate_error = str(e.detail) if isinstance(e.detail, str) else json.dumps(e.detail)

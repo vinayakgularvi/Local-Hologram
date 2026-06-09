@@ -1,11 +1,13 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
 import { getSelectedAvatarId, setSelectedAvatarId } from "./selectedAvatar.js";
+import { audioFileToWavFile } from "./audioWav.js";
+import { fitImageToAvatarStage } from "./avatarStageImage.js";
 
 const promptText = ref("");
 const voiceAudioUploadInput = ref(null);
 const audioScriptUploadInput = ref(null);
-const VOICE_AUDIO_ACCEPT = "audio/*,.wav,.webm,.mp3,.m4a,.ogg,.aac";
+const VOICE_AUDIO_ACCEPT = ".wav,audio/wav";
 const customerRecordFile = ref(null);
 const customerRecordPreview = ref("");
 const referenceId = ref("ref101");
@@ -1264,17 +1266,23 @@ async function startRecording() {
     mediaRecorder.ondataavailable = (ev) => {
       if (ev.data && ev.data.size > 0) recordChunks.push(ev.data);
     };
-    mediaRecorder.onstop = () => {
+    mediaRecorder.onstop = async () => {
       const blob = new Blob(recordChunks, { type: mediaRecorder?.mimeType || "audio/webm" });
-      const file = new File([blob], "avatar_voice_recording.webm", { type: blob.type });
-      customerRecordFile.value = file;
-      customerRecordPreview.value = toPreview(file);
-      referenceAudioSaved.value = null;
       customerRecording.value = false;
       if (mediaStream) mediaStream.getTracks().forEach((t) => t.stop());
       mediaStream = null;
       mediaRecorder = null;
       customerStatus.value = "";
+      try {
+        const webmFile = new File([blob], "avatar_voice_recording.webm", { type: blob.type });
+        customerRecordFile.value = await audioFileToWavFile(webmFile, "avatar_voice_recording.wav");
+        customerRecordPreview.value = toPreview(customerRecordFile.value);
+        referenceAudioSaved.value = null;
+      } catch (e) {
+        customerStatus.value = e instanceof Error ? e.message : "Could not process recording.";
+        customerRecordFile.value = null;
+        customerRecordPreview.value = "";
+      }
     };
     mediaRecorder.start();
     customerRecording.value = true;
@@ -1351,7 +1359,7 @@ async function saveRecording() {
     return;
   }
   if (!promptText.value.trim()) {
-    customerStatus.value = "Script must match the spoken audio.";
+    customerStatus.value = "Audio script (ref_text) is required — must match the spoken audio.";
     return;
   }
   const refId = referenceId.value.trim();
@@ -1362,8 +1370,9 @@ async function saveRecording() {
   customerRecordBusy.value = true;
   customerStatus.value = "";
   try {
+    const wavFile = await audioFileToWavFile(customerRecordFile.value, "reference.wav");
     const fd = new FormData();
-    fd.append("ref_audio", customerRecordFile.value);
+    fd.append("ref_audio", wavFile);
     fd.append("ref_text", promptText.value.trim());
     fd.append("reference_id", refId);
     fd.append("overwrite", "false");
@@ -1382,8 +1391,20 @@ let avatarVideoPollId = null;
 
 function onAvatarVideoImage(ev) {
   const f = ev.target.files?.[0];
-  avatarVideoImageFile.value = f || null;
-  avatarVideoImagePreview.value = f ? toPreview(f) : "";
+  ev.target.value = "";
+  if (!f) return;
+  avatarVideoStatus.value = "";
+  void (async () => {
+    try {
+      const processed = await fitImageToAvatarStage(f);
+      avatarVideoImageFile.value = processed;
+      avatarVideoImagePreview.value = toPreview(processed);
+    } catch (e) {
+      avatarVideoImageFile.value = null;
+      avatarVideoImagePreview.value = "";
+      avatarVideoStatus.value = e instanceof Error ? e.message : "Could not process image.";
+    }
+  })();
 }
 
 function onAvatarVideoRef(ev) {
@@ -1547,7 +1568,7 @@ function formatIso(iso) {
                   <input type="file" accept="image/*" @change="onAvatarVideoImage" />
                 </label>
                 <div
-                  class="video-hub-preview"
+                  class="video-hub-preview video-hub-preview--stage"
                   :class="{ 'video-hub-preview--empty': !avatarVideoImagePreview }"
                 >
                   <img
@@ -1673,11 +1694,11 @@ function formatIso(iso) {
               </label>
 
               <label class="field">
-                <span>Script</span>
+                <span>Audio script (ref_text)</span>
                 <textarea
                   v-model="promptText"
                   rows="5"
-                  placeholder="Exact words spoken in the recording."
+                  placeholder="Exact text spoken in the recording — required for reference-audio."
                 />
               </label>
               <div class="actions">
@@ -1728,7 +1749,6 @@ function formatIso(iso) {
                       @change="onUploadVoiceAudio"
                     />
                   </div>
-                  <p class="voice-source-options__hint">WAV, WebM, MP3, M4A, OGG</p>
                 </div>
               </div>
 
@@ -3912,6 +3932,17 @@ input[type="password"]:focus {
   display: flex;
   align-items: center;
   justify-content: center;
+}
+
+.flow-card--video-hub .video-hub-preview--stage {
+  aspect-ratio: 2490 / 3840;
+  max-width: 12rem;
+  background: #e4e2e2;
+}
+
+.flow-card--video-hub .video-hub-preview--stage .video-hub-preview__media {
+  object-fit: contain;
+  background: #e4e2e2;
 }
 
 .flow-card--video-hub .video-hub-preview--empty {

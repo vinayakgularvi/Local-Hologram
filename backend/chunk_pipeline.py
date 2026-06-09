@@ -353,6 +353,20 @@ def ffmpeg_extract_audio_wav(
     _run(cmd)
 
 
+AVATAR_STAGE_WIDTH = 2490
+AVATAR_STAGE_HEIGHT = 3840
+AVATAR_STAGE_PAD_COLOR = "e4e2e2"
+
+
+def fit_image_to_avatar_stage(src: str, out: str) -> None:
+    """Resize image to 2490×3840 with aspect preserved and centered side/top padding."""
+    vf = (
+        f"scale={AVATAR_STAGE_WIDTH}:{AVATAR_STAGE_HEIGHT}:force_original_aspect_ratio=decrease,"
+        f"pad={AVATAR_STAGE_WIDTH}:{AVATAR_STAGE_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color={AVATAR_STAGE_PAD_COLOR}"
+    )
+    _run(["ffmpeg", "-y", "-i", src, "-vf", vf, out])
+
+
 def run_chunked_lipsync(
     *,
     source_video: str,
