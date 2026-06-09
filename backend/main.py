@@ -6394,6 +6394,31 @@ async def video_qa_search_endpoint(body: VideoQaSearchBody):
 
 # Built frontend from `frontend` → `backend/static/dist` (e.g. Docker image)
 _spa_dist = _BACKEND_DIR / "static" / "dist"
+
+
+@app.get("/{asset_id}.mp4", include_in_schema=False)
+async def serve_hologram_idle_mp4(asset_id: str):
+    """
+    Serve idle / avatar MP4 from frontend/public (live Create Avatar uploads)
+    or static dist — avoids rebuild when HOLOGRAM_SELECTED_AVATAR_ID changes.
+    """
+    try:
+        aid = _hologram_asset_id(asset_id, "asset_id")
+    except HTTPException:
+        raise HTTPException(status_code=404, detail="Not found") from None
+    candidates = [_FRONTEND_PUBLIC_DIR / f"{aid}.mp4"]
+    if _spa_dist.is_dir():
+        candidates.append(_spa_dist / f"{aid}.mp4")
+    for path in candidates:
+        if path.is_file():
+            return FileResponse(
+                path,
+                media_type="video/mp4",
+                headers={"Accept-Ranges": "bytes", "Cache-Control": "public, max-age=60"},
+            )
+    raise HTTPException(status_code=404, detail="Video not found")
+
+
 if _spa_dist.is_dir():
     app.mount("/", StaticFiles(directory=str(_spa_dist), html=True), name="spa")
 

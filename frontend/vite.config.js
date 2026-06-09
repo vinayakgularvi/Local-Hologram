@@ -46,6 +46,9 @@ export default defineConfig({
       "/session": { target: backendOrigin, changeOrigin: true },
       "/human": { target: backendOrigin, changeOrigin: true },
       "/record": { target: backendOrigin, changeOrigin: true },
+      "/interrupt_talk": { target: backendOrigin, changeOrigin: true },
+      // Avatar MP4 may exist on backend (frontend/public) before Vite picks up the file
+      "^/(?!@|src/|node_modules/).*\\.mp4$": { target: backendOrigin, changeOrigin: true },
     },
   },
 });

@@ -45,6 +45,7 @@ function resolveIdleLoopVideoUrl(raw) {
 const IDLE_LOOP_VIDEO_SRC = resolveIdleLoopVideoUrl(
   import.meta.env.VITE_IDLE_LOOP_VIDEO || "/Videofile.mp4"
 );
+const IDLE_LOOP_FALLBACK_SRC = resolveIdleLoopVideoUrl("/Videofile.mp4");
 /** Runtime override from GET /api/webrtc (Docker / root .env without frontend rebuild). */
 let idleLoopVideoFromServer = null;
 /** Set when user picks an avatar in Studio → frontend/public/{id}.mp4 */
@@ -54,25 +55,40 @@ function getIdleLoopVideoSrc() {
   return idleLoopVideoFromAvatar || idleLoopVideoFromServer || IDLE_LOOP_VIDEO_SRC;
 }
 
-function applySelectedAvatarIdleVideo(avatarId) {
+async function hologramMp4Exists(url) {
+  try {
+    const res = await fetch(url, { method: "HEAD" });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function applySelectedAvatarIdleVideo(avatarId) {
   const id = String(avatarId || "").trim();
   if (!id) return;
   const path = resolveIdleLoopVideoUrl(`/${id}.mp4`);
+  if (!(await hologramMp4Exists(path))) {
+    console.warn("[idle-loop] avatar mp4 missing, using default", { path, id });
+    idleLoopVideoFromAvatar = null;
+    if (mediaVisible.value) void startIdleLoop(IDLE_LOOP_FALLBACK_SRC);
+    return;
+  }
   if (idleLoopVideoFromAvatar === path) return;
   idleLoopVideoFromAvatar = path;
   idleLoopGeneration += 1;
   if (mediaVisible.value) {
-    void startIdleLoop();
+    void startIdleLoop(path);
   }
 }
 
 function onHologramAvatarSelected(ev) {
-  applySelectedAvatarIdleVideo(ev?.detail?.avatarId || getSelectedAvatarId());
+  void applySelectedAvatarIdleVideo(ev?.detail?.avatarId || getSelectedAvatarId());
 }
 
 function onHologramAvatarStorage(ev) {
   if (ev.key !== SELECTED_AVATAR_STORAGE_KEY || !ev.newValue) return;
-  applySelectedAvatarIdleVideo(ev.newValue);
+  void applySelectedAvatarIdleVideo(ev.newValue);
 }
 
 /** @type {RTCPeerConnection | null} */
@@ -706,9 +722,9 @@ function showMedia() {
 /** No-op: idle /Videofile.mp4 stays playing under WebRTC and Video RAG overlays. */
 function pauseIdleLoop() {}
 
-async function startIdleLoop() {
+async function startIdleLoop(explicitPath = null) {
   const el = idleLoopEl.value;
-  const path = getIdleLoopVideoSrc();
+  const path = explicitPath || getIdleLoopVideoSrc();
   if (!el || !path) return;
   const generation = idleLoopGeneration;
   const switching = !el.src || (!el.src.endsWith(path) && !el.src.includes(path));
@@ -716,39 +732,46 @@ async function startIdleLoop() {
     el.loop = true;
     el.muted = true;
     el.playsInline = true;
+    el.setAttribute("webkit-playsinline", "true");
     el.src = path;
     el.load();
-    await new Promise((resolve, reject) => {
-      const timer = window.setTimeout(() => {
-        cleanup();
-        reject(new Error("idle loop load timeout"));
-      }, 15000);
-      const onReady = () => {
-        cleanup();
-        resolve();
-      };
-      const onErr = () => {
-        cleanup();
-        reject(new Error(`idle loop failed to load: ${path}`));
-      };
-      const cleanup = () => {
-        window.clearTimeout(timer);
-        el.removeEventListener("loadeddata", onReady);
-        el.removeEventListener("canplay", onReady);
-        el.removeEventListener("error", onErr);
-      };
-      if (el.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
-        cleanup();
-        resolve();
-        return;
-      }
-      el.addEventListener("loadeddata", onReady, { once: true });
-      el.addEventListener("canplay", onReady, { once: true });
-      el.addEventListener("error", onErr, { once: true });
-    }).catch((e) => {
+    try {
+      await new Promise((resolve, reject) => {
+        const timer = window.setTimeout(() => {
+          cleanup();
+          reject(new Error("idle loop load timeout"));
+        }, 15000);
+        const onReady = () => {
+          cleanup();
+          resolve();
+        };
+        const onErr = () => {
+          cleanup();
+          reject(new Error(`idle loop failed to load: ${path}`));
+        };
+        const cleanup = () => {
+          window.clearTimeout(timer);
+          el.removeEventListener("loadeddata", onReady);
+          el.removeEventListener("canplay", onReady);
+          el.removeEventListener("error", onErr);
+        };
+        if (el.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+          cleanup();
+          resolve();
+          return;
+        }
+        el.addEventListener("loadeddata", onReady, { once: true });
+        el.addEventListener("canplay", onReady, { once: true });
+        el.addEventListener("error", onErr, { once: true });
+      });
+    } catch (e) {
       console.warn("[idle-loop]", e.message, { path, resolvedSrc: el.currentSrc || el.src });
-      throw e;
-    });
+      if (path !== IDLE_LOOP_FALLBACK_SRC) {
+        idleLoopVideoFromAvatar = null;
+        return startIdleLoop(IDLE_LOOP_FALLBACK_SRC);
+      }
+      return;
+    }
   }
   if (generation !== idleLoopGeneration) {
     return;
@@ -761,6 +784,10 @@ async function startIdleLoop() {
     console.info("[idle-loop] playing (base layer)", path);
   } catch (e) {
     console.warn("[idle-loop] playback failed", path, e);
+    if (path !== IDLE_LOOP_FALLBACK_SRC) {
+      idleLoopVideoFromAvatar = null;
+      return startIdleLoop(IDLE_LOOP_FALLBACK_SRC);
+    }
   }
 }
 
@@ -928,7 +955,7 @@ function applyWebrtcStatusPayload(d) {
     lastPolledSelectedAvatarId = remoteAvatar;
     if (remoteAvatar !== getSelectedAvatarId()) {
       void syncSelectedAvatarFromServer().then((id) => {
-        if (id) applySelectedAvatarIdleVideo(id);
+        if (id) void applySelectedAvatarIdleVideo(id);
       });
     }
   }
@@ -2943,11 +2970,10 @@ function formatBillMoney(n) {
 
 onMounted(() => {
   void syncSelectedAvatarFromServer().then((id) => {
-    if (id) {
-      lastPolledSelectedAvatarId = id;
-      applySelectedAvatarIdleVideo(id);
-    } else {
-      applySelectedAvatarIdleVideo(getSelectedAvatarId());
+    const avatarId = id || getSelectedAvatarId();
+    if (avatarId) {
+      lastPolledSelectedAvatarId = avatarId;
+      void applySelectedAvatarIdleVideo(avatarId);
     }
   });
   webrtcStatusPollId = window.setInterval(() => void refreshWebrtcStatus(), 8000);
@@ -2997,7 +3023,7 @@ onUnmounted(() => {
         :class="{
           'video-wrap--featured-image': SHOW_IMAGE_ENABLED && featuredMenuImages.length > 0,
           'video-wrap--cached-playing': cachedVideoActive,
-          'video-wrap--webrtc-answering': webrtcStageActive,
+          'video-wrap--webrtc-answering': webrtcStageActive && (videoReady || cachedVideoActive),
         }"
       >
         <div
