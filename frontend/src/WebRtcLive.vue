@@ -23,8 +23,9 @@ const videoEl = ref(null);
 const idleLoopEl = ref(null);
 const cachedVideoEl = ref(null);
 const cachedVideoActive = ref(false);
-/** Idle hologram loop (public MP4); hidden while WebRTC or cached Q&A plays. */
-const webrtcStageActive = ref(false);
+/** WebRTC lip-sync overlay — only while voice-stream answer audio is playing. */
+const voiceStreamOverlayActive = ref(false);
+const webrtcOverlayVisible = computed(() => voiceStreamOverlayActive.value);
 /** Bumps when an in-flight startIdleLoop() should abort (e.g. new src load). */
 let idleLoopGeneration = 0;
 const audioEl = ref(null);
@@ -57,8 +58,15 @@ function getIdleLoopVideoSrc() {
 
 async function hologramMp4Exists(url) {
   try {
-    const res = await fetch(url, { method: "HEAD" });
-    return res.ok;
+    // Vite dev server returns 405 for HEAD on public/ MP4s — use a tiny ranged GET instead.
+    const ranged = await fetch(url, {
+      method: "GET",
+      headers: { Range: "bytes=0-0" },
+    });
+    if (ranged.ok || ranged.status === 206) return true;
+    if (ranged.status !== 405 && ranged.status !== 416) return false;
+    const full = await fetch(url, { method: "GET" });
+    return full.ok;
   } catch {
     return false;
   }
@@ -71,15 +79,13 @@ async function applySelectedAvatarIdleVideo(avatarId) {
   if (!(await hologramMp4Exists(path))) {
     console.warn("[idle-loop] avatar mp4 missing, using default", { path, id });
     idleLoopVideoFromAvatar = null;
-    if (mediaVisible.value) void startIdleLoop(IDLE_LOOP_FALLBACK_SRC);
+    void ensureIdleLoopPlaying(IDLE_LOOP_FALLBACK_SRC);
     return;
   }
   if (idleLoopVideoFromAvatar === path) return;
   idleLoopVideoFromAvatar = path;
   idleLoopGeneration += 1;
-  if (mediaVisible.value) {
-    void startIdleLoop(path);
-  }
+  void ensureIdleLoopPlaying(path);
 }
 
 function onHologramAvatarSelected(ev) {
@@ -681,12 +687,17 @@ let webrtcTtfaPollId = null;
 let lipSyncPending = null;
 let lipSyncPollId = null;
 let lipSyncTimeout = null;
-/** Keeps WebRTC visible until answer audio finishes (voice-turn JSON returns earlier). */
+/** Hides voice-stream overlay when answer audio finishes (JSON returns before playback ends). */
 let answerEndWatchId = null;
+let answerEndMaxTimerId = null;
 let answerEndAudioEventsBound = false;
+let answerAudioCtx = null;
+/** @type {AnalyserNode | null} */
+let answerAudioAnalyser = null;
 const ANSWER_END_STALL_MS = 650;
 const ANSWER_END_NEVER_HEARD_MS = 90_000;
 const ANSWER_END_MAX_MS = 180_000;
+const ANSWER_AUDIO_RMS_MIN = 0.012;
 /** Voice input request (recognition start) → final transcript (STT latency). */
 let voiceInputRequestMs = 0;
 let sttSessionStartMs = 0;
@@ -715,12 +726,33 @@ function resolveMicLang() {
 function showMedia() {
   mediaVisible.value = true;
   nextTick(() => {
-    void startIdleLoop();
+    void ensureIdleLoopPlaying();
   });
 }
 
-/** No-op: idle /Videofile.mp4 stays playing under WebRTC and Video RAG overlays. */
+/** No-op: selected avatar / idle MP4 keeps playing under WebRTC and cached Q&A overlays. */
 function pauseIdleLoop() {}
+
+async function ensureIdleLoopPlaying(explicitPath = null) {
+  if (!mediaVisible.value) return;
+  const el = idleLoopEl.value;
+  const path = explicitPath || getIdleLoopVideoSrc();
+  if (!el || !path) return;
+  const current = String(el.currentSrc || el.src || "");
+  const onPath =
+    current.endsWith(path) || current.includes(path) || current.includes(encodeURI(path));
+  if (!onPath) {
+    await startIdleLoop(path);
+    return;
+  }
+  if (el.paused || el.ended) {
+    try {
+      await el.play();
+    } catch {
+      await startIdleLoop(path);
+    }
+  }
+}
 
 async function startIdleLoop(explicitPath = null) {
   const el = idleLoopEl.value;
@@ -791,11 +823,70 @@ async function startIdleLoop(explicitPath = null) {
   }
 }
 
-function activateWebRtcStage() {
-  pauseIdleLoop();
-  if (!webrtcStageActive.value) {
-    webrtcStageActive.value = true;
+function showVoiceStreamOverlay() {
+  if (voiceStreamOverlayActive.value) return;
+  voiceStreamOverlayActive.value = true;
+  void ensureIdleLoopPlaying();
+}
+
+function hideVoiceStreamOverlay() {
+  if (!voiceStreamOverlayActive.value) return;
+  voiceStreamOverlayActive.value = false;
+  void ensureIdleLoopPlaying();
+}
+
+function teardownAnswerAudioAnalyser() {
+  answerAudioAnalyser = null;
+  if (answerAudioCtx) {
+    void answerAudioCtx.close().catch(() => {});
+    answerAudioCtx = null;
   }
+}
+
+function ensureAnswerAudioAnalyser() {
+  const audio = audioEl.value;
+  if (!audio || answerAudioAnalyser) return answerAudioAnalyser;
+  const stream = audio.srcObject;
+  if (!(stream instanceof MediaStream)) return null;
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return null;
+    answerAudioCtx = new AC();
+    const src = answerAudioCtx.createMediaStreamSource(stream);
+    answerAudioAnalyser = answerAudioCtx.createAnalyser();
+    answerAudioAnalyser.fftSize = 256;
+    src.connect(answerAudioAnalyser);
+    return answerAudioAnalyser;
+  } catch {
+    return null;
+  }
+}
+
+function measureAnswerAudioRms() {
+  const analyser = ensureAnswerAudioAnalyser();
+  if (!analyser) return 0;
+  const buf = new Float32Array(analyser.fftSize);
+  analyser.getFloatTimeDomainData(buf);
+  let sum = 0;
+  for (let i = 0; i < buf.length; i += 1) sum += buf[i] * buf[i];
+  return Math.sqrt(sum / buf.length);
+}
+
+function clearAnswerOverlayMaxTimer() {
+  if (answerEndMaxTimerId != null) {
+    window.clearTimeout(answerEndMaxTimerId);
+    answerEndMaxTimerId = null;
+  }
+}
+
+function scheduleAnswerOverlayMaxMs(ms) {
+  clearAnswerOverlayMaxTimer();
+  const budget = Number(ms);
+  if (!Number.isFinite(budget) || budget <= 0) return;
+  answerEndMaxTimerId = window.setTimeout(() => {
+    answerEndMaxTimerId = null;
+    finishAnswerPlaybackEndWatch("max-estimate");
+  }, Math.min(ANSWER_END_MAX_MS, budget));
 }
 
 function clearAnswerPlaybackEndWatch() {
@@ -803,6 +894,8 @@ function clearAnswerPlaybackEndWatch() {
     window.clearInterval(answerEndWatchId);
     answerEndWatchId = null;
   }
+  clearAnswerOverlayMaxTimer();
+  teardownAnswerAudioAnalyser();
 }
 
 function bindAnswerEndAudioEvents() {
@@ -810,7 +903,7 @@ function bindAnswerEndAudioEvents() {
   if (!audio || answerEndAudioEventsBound) return;
   answerEndAudioEventsBound = true;
   const onEndSignal = () => {
-    if (!webrtcStageActive.value || answerEndWatchId == null) return;
+    if (!voiceStreamOverlayActive.value || answerEndWatchId == null) return;
     finishAnswerPlaybackEndWatch("audio-pause-or-ended");
   };
   audio.addEventListener("pause", onEndSignal);
@@ -818,28 +911,26 @@ function bindAnswerEndAudioEvents() {
 }
 
 function finishAnswerPlaybackEndWatch(reason) {
+  if (!answerEndWatchId && !voiceStreamOverlayActive.value) return;
   clearAnswerPlaybackEndWatch();
-  if (!webrtcStageActive.value) return;
-  console.info("[webrtc-answer] end watch:", reason);
-  deactivateWebRtcStage();
+  console.info("[voice-stream] overlay off:", reason);
+  hideVoiceStreamOverlay();
 }
 
-function ensureAnswerPlaybackEndWatch(baselineSec) {
-  if (answerEndWatchId != null || !webrtcStageActive.value) return;
+function ensureAnswerPlaybackEndWatch(baselineSec, maxMs = null) {
+  if (answerEndWatchId != null) return;
   bindAnswerEndAudioEvents();
+  scheduleAnswerOverlayMaxMs(maxMs ?? ANSWER_END_MAX_MS);
   const baseline = Number(baselineSec);
   if (!Number.isFinite(baseline) || baseline < 0) return;
 
   let sawAnswerAudio = false;
+  let lastSpeechAt = 0;
   let lastAudioT = -1;
   let stallMs = 0;
   const startedAt = performance.now();
 
   answerEndWatchId = window.setInterval(() => {
-    if (!webrtcStageActive.value) {
-      clearAnswerPlaybackEndWatch();
-      return;
-    }
     const now = performance.now();
     if (now - startedAt > ANSWER_END_MAX_MS) {
       finishAnswerPlaybackEndWatch("max-duration");
@@ -853,10 +944,14 @@ function ensureAnswerPlaybackEndWatch(baselineSec) {
     const audio = audioEl.value;
     if (!audio) return;
 
-    if (webRtcStrictAudioPlaying(baseline)) {
+    const rms = measureAnswerAudioRms();
+    const timelinePlaying = webRtcStrictAudioPlaying(baseline);
+    if (timelinePlaying || rms >= ANSWER_AUDIO_RMS_MIN) {
       sawAnswerAudio = true;
+      showVoiceStreamOverlay();
       stallMs = 0;
       lastAudioT = audio.currentTime;
+      if (rms >= ANSWER_AUDIO_RMS_MIN) lastSpeechAt = now;
       return;
     }
 
@@ -876,8 +971,18 @@ function ensureAnswerPlaybackEndWatch(baselineSec) {
     }
     if (stallMs >= ANSWER_END_STALL_MS) {
       finishAnswerPlaybackEndWatch("audio-stall");
+      return;
+    }
+    if (lastSpeechAt > 0 && now - lastSpeechAt >= ANSWER_END_STALL_MS) {
+      finishAnswerPlaybackEndWatch("answer-silence");
     }
   }, 16);
+}
+
+/** Hide voice-stream overlay and stop answer playback watch. */
+function deactivateWebRtcStage() {
+  clearAnswerPlaybackEndWatch();
+  hideVoiceStreamOverlay();
 }
 
 function answerPlaybackBaseline() {
@@ -889,19 +994,6 @@ function answerPlaybackBaseline() {
   }
   const audio = audioEl.value;
   return audio && Number.isFinite(audio.currentTime) ? audio.currentTime : 0;
-}
-
-function deactivateWebRtcStage() {
-  clearAnswerPlaybackEndWatch();
-  if (!webrtcStageActive.value) return;
-  webrtcStageActive.value = false;
-  if (!cachedVideoActive.value) {
-    nextTick(() => {
-      if (!webrtcStageActive.value && !cachedVideoActive.value) {
-        void startIdleLoop();
-      }
-    });
-  }
 }
 
 function apiOrigin() {
@@ -1124,7 +1216,7 @@ async function connect() {
 
 function disconnect() {
   stopMicInternal({ cancel: true });
-  clearAnswerPlaybackEndWatch();
+  deactivateWebRtcStage();
   started.value = false;
   videoReady.value = false;
   if (orderPlacedHideTimer != null) {
@@ -1147,8 +1239,14 @@ function bindWebRtcTtfaAudioListener() {
   if (!audio || audio.dataset.ttfaBound === "1") return;
   audio.dataset.ttfaBound = "1";
   audio.addEventListener("playing", () => {
-    if (webrtcTtfaPending || lipSyncPending) {
-      activateWebRtcStage();
+    if (!webrtcTtfaPending && !lipSyncPending) return;
+    const baseline =
+      webrtcTtfaPending?.baselineTime ?? lipSyncPending?.audioBaselineTime ?? 0;
+    if (
+      webRtcStrictAudioPlaying(baseline) ||
+      measureAnswerAudioRms() >= ANSWER_AUDIO_RMS_MIN
+    ) {
+      showVoiceStreamOverlay();
     }
     if (!webrtcTtfaPending) return;
     onWebRtcAudioPlayingForTtfa();
@@ -1283,7 +1381,6 @@ function scheduleLipSyncLatency(
 ) {
   clearLipSyncPending();
   if (!turnId || !Number.isFinite(audioFirstMs)) return;
-  activateWebRtcStage();
   bindVideoPlaybackListener();
   const v = videoEl.value;
   const baseline =
@@ -1553,7 +1650,7 @@ function liveTalkingSessionIdPayload() {
 /** Stop LiveTalking speech + local cached Q&A clip when user taps mic to interrupt. */
 async function interruptAvatarSpeech() {
   stopCachedVideoQa();
-  clearAnswerPlaybackEndWatch();
+  deactivateWebRtcStage();
   clearWebRtcTtfaPending();
   pendingVoiceAnalytics = null;
 
@@ -1587,7 +1684,10 @@ function postHuman(text) {
   if (!t) return;
   const payload = liveTalkingSessionIdPayload();
   if (!payload) return;
-  activateWebRtcStage();
+  ensureAnswerPlaybackEndWatch(
+    answerPlaybackBaseline(),
+    Math.min(ANSWER_END_MAX_MS, Math.max(8000, t.length * 85))
+  );
   void fetch(signalingUrl("/human"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -2196,7 +2296,7 @@ async function runVoicePipeline(userText, stt = null) {
   webrtcError.value = "";
   clearWebRtcTtfaPending();
   pendingVoiceAnalytics = null;
-  activateWebRtcStage();
+  void ensureIdleLoopPlaying();
   const requestSentMs = performance.now();
   beginVoiceTurnTtfaWatch(requestSentMs);
   const sid = String(sessionId.value || getHologramSessionId() || "").trim();
@@ -2369,8 +2469,19 @@ async function runVoicePipeline(userText, stt = null) {
       clearMicTapTiming();
       deactivateWebRtcStage();
     } else {
-      activateWebRtcStage();
-      ensureAnswerPlaybackEndWatch(answerPlaybackBaseline());
+      const chunkCount = Number(
+        data.rag?.human_chunk_count ?? data.rag?.human_sentence_count
+      );
+      const sumTotalMs = Number(latSummary?.sum_total_ms);
+      let maxOverlayMs = Number.isFinite(sumTotalMs) && sumTotalMs > 0 ? sumTotalMs + 5000 : null;
+      if (!maxOverlayMs && spoken.length) {
+        const chunks = Number.isFinite(chunkCount) && chunkCount > 0 ? chunkCount : 1;
+        maxOverlayMs = Math.min(
+          ANSWER_END_MAX_MS,
+          Math.max(12000, spoken.length * 85 + chunks * 2500)
+        );
+      }
+      ensureAnswerPlaybackEndWatch(answerPlaybackBaseline(), maxOverlayMs);
     }
   } catch (e) {
     clearWebRtcTtfaPending();
@@ -2800,9 +2911,7 @@ function stopCachedVideoQa() {
   el.pause();
   el.removeAttribute("src");
   el.load();
-  if (!webrtcStageActive.value) {
-    void startIdleLoop();
-  }
+  void ensureIdleLoopPlaying();
 }
 
 function waitCachedVideoReady(el, timeoutMs = 12000) {
@@ -2861,6 +2970,7 @@ async function playCachedVideoQa(hit) {
   }
   cachedVideoActive.value = true;
   el.currentTime = 0;
+  void ensureIdleLoopPlaying();
 
   await waitCachedVideoReady(el);
 
@@ -2968,25 +3078,36 @@ function formatBillMoney(n) {
   return x.toFixed(2);
 }
 
+let idleKeepaliveId = null;
+
 onMounted(() => {
+  showMedia();
   void syncSelectedAvatarFromServer().then((id) => {
     const avatarId = id || getSelectedAvatarId();
     if (avatarId) {
       lastPolledSelectedAvatarId = avatarId;
       void applySelectedAvatarIdleVideo(avatarId);
+    } else {
+      void ensureIdleLoopPlaying();
     }
   });
   webrtcStatusPollId = window.setInterval(() => void refreshWebrtcStatus(), 8000);
+  idleKeepaliveId = window.setInterval(() => {
+    void ensureIdleLoopPlaying();
+  }, 1200);
   window.addEventListener("hologram-avatar-selected", onHologramAvatarSelected);
   window.addEventListener("storage", onHologramAvatarStorage);
   void connect();
-  showMedia();
 });
 
 onUnmounted(() => {
   if (webrtcStatusPollId != null) {
     window.clearInterval(webrtcStatusPollId);
     webrtcStatusPollId = null;
+  }
+  if (idleKeepaliveId != null) {
+    window.clearInterval(idleKeepaliveId);
+    idleKeepaliveId = null;
   }
   window.removeEventListener("hologram-avatar-selected", onHologramAvatarSelected);
   window.removeEventListener("storage", onHologramAvatarStorage);
@@ -3023,29 +3144,9 @@ onUnmounted(() => {
         :class="{
           'video-wrap--featured-image': SHOW_IMAGE_ENABLED && featuredMenuImages.length > 0,
           'video-wrap--cached-playing': cachedVideoActive,
-          'video-wrap--webrtc-answering': webrtcStageActive && (videoReady || cachedVideoActive),
+          'video-wrap--webrtc-overlay': webrtcOverlayVisible,
         }"
       >
-        <div
-          v-if="webrtcStageActive && !videoReady && !webrtcError"
-          class="video-loading"
-          role="status"
-          aria-live="polite"
-          aria-busy="true"
-        >
-          <img
-            class="video-loading__logo"
-            src="/favicon.svg"
-            alt="Loading logo"
-            width="56"
-            height="56"
-          />
-          <div class="video-loading__track" aria-hidden="true">
-            <div class="video-loading__fill" />
-          </div>
-          <span class="video-loading__label">{{ busy ? "Connecting…" : "Loading video…" }}</span>
-        </div>
-
         <div
           v-if="!mediaVisible"
           class="start-overlay"
@@ -3399,7 +3500,7 @@ onUnmounted(() => {
   object-position: center center;
 }
 
-/* Base layer: /Videofile.mp4 always visible; WebRTC + Video RAG stack on top */
+/* Base layer: selected avatar / idle MP4 always visible; WebRTC + cached Q&A stack on top */
 .video--idle-loop {
   z-index: 0;
   opacity: 1;
@@ -3412,10 +3513,10 @@ onUnmounted(() => {
   opacity: 0;
   visibility: hidden;
   pointer-events: none;
-  transition: opacity 0.2s ease;
+  transition: opacity 0.18s ease;
 }
 
-.video-wrap--webrtc-answering .video--webrtc {
+.video-wrap--webrtc-overlay .video--webrtc {
   opacity: 1;
   visibility: visible;
 }

@@ -106,7 +106,9 @@ def _tts_reference_form_fields(gen_text: str) -> dict[str, str]:
     return {
         "sway_sampling_coef": os.environ.get("VOICE_TTS_SWAY_SAMPLING_COEF", "-1").strip() or "-1",
         "remove_silence": os.environ.get("VOICE_TTS_REMOVE_SILENCE", "false").strip() or "false",
-        "speed": os.environ.get("VOICE_TTS_SPEED", "1").strip() or "1",
+        "speed": os.environ.get("VOICE_TTS_SPEED", "0.75").strip() or "0.75",
+        "style_preset": os.environ.get("VOICE_TTS_STYLE_PRESET", "calm_joyful").strip()
+        or "calm_joyful",
         "target_rms": os.environ.get("VOICE_TTS_TARGET_RMS", "0.1").strip() or "0.1",
         "use_cache": os.environ.get("VOICE_TTS_USE_CACHE", "true").strip() or "true",
         "overwrite": os.environ.get("VOICE_TTS_OVERWRITE", "false").strip() or "false",

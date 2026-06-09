@@ -2922,15 +2922,52 @@ def _speakable_stream_prefix(buf: str) -> str:
     return buf[:cut]
 
 
+# Sentence end: punctuation followed by whitespace/EOS (not decimals like $3.50).
+_SENTENCE_END_RE = re.compile(r'[.!?。！？]+["\']?(?=\s|$)')
+_MONEY_FOR_TTS_RE = re.compile(r"\$\s*(\d+)(?:\.(\d{1,2}))?\b")
+
+
+def normalize_speak_text_for_tts(text: str) -> str:
+    """Expand $3.50 for TTS — engines often stop at '.' and only say 'three'."""
+
+    def _money_repl(m: re.Match[str]) -> str:
+        dollars = int(m.group(1))
+        cents_raw = m.group(2)
+        if not cents_raw:
+            return f"{dollars} dollar" if dollars == 1 else f"{dollars} dollars"
+        cents = int(cents_raw.ljust(2, "0")[:2])
+        if cents == 0:
+            return f"{dollars} dollar" if dollars == 1 else f"{dollars} dollars"
+        d_part = f"{dollars} dollar" if dollars == 1 else f"{dollars} dollars"
+        c_part = f"{cents} cent" if cents == 1 else f"{cents} cents"
+        return f"{d_part} and {c_part}"
+
+    return _MONEY_FOR_TTS_RE.sub(_money_repl, text or "")
+
+
+def _decimal_in_progress_at_end(text: str, punct_end: int) -> bool:
+    """True when '.' at punct_end is an incomplete decimal (e.g. $3. or $3.5), not a full stop."""
+    if punct_end <= 0 or punct_end > len(text):
+        return False
+    if text[punct_end - 1] != ".":
+        return False
+    prefix = text[:punct_end]
+    if re.search(r"\$\d+\.\Z", prefix):
+        return True
+    if re.search(r"\$\d+\.\d\Z", prefix):
+        return True
+    return False
+
+
 def _pop_complete_sentences(buf: str) -> tuple[list[str], str]:
     """Split speakable prefix into finished sentences; return (sentences, remainder)."""
     sentences: list[str] = []
     rest = buf
     while rest:
-        m = re.search(r'[.!?。！？]+["\']?', rest)
+        m = _SENTENCE_END_RE.search(rest)
         if m:
             end = m.end()
-            if end < len(rest) and not rest[end].isspace():
+            if _decimal_in_progress_at_end(rest, end):
                 break
             candidate = rest[:end].strip()
             if len(candidate) < VOICE_STREAM_HUMAN_MIN_CHARS:
@@ -2943,6 +2980,9 @@ def _pop_complete_sentences(buf: str) -> tuple[list[str], str]:
             candidate = rest[:nl].strip()
             if len(candidate) >= VOICE_STREAM_HUMAN_MIN_CHARS:
                 sentences.append(candidate)
+                rest = rest[nl + 1 :].lstrip()
+                continue
+            if not candidate:
                 rest = rest[nl + 1 :].lstrip()
                 continue
         break
@@ -2984,7 +3024,7 @@ def _prepare_stream_sentence_for_human(
     s = _RECEIPT_BLOCK_RE.sub("", s)
     s = _ORDERDONE_BLOCK_RE.sub("", s)
     s = strip_show_image_item_names_from_speech(s, show_image)
-    return s.strip()
+    return normalize_speak_text_for_tts(s.strip())
 
 
 class _StreamHumanDispatcher:
@@ -3087,7 +3127,9 @@ class _StreamHumanDispatcher:
             self.buffer = remainder + safe_tail
             pending.extend(chunks)
         if final and self.buffer.strip():
-            pending.append(self.buffer.strip())
+            tail = _prepare_stream_sentence_for_human(self.buffer.strip(), self.show_image)
+            if len(tail) >= VOICE_STREAM_HUMAN_MIN_CHARS:
+                pending.append(tail)
             self.buffer = ""
         parallel = voice_stream_parallel_enabled() and voice_dispatch_mode() == "humanaudio"
         if pending:
@@ -3475,6 +3517,7 @@ async def _voice_pipeline(body: VoiceTurnBody, *, humanaudio_only: bool = False)
         order_done_num = 42
     speak_text = strip_show_image_markup(speak_text)
     speak_text = strip_show_image_item_names_from_speech(speak_text, show_image)
+    speak_text = normalize_speak_text_for_tts(speak_text)
     if (
         not speak_text.strip()
         and not (receipt and receipt.get("items"))
@@ -6396,7 +6439,7 @@ async def video_qa_search_endpoint(body: VideoQaSearchBody):
 _spa_dist = _BACKEND_DIR / "static" / "dist"
 
 
-@app.get("/{asset_id}.mp4", include_in_schema=False)
+@app.api_route("/{asset_id}.mp4", methods=["GET", "HEAD"], include_in_schema=False)
 async def serve_hologram_idle_mp4(asset_id: str):
     """
     Serve idle / avatar MP4 from frontend/public (live Create Avatar uploads)
