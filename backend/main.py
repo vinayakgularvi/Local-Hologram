@@ -28,7 +28,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import Request as StarletteRequest
 from fastapi.staticfiles import StaticFiles
 from gradio_client import Client, handle_file
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from analytics_store import (
     clear_all,
@@ -284,6 +284,11 @@ LIPSYNC_CHUNK_PARALLEL = max(1, _env_first_int("LIPSYNC_CHUNK_PARALLEL", default
 
 # LiveTalking-style WebRTC signaling (POST /offer, /human, /record) — proxied to this origin when set
 WEBRTC_SIGNALING_BASE = os.environ.get("WEBRTC_SIGNALING_BASE", "").strip().rstrip("/")
+# Optional default for RAG /v1/chat when no WebRTC session (studio / video-qa). Not used for LiveTalking.
+HOLOGRAM_SESSION_ID = os.environ.get("HOLOGRAM_SESSION_ID", "").strip()
+RAG_SESSION_ID = os.environ.get("RAG_SESSION_ID", "").strip() or HOLOGRAM_SESSION_ID
+# Active hologram avatar (Create Avatar → Set avatar); shared across devices via .env
+HOLOGRAM_SELECTED_AVATAR_ID = os.environ.get("HOLOGRAM_SELECTED_AVATAR_ID", "").strip()
 # After /api/voice-turn, POST speak_text to LiveTalking /human from the API (saves browser round-trip).
 VOICE_DISPATCH_HUMAN = os.environ.get("VOICE_DISPATCH_HUMAN", "1").strip().lower() in (
     "1",
@@ -955,6 +960,29 @@ async def _store_gradio_file(candidate: Any, *, prefix: str, fallback_ext: str) 
     return f"/outputs/{out_name}"
 
 
+def resolve_livetalking_session_id(client_sessionid: str | int | None = None) -> str:
+    """LiveTalking session from WebRTC /offer response — never overridden by env."""
+    if client_sessionid is None:
+        return ""
+    sid = str(client_sessionid).strip()
+    return sid if sid and sid != "0" else ""
+
+
+def resolve_rag_session_id(
+    client_sessionid: str | int | None = None,
+    *,
+    fallback: str = "default",
+) -> str:
+    """RAG /v1/chat: use active WebRTC session when connected, else RAG_SESSION_ID env."""
+    sid = resolve_livetalking_session_id(client_sessionid)
+    if sid:
+        return sid
+    if RAG_SESSION_ID:
+        return RAG_SESSION_ID
+    fb = (fallback or "").strip()
+    return fb or "default"
+
+
 async def _forward_webrtc_post(subpath: str, request: Request) -> Response:
     """Forward JSON POST body to LiveTalking (or compatible) signaling server."""
     if not WEBRTC_SIGNALING_BASE:
@@ -984,6 +1012,7 @@ async def _forward_webrtc_post(subpath: str, request: Request) -> Response:
 
 @app.post("/offer")
 async def webrtc_offer_proxy(request: Request) -> Response:
+    """Forward WebRTC offer; return LiveTalking sessionid unchanged (server-assigned UUID)."""
     return await _forward_webrtc_post("/offer", request)
 
 
@@ -2153,6 +2182,9 @@ async def webrtc_proxy_status():
         "voice_stream_human_min_chars": VOICE_STREAM_HUMAN_MIN_CHARS,
         "voice_dispatch_mode": voice_dispatch_mode(),
         "idle_loop_video": IDLE_LOOP_VIDEO,
+        "rag_session_id": RAG_SESSION_ID or None,
+        "hologram_session_id": RAG_SESSION_ID or None,
+        "selected_avatar_id": get_hologram_selected_avatar_id() or None,
     }
 
 
@@ -2744,6 +2776,20 @@ class VoiceTurnBody(BaseModel):
         max_length=64,
         description="LiveTalking WebRTC session id; when set, API dispatches /human after speak_text is ready.",
     )
+
+    @field_validator("sessionid", mode="before")
+    @classmethod
+    def _sessionid_to_str(cls, v: Any) -> str | None:
+        if v is None or v == "":
+            return None
+        if isinstance(v, bool):
+            return str(v)
+        if isinstance(v, int):
+            return str(v)
+        if isinstance(v, float) and v.is_integer():
+            return str(int(v))
+        s = str(v).strip()
+        return s if s and s != "0" else None
     stt_latency_ms: float | None = Field(
         None,
         ge=0,
@@ -3183,7 +3229,7 @@ async def _voice_pipeline(body: VoiceTurnBody, *, humanaudio_only: bool = False)
     user_text = body.text.strip()
     if not user_text:
         raise HTTPException(status_code=400, detail="text is empty.")
-    sid = (body.sessionid or "").strip()
+    sid = resolve_livetalking_session_id(body.sessionid)
     t0 = time.perf_counter()
 
     from hologram_trace import trace as hologram_trace
@@ -3357,7 +3403,7 @@ async def _voice_pipeline(body: VoiceTurnBody, *, humanaudio_only: bool = False)
                 stream_result = await _collect_rag_generate_stream(
                     RAG_GENERATE_STREAM_URL,
                     message=user_text,
-                    session_id=sid or "voice",
+                    session_id=resolve_rag_session_id(sid),
                     top_k=RAG_CHAT_TOP_K,
                     voice_turn=True,
                     stream_human_sessionid=stream_human_sessionid,
@@ -4237,7 +4283,7 @@ async def rag_query(body: RagQueryBody):
             stream_result = await _collect_rag_generate_stream(
                 RAG_GENERATE_STREAM_URL,
                 message=body.query.strip(),
-                session_id="studio",
+                session_id=resolve_rag_session_id(None, fallback="studio"),
                 top_k=body.n_results,
             )
             if isinstance(stream_result, tuple):
@@ -5039,6 +5085,22 @@ async def avatar_run_voice_clone(
         shutil.rmtree(work, ignore_errors=True)
 
 
+def get_hologram_selected_avatar_id() -> str:
+    return (os.environ.get("HOLOGRAM_SELECTED_AVATAR_ID") or HOLOGRAM_SELECTED_AVATAR_ID or "").strip()
+
+
+def set_hologram_selected_avatar_id(avatar_id: str) -> str:
+    aid = _hologram_asset_id(avatar_id, "avatar_id")
+    os.environ["HOLOGRAM_SELECTED_AVATAR_ID"] = aid
+    global HOLOGRAM_SELECTED_AVATAR_ID
+    HOLOGRAM_SELECTED_AVATAR_ID = aid
+    try:
+        _update_dotenv_key("HOLOGRAM_SELECTED_AVATAR_ID", aid)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Unable to update .env: {e}") from e
+    return aid
+
+
 @app.get("/api/avatar/config")
 async def avatar_config():
     ref_id = ""
@@ -5052,6 +5114,30 @@ async def avatar_config():
         "avatar_api_base": AVATAR_API_BASE,
         "reference_id_default": ref_id,
         "voice_tts_reference_id": ref_id,
+        "selected_avatar_id": get_hologram_selected_avatar_id() or None,
+    }
+
+
+@app.get("/api/avatar/selected")
+async def avatar_get_selected():
+    """Active hologram avatar id (shared across devices)."""
+    aid = get_hologram_selected_avatar_id()
+    video_url = f"/{aid}.mp4" if aid else None
+    return {"avatar_id": aid or None, "video_url": video_url}
+
+
+class AvatarSelectedBody(BaseModel):
+    avatar_id: str = Field(..., min_length=1, max_length=64)
+
+
+@app.post("/api/avatar/selected")
+async def avatar_set_selected(body: AvatarSelectedBody):
+    """Set active hologram avatar for all clients (persists to .env)."""
+    aid = set_hologram_selected_avatar_id(body.avatar_id)
+    return {
+        "avatar_id": aid,
+        "video_url": f"/{aid}.mp4",
+        "status": f"Live avatar set to {aid}.",
     }
 
 
@@ -6023,7 +6109,7 @@ async def video_qa_ask_endpoint(body: VideoQaAskBody):
                 stream_result = await _collect_rag_generate_stream(
                     RAG_GENERATE_STREAM_URL,
                     message=question,
-                    session_id="video-qa",
+                    session_id=resolve_rag_session_id(None, fallback="video-qa"),
                     top_k=body.limit,
                 )
             else:

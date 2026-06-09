@@ -1,6 +1,10 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
-import { getSelectedAvatarId, setSelectedAvatarId } from "./selectedAvatar.js";
+import {
+  getSelectedAvatarId,
+  setSelectedAvatarId,
+  syncSelectedAvatarFromServer,
+} from "./selectedAvatar.js";
 import { audioFileToWavFile } from "./audioWav.js";
 import { fitImageToAvatarStage } from "./avatarStageImage.js";
 
@@ -324,7 +328,15 @@ let avatarTasksPollId = null;
 function startAvatarTasksPolling() {
   stopAvatarTasksPolling();
   void loadAvatarTasks();
-  avatarTasksPollId = window.setInterval(() => void loadAvatarTasks(), 4000);
+  void syncSelectedAvatarFromServer().then((id) => {
+    if (id) selectedLiveAvatarId.value = id;
+  });
+  avatarTasksPollId = window.setInterval(() => {
+    void loadAvatarTasks();
+    void syncSelectedAvatarFromServer().then((id) => {
+      if (id) selectedLiveAvatarId.value = id;
+    });
+  }, 4000);
 }
 
 function stopAvatarTasksPolling() {
@@ -347,7 +359,7 @@ function isAvatarTaskCompleted(task) {
   return s === "completed" || s === "succeeded";
 }
 
-function setLiveAvatar(task) {
+async function setLiveAvatar(task) {
   const id = String(task?.avatar_id || "").trim();
   if (!id) {
     setAvatarStatus.value = "Row has no avatar ID.";
@@ -357,9 +369,14 @@ function setLiveAvatar(task) {
     setAvatarStatus.value = "Wait until the avatar task is completed.";
     return;
   }
-  setSelectedAvatarId(id);
-  selectedLiveAvatarId.value = id;
-  setAvatarStatus.value = "Live avatar updated.";
+  setAvatarStatus.value = "Saving…";
+  try {
+    await setSelectedAvatarId(id);
+    selectedLiveAvatarId.value = id;
+    setAvatarStatus.value = "Live avatar updated for all devices.";
+  } catch (e) {
+    setAvatarStatus.value = e instanceof Error ? e.message : String(e);
+  }
 }
 
 function onHologramAvatarSelected(ev) {
@@ -1486,6 +1503,9 @@ async function startAvatarVideo() {
 }
 
 onMounted(() => {
+  void syncSelectedAvatarFromServer().then((id) => {
+    if (id) selectedLiveAvatarId.value = id;
+  });
   void loadConfig();
   startAvatarTasksPolling();
   window.addEventListener("hologram-avatar-selected", onHologramAvatarSelected);

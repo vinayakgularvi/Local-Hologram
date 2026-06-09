@@ -1,13 +1,22 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, nextTick } from "vue";
-import { getSelectedAvatarId, SELECTED_AVATAR_STORAGE_KEY } from "./selectedAvatar.js";
+import {
+  getSelectedAvatarId,
+  SELECTED_AVATAR_STORAGE_KEY,
+  syncSelectedAvatarFromServer,
+} from "./selectedAvatar.js";
+import {
+  getHologramSessionId,
+  hologramSessionIdPayload,
+  resolveHologramSessionId,
+} from "./hologramSession.js";
 
 const busy = ref(false);
 /** True once the remote video is actually rendering (not only SDP done). */
 const videoReady = ref(false);
 const started = ref(false);
 const proxyConfigured = ref(null);
-const sessionId = ref("0");
+const sessionId = ref(getHologramSessionId() || "0");
 const webrtcError = ref("");
 
 const videoEl = ref(null);
@@ -887,36 +896,56 @@ function signalingUrl(path) {
   return base ? `${base}${p}` : p;
 }
 
-fetch(signalingUrl("/api/webrtc"))
-  .then((r) => r.json())
-  .then((d) => {
-    proxyConfigured.value = Boolean(d.signaling_proxy_configured);
-    transcribeConfigured.value = Boolean(d.transcribe_configured);
-    if (d.transcribe_backend === "whisper") {
-      transcribeBackend.value = "whisper";
-    } else if (
-      d.transcribe_backend === "parakeet" ||
-      d.transcribe_backend === "openai" ||
-      d.transcribe_backend === "nvidia" ||
-      d.transcribe_backend === "nemo"
-    ) {
-      transcribeBackend.value = "parakeet";
-    }
-    if (d.idle_loop_video) {
-      const resolved = resolveIdleLoopVideoUrl(d.idle_loop_video);
-      if (resolved !== idleLoopVideoFromServer) {
-        idleLoopVideoFromServer = resolved;
-        idleLoopGeneration += 1;
-        if (mediaVisible.value && !idleLoopVideoFromAvatar) {
-          void startIdleLoop();
-        }
+let webrtcStatusPollId = null;
+let lastPolledSelectedAvatarId = "";
+
+function applyWebrtcStatusPayload(d) {
+  if (!d || typeof d !== "object") return;
+  proxyConfigured.value = Boolean(d.signaling_proxy_configured);
+  transcribeConfigured.value = Boolean(d.transcribe_configured);
+  if (d.transcribe_backend === "whisper") {
+    transcribeBackend.value = "whisper";
+  } else if (
+    d.transcribe_backend === "parakeet" ||
+    d.transcribe_backend === "openai" ||
+    d.transcribe_backend === "nvidia" ||
+    d.transcribe_backend === "nemo"
+  ) {
+    transcribeBackend.value = "parakeet";
+  }
+  if (d.idle_loop_video) {
+    const resolved = resolveIdleLoopVideoUrl(d.idle_loop_video);
+    if (resolved !== idleLoopVideoFromServer) {
+      idleLoopVideoFromServer = resolved;
+      idleLoopGeneration += 1;
+      if (mediaVisible.value && !idleLoopVideoFromAvatar) {
+        void startIdleLoop();
       }
     }
-  })
-  .catch(() => {
+  }
+  const remoteAvatar = String(d.selected_avatar_id || "").trim();
+  if (remoteAvatar && remoteAvatar !== lastPolledSelectedAvatarId) {
+    lastPolledSelectedAvatarId = remoteAvatar;
+    if (remoteAvatar !== getSelectedAvatarId()) {
+      void syncSelectedAvatarFromServer().then((id) => {
+        if (id) applySelectedAvatarIdleVideo(id);
+      });
+    }
+  }
+}
+
+async function refreshWebrtcStatus() {
+  try {
+    const res = await fetch(signalingUrl("/api/webrtc"));
+    if (!res.ok) throw new Error(String(res.status));
+    applyWebrtcStatusPayload(await res.json());
+  } catch {
     proxyConfigured.value = false;
     transcribeConfigured.value = false;
-  });
+  }
+}
+
+void refreshWebrtcStatus();
 
 function waitIceGatheringFast(conn) {
   if (conn.iceGatheringState === "complete") {
@@ -984,6 +1013,8 @@ async function negotiate() {
   const avatarId = getSelectedAvatarId();
   const payload = { sdp: local.sdp, type: local.type };
   if (avatarId) payload.avatar = avatarId;
+  const sessionPayload = hologramSessionIdPayload();
+  if (sessionPayload) Object.assign(payload, sessionPayload);
 
   const res = await fetch(signalingUrl("/offer"), {
     method: "POST",
@@ -996,7 +1027,7 @@ async function negotiate() {
   }
   const answer = await res.json();
   if (answer.sessionid !== undefined && answer.sessionid !== null) {
-    sessionId.value = String(answer.sessionid);
+    sessionId.value = resolveHologramSessionId(answer.sessionid);
   }
   await pc.setRemoteDescription(answer);
   if (avatarId) {
@@ -1081,7 +1112,7 @@ function disconnect() {
     pc.close();
     pc = null;
   }
-  sessionId.value = "0";
+  sessionId.value = getHologramSessionId() || "0";
 }
 
 function bindWebRtcTtfaAudioListener() {
@@ -1487,12 +1518,8 @@ async function reportLipSyncLatencyMs(turnId, lipSyncMs, extra = {}) {
 
 /** Queue TTS on LiveTalking; do not await (avatar starts generating while UI updates). */
 function liveTalkingSessionIdPayload() {
-  const sid = String(sessionId.value || "").trim();
+  const sid = String(sessionId.value || getHologramSessionId() || "").trim();
   if (!sid || sid === "0") return null;
-  const asNum = Number(sid);
-  if (Number.isFinite(asNum) && !Number.isNaN(asNum)) {
-    return { sessionid: asNum };
-  }
   return { sessionid: sid };
 }
 
@@ -2145,9 +2172,9 @@ async function runVoicePipeline(userText, stt = null) {
   activateWebRtcStage();
   const requestSentMs = performance.now();
   beginVoiceTurnTtfaWatch(requestSentMs);
-  const sid = String(sessionId.value || "").trim();
+  const sid = String(sessionId.value || getHologramSessionId() || "").trim();
   const payload = { text: t };
-  if (sid) payload.sessionid = sid;
+  if (sid && sid !== "0") payload.sessionid = sid;
   if (sttLatencyMs != null && Number.isFinite(sttLatencyMs) && sttLatencyMs >= 0) {
     payload.stt_latency_ms = Math.round(sttLatencyMs * 10) / 10;
   }
@@ -2915,7 +2942,15 @@ function formatBillMoney(n) {
 }
 
 onMounted(() => {
-  applySelectedAvatarIdleVideo(getSelectedAvatarId());
+  void syncSelectedAvatarFromServer().then((id) => {
+    if (id) {
+      lastPolledSelectedAvatarId = id;
+      applySelectedAvatarIdleVideo(id);
+    } else {
+      applySelectedAvatarIdleVideo(getSelectedAvatarId());
+    }
+  });
+  webrtcStatusPollId = window.setInterval(() => void refreshWebrtcStatus(), 8000);
   window.addEventListener("hologram-avatar-selected", onHologramAvatarSelected);
   window.addEventListener("storage", onHologramAvatarStorage);
   void connect();
@@ -2923,6 +2958,10 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
+  if (webrtcStatusPollId != null) {
+    window.clearInterval(webrtcStatusPollId);
+    webrtcStatusPollId = null;
+  }
   window.removeEventListener("hologram-avatar-selected", onHologramAvatarSelected);
   window.removeEventListener("storage", onHologramAvatarStorage);
   if (orderPlacedHideTimer != null) {
