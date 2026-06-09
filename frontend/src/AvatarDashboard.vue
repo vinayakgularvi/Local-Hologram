@@ -15,6 +15,11 @@ const VOICE_AUDIO_ACCEPT = ".wav,audio/wav";
 const customerRecordFile = ref(null);
 const customerRecordPreview = ref("");
 const referenceId = ref("ref101");
+const voiceTtsStylePreset = ref("calm_joyful");
+const voiceTtsSpeed = ref(0.75);
+const activeVoiceTtsStylePreset = ref("");
+const activeVoiceTtsSpeed = ref("");
+const setVoiceTtsSettingsBusy = ref(false);
 const referenceAudioSaved = ref(null);
 const activeVoiceReferenceId = ref("");
 const setVoiceReferenceBusy = ref(false);
@@ -427,6 +432,13 @@ async function loadConfig() {
     activeVoiceReferenceId.value = String(
       data.voice_tts_reference_id || data.reference_id_default || "",
     ).trim();
+    const preset = String(data.voice_tts_style_preset || "calm_joyful").trim() || "calm_joyful";
+    voiceTtsStylePreset.value = preset;
+    activeVoiceTtsStylePreset.value = preset;
+    const speedRaw = Number.parseFloat(String(data.voice_tts_speed ?? "0.75"));
+    const speed = Number.isFinite(speedRaw) ? speedRaw : 0.75;
+    voiceTtsSpeed.value = speed;
+    activeVoiceTtsSpeed.value = String(speed);
   } catch {
     promptText.value = "Please read this script clearly while recording your voice.";
     hologramAvatarConfigured.value = false;
@@ -1370,6 +1382,34 @@ async function setVoiceReference() {
   }
 }
 
+async function setVoiceTtsSettings() {
+  const preset = voiceTtsStylePreset.value.trim();
+  const speed = Number(voiceTtsSpeed.value);
+  if (!preset) {
+    customerStatus.value = "Style preset is required.";
+    return;
+  }
+  if (!Number.isFinite(speed) || speed < 0.25 || speed > 2) {
+    customerStatus.value = "Speed must be between 0.25 and 2.";
+    return;
+  }
+  setVoiceTtsSettingsBusy.value = true;
+  customerStatus.value = "";
+  try {
+    const out = await postJson("/api/avatar/voice-tts-settings", {
+      style_preset: preset,
+      speed,
+    });
+    activeVoiceTtsStylePreset.value = String(out.voice_tts_style_preset || preset);
+    activeVoiceTtsSpeed.value = String(out.voice_tts_speed ?? speed);
+    customerStatus.value = "TTS style and speed updated.";
+  } catch (e) {
+    customerStatus.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    setVoiceTtsSettingsBusy.value = false;
+  }
+}
+
 async function saveRecording() {
   if (!customerRecordFile.value) {
     customerStatus.value = "Please record or upload audio first.";
@@ -1712,6 +1752,45 @@ function formatIso(iso) {
                   spellcheck="false"
                 />
               </label>
+
+              <div class="voice-tts-settings">
+                <label class="field">
+                  <span>Style preset</span>
+                  <select v-model="voiceTtsStylePreset">
+                    <option value="calm_joyful">calm_joyful</option>
+                  </select>
+                  <span class="field-hint">VOICE_TTS_STYLE_PRESET · sent to /v1/tts/reference</span>
+                </label>
+                <label class="field">
+                  <span>Speed</span>
+                  <input
+                    v-model.number="voiceTtsSpeed"
+                    type="number"
+                    min="0.25"
+                    max="2"
+                    step="0.05"
+                    inputmode="decimal"
+                  />
+                  <span class="field-hint">VOICE_TTS_SPEED (0.25–2)</span>
+                </label>
+              </div>
+              <div class="actions">
+                <button
+                  type="button"
+                  class="btn btn--secondary"
+                  :disabled="setVoiceTtsSettingsBusy || !voiceTtsStylePreset.trim()"
+                  @click="setVoiceTtsSettings"
+                >
+                  {{ setVoiceTtsSettingsBusy ? "Applying…" : "Apply TTS settings" }}
+                </button>
+                <span
+                  v-if="activeVoiceTtsStylePreset || activeVoiceTtsSpeed"
+                  class="chip chip--ok"
+                >
+                  TTS · {{ activeVoiceTtsStylePreset || voiceTtsStylePreset }} · speed
+                  {{ activeVoiceTtsSpeed || voiceTtsSpeed }}
+                </span>
+              </div>
 
               <label class="field">
                 <span>Audio script (ref_text)</span>
@@ -3686,6 +3765,28 @@ function formatIso(iso) {
   color: #475569;
 }
 
+.field .field-hint {
+  font-weight: 400;
+  font-size: 0.75rem;
+  text-transform: none;
+  letter-spacing: 0;
+  color: #64748b;
+  margin: 0;
+}
+
+.voice-tts-settings {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: 1fr 1fr;
+  margin-bottom: 0.25rem;
+}
+
+@media (max-width: 640px) {
+  .voice-tts-settings {
+    grid-template-columns: 1fr;
+  }
+}
+
 .field-hint {
   margin: -0.35rem 0 0.75rem;
   font-size: 0.82rem;
@@ -3699,7 +3800,8 @@ function formatIso(iso) {
 textarea,
 select,
 input[type="text"],
-input[type="password"] {
+input[type="password"],
+input[type="number"] {
   width: 100%;
   border: 1px solid rgba(148, 163, 184, 0.55);
   border-radius: 12px;
@@ -3720,7 +3822,8 @@ textarea {
 textarea:focus,
 select:focus,
 input[type="text"]:focus,
-input[type="password"]:focus {
+input[type="password"]:focus,
+input[type="number"]:focus {
   outline: none;
   border-color: rgba(20, 184, 166, 0.65);
   box-shadow: 0 0 0 3px rgba(20, 184, 166, 0.18);

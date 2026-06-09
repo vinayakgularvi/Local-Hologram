@@ -375,6 +375,7 @@ HOLOGRAM_UPLOAD_TIMEOUT_SEC = max(60.0, float(_env_first_int("HOLOGRAM_UPLOAD_TI
 HOLOGRAM_PREPARE_TIMEOUT_SEC = max(120.0, float(_env_first_int("HOLOGRAM_PREPARE_TIMEOUT_SEC", default=900)))
 _HOLOGRAM_ASSET_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 _TTS_REFERENCE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_TTS_STYLE_PRESET_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _HOLOGRAM_SERVER_PATH_RE = re.compile(r"^/[\w./-]+$")
 AVATAR_API_BASE = os.environ.get("AVATAR_API_BASE", "http://10.29.145.124:9000").strip().rstrip("/")
 AVATAR_VIDEO_API_BASE = os.environ.get("AVATAR_VIDEO_API_BASE", "http://10.29.145.124:8002").strip().rstrip("/")
@@ -5157,6 +5158,14 @@ async def avatar_config():
         "avatar_api_base": AVATAR_API_BASE,
         "reference_id_default": ref_id,
         "voice_tts_reference_id": ref_id,
+        "voice_tts_style_preset": (
+            os.environ.get("VOICE_TTS_STYLE_PRESET") or "calm_joyful"
+        ).strip()
+        or "calm_joyful",
+        "voice_tts_speed": (
+            os.environ.get("VOICE_TTS_SPEED") or "0.75"
+        ).strip()
+        or "0.75",
         "selected_avatar_id": get_hologram_selected_avatar_id() or None,
     }
 
@@ -5224,6 +5233,36 @@ async def avatar_set_voice_reference_id(body: AvatarVoiceReferenceIdBody):
         "reference_id": ref_id,
         "voice_tts_reference_id": ref_id,
         "status": f"Active voice set to {ref_id}.",
+    }
+
+
+class AvatarVoiceTtsSettingsBody(BaseModel):
+    style_preset: str = Field(..., min_length=1, max_length=64)
+    speed: float = Field(..., ge=0.25, le=2.0)
+
+
+@app.post("/api/avatar/voice-tts-settings")
+async def avatar_set_voice_tts_settings(body: AvatarVoiceTtsSettingsBody):
+    """Set runtime + .env VOICE_TTS_STYLE_PRESET and VOICE_TTS_SPEED for /v1/tts/reference."""
+    preset = (body.style_preset or "").strip()
+    if not _TTS_STYLE_PRESET_RE.fullmatch(preset):
+        raise HTTPException(
+            status_code=400,
+            detail="style_preset must be 1–64 alphanumeric characters, underscores, or hyphens.",
+        )
+    speed = float(body.speed)
+    speed_str = f"{speed:g}"
+    os.environ["VOICE_TTS_STYLE_PRESET"] = preset
+    os.environ["VOICE_TTS_SPEED"] = speed_str
+    try:
+        _update_dotenv_key("VOICE_TTS_STYLE_PRESET", preset)
+        _update_dotenv_key("VOICE_TTS_SPEED", speed_str)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Unable to update .env: {e}") from e
+    return {
+        "voice_tts_style_preset": preset,
+        "voice_tts_speed": speed_str,
+        "status": f"TTS settings updated (style_preset={preset}, speed={speed_str}).",
     }
 
 
