@@ -104,6 +104,14 @@ const avatarTasks = ref([]);
 const avatarTasksLoadError = ref("");
 const selectedLiveAvatarId = ref(getSelectedAvatarId());
 const setAvatarStatus = ref("");
+const studioRefreshing = ref(false);
+const studioReady = ref(false);
+const studioPageStatus = ref("");
+const studioPageStatusTone = ref("muted");
+const studioLastUpdatedAt = ref("");
+const studioFormValuesHydrated = ref(false);
+let avatarTasksLoadInFlight = false;
+let avatarVideoPollInFlight = false;
 
 /** Knowledge hub: grid + detail panel */
 const activeKbSource = ref(null);
@@ -254,6 +262,15 @@ function apiUrl(path) {
   return p;
 }
 
+function pageIsVisible() {
+  return typeof document === "undefined" || document.visibilityState === "visible";
+}
+
+function setStudioPageStatus(message = "", tone = "muted") {
+  studioPageStatus.value = String(message || "").trim();
+  studioPageStatusTone.value = tone;
+}
+
 function toPreview(file) {
   if (!file) return "";
   const url = URL.createObjectURL(file);
@@ -261,29 +278,32 @@ function toPreview(file) {
   return url;
 }
 
-async function postForm(path, fd) {
-  const res = await fetch(apiUrl(path), { method: "POST", body: fd });
+async function requestJson(path, init = {}) {
+  const headers = { Accept: "application/json", ...(init.headers || {}) };
+  const res = await fetch(apiUrl(path), { ...init, headers });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(apiErrorMessage(data, res.status));
   return data;
+}
+
+async function postForm(path, fd) {
+  return requestJson(path, { method: "POST", body: fd });
 }
 
 function apiErrorMessage(data, status) {
   const d = data?.detail;
   if (typeof d === "string") return d;
   if (Array.isArray(d)) return d.map((x) => x?.msg || x).join("; ");
+  if (d && typeof d === "object") return JSON.stringify(d);
   return data?.error || `Request failed (${status})`;
 }
 
 async function postJson(path, body) {
-  const res = await fetch(apiUrl(path), {
+  return requestJson(path, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify(body),
   });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(apiErrorMessage(data, res.status));
-  return data;
 }
 
 function triggerAvatarTaskVideoUpload() {
@@ -296,14 +316,16 @@ function onAvatarTaskVideo(ev) {
 }
 
 async function loadAvatarTasks() {
+  if (avatarTasksLoadInFlight || !pageIsVisible()) return;
+  avatarTasksLoadInFlight = true;
   try {
-    const res = await fetch(apiUrl("/api/avatar/tasks"));
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(apiErrorMessage(data, res.status));
+    const data = await requestJson("/api/avatar/tasks");
     avatarTasks.value = Array.isArray(data.tasks) ? data.tasks : [];
     avatarTasksLoadError.value = "";
   } catch (e) {
     avatarTasksLoadError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    avatarTasksLoadInFlight = false;
   }
 }
 
@@ -348,14 +370,11 @@ let avatarTasksPollId = null;
 function startAvatarTasksPolling() {
   stopAvatarTasksPolling();
   void loadAvatarTasks();
-  void syncSelectedAvatarFromServer().then((id) => {
-    if (id) selectedLiveAvatarId.value = id;
-  });
+  void syncSelectedAvatarState();
   avatarTasksPollId = window.setInterval(() => {
+    if (!pageIsVisible()) return;
     void loadAvatarTasks();
-    void syncSelectedAvatarFromServer().then((id) => {
-      if (id) selectedLiveAvatarId.value = id;
-    });
+    void syncSelectedAvatarState();
   }, 4000);
 }
 
@@ -476,12 +495,13 @@ function cleanStatusText(v) {
 
 async function loadConfig() {
   try {
-    const res = await fetch(apiUrl("/api/avatar/config"));
-    if (!res.ok) throw new Error("Unable to load avatar config.");
-    const data = await res.json();
+    const data = await requestJson("/api/avatar/config");
     promptText.value = String(data.sample_text || "").trim();
     hologramAvatarConfigured.value = data.hologram_avatar_configured === true;
     if (data.reference_id_default) referenceId.value = String(data.reference_id_default);
+    if (data.selected_avatar_id) {
+      selectedLiveAvatarId.value = String(data.selected_avatar_id).trim();
+    }
     activeVoiceReferenceId.value = String(
       data.voice_tts_reference_id || data.reference_id_default || "",
     ).trim();
@@ -622,14 +642,113 @@ function toggleVectorDbSource(id) {
   activeVectorDbSource.value = activeVectorDbSource.value === id ? null : id;
 }
 
+function applyStudioFormValues(data) {
+  const sp = data?.sharepoint || {};
+  spForm.value = {
+    ...spForm.value,
+    azure_tenant_id: String(sp.azure_tenant_id || ""),
+    azure_client_id: String(sp.azure_client_id || ""),
+    sharepoint_site_url: String(sp.sharepoint_site_url || ""),
+    sharepoint_folder_path: String(sp.sharepoint_folder_path || ""),
+  };
+
+  const gd = data?.google_drive || {};
+  gdriveForm.value = {
+    ...gdriveForm.value,
+    folder_id: String(gd.folder_id || ""),
+    credentials_path: String(gd.credentials_path || ""),
+  };
+
+  const dbx = data?.dropbox || {};
+  dbxForm.value = {
+    ...dbxForm.value,
+    dropbox_folder_path: String(dbx.dropbox_folder_path || ""),
+    dropbox_app_key: String(dbx.dropbox_app_key || ""),
+  };
+
+  const s3 = data?.s3 || {};
+  s3Form.value = {
+    ...s3Form.value,
+    s3_bucket: String(s3.s3_bucket || ""),
+    s3_prefix: String(s3.s3_prefix || ""),
+    aws_region: String(s3.aws_region || ""),
+    s3_use_default_credential_chain: String(s3.s3_use_default_credential_chain || ""),
+  };
+
+  const az = data?.azure_blob || {};
+  azureForm.value = {
+    ...azureForm.value,
+    azure_storage_account_name: String(az.azure_storage_account_name || ""),
+    azure_blob_container: String(az.azure_blob_container || ""),
+    azure_blob_prefix: String(az.azure_blob_prefix || ""),
+  };
+
+  const gcs = data?.gcs || {};
+  gcsForm.value = {
+    ...gcsForm.value,
+    bucket: String(gcs.bucket || ""),
+    prefix: String(gcs.prefix || ""),
+    credentials_path: String(gcs.credentials_path || ""),
+    use_adc: Boolean(gcs.use_adc),
+  };
+
+  const pinecone = data?.pinecone || {};
+  pineconeForm.value = {
+    ...pineconeForm.value,
+    pinecone_index_name: String(pinecone.pinecone_index_name || ""),
+    pinecone_host: String(pinecone.pinecone_host || ""),
+  };
+
+  const milvus = data?.milvus || {};
+  milvusForm.value = {
+    ...milvusForm.value,
+    milvus_uri: String(milvus.milvus_uri || ""),
+    milvus_db_name: String(milvus.milvus_db_name || ""),
+    milvus_collection_name: String(milvus.milvus_collection_name || ""),
+  };
+
+  const weaviate = data?.weaviate || {};
+  weaviateForm.value = {
+    ...weaviateForm.value,
+    weaviate_url: String(weaviate.weaviate_url || ""),
+    weaviate_class_name: String(weaviate.weaviate_class_name || ""),
+  };
+
+  const qdrant = data?.qdrant || {};
+  qdrantForm.value = {
+    ...qdrantForm.value,
+    qdrant_url: String(qdrant.qdrant_url || ""),
+    qdrant_collection_name: String(qdrant.qdrant_collection_name || ""),
+  };
+
+  const elastic = data?.elasticsearch || {};
+  elasticsearchForm.value = {
+    ...elasticsearchForm.value,
+    elasticsearch_url: String(elastic.elasticsearch_url || ""),
+    elasticsearch_index_name: String(elastic.elasticsearch_index_name || ""),
+  };
+
+  const azureAi = data?.azure_ai_search || {};
+  azureAiSearchForm.value = {
+    ...azureAiSearchForm.value,
+    azure_ai_search_endpoint: String(azureAi.azure_ai_search_endpoint || ""),
+    azure_ai_search_index_name: String(azureAi.azure_ai_search_index_name || ""),
+  };
+}
+
+async function loadStudioFormValues() {
+  try {
+    const data = await requestJson("/api/studio/integrations/values");
+    applyStudioFormValues(data);
+    studioFormValuesHydrated.value = true;
+  } catch {
+    /* ignore form hydration failures; section cards still load independently */
+  }
+}
+
 async function loadStudioSummary() {
   try {
-    const res = await fetch(apiUrl("/api/studio/integrations"));
-    if (!res.ok) {
-      studioSummary.value = null;
-      return;
-    }
-    studioSummary.value = await res.json();
+    studioSummary.value = await requestJson("/api/studio/integrations");
   } catch {
     studioSummary.value = null;
   }
@@ -654,18 +773,16 @@ async function toggleLiveSyncMaster() {
   liveSyncMasterMsg.value = "";
   try {
     const next = !liveSyncMasterOn.value;
-    const res = await fetch(apiUrl("/api/studio/live-sync"), {
+    await requestJson("/api/studio/live-sync", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ master_enabled: next }),
     });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      const d = data.detail;
-      throw new Error(typeof d === "string" ? d : JSON.stringify(d));
-    }
     await loadStudioSummary();
     await reloadAllCloudConnectorConfigs();
+    liveSyncMasterMsg.value = next
+      ? "Live sync enabled for configured cloud sources."
+      : "Live sync paused for all cloud sources.";
   } catch (e) {
     liveSyncMasterMsg.value = e instanceof Error ? e.message : String(e);
   } finally {
@@ -675,12 +792,7 @@ async function toggleLiveSyncMaster() {
 
 async function loadLlmConfig() {
   try {
-    const res = await fetch(apiUrl("/api/llm/config"));
-    if (!res.ok) {
-      llmConfig.value = null;
-      return;
-    }
-    const data = await res.json();
+    const data = await requestJson("/api/llm/config");
     llmConfig.value = data;
     if (data.local) {
       llmForm.value.ollama_base = String(data.local.ollama_base || "");
@@ -701,6 +813,49 @@ async function loadLlmConfig() {
     }
   } catch {
     llmConfig.value = null;
+  }
+}
+
+async function syncSelectedAvatarState() {
+  const id = await syncSelectedAvatarFromServer();
+  if (id) selectedLiveAvatarId.value = id;
+}
+
+async function refreshStudioAdmin({ hydrateForms = false, announce = false } = {}) {
+  if (studioRefreshing.value) return;
+  studioRefreshing.value = true;
+  if (announce) {
+    setStudioPageStatus("Refreshing Studio from the server…", "muted");
+  }
+  try {
+    await Promise.all([
+      syncSelectedAvatarState(),
+      loadConfig(),
+      loadRagStatus(),
+      loadSharepointConfig(),
+      loadGoogleDriveConfig(),
+      loadDropboxConfig(),
+      loadS3Config(),
+      loadAzureBlobConfig(),
+      loadGcsConfig(),
+      loadStudioSummary(),
+      loadLlmConfig(),
+    ]);
+    if (hydrateForms || !studioFormValuesHydrated.value) {
+      await loadStudioFormValues();
+    }
+    studioReady.value = true;
+    studioLastUpdatedAt.value = new Date().toISOString();
+    if (announce) {
+      setStudioPageStatus("Studio is in sync with the server.", "ok");
+    }
+  } catch (e) {
+    setStudioPageStatus(
+      e instanceof Error ? e.message : "Unable to refresh Studio right now.",
+      "warn"
+    );
+  } finally {
+    studioRefreshing.value = false;
   }
 }
 
@@ -994,21 +1149,13 @@ async function clearStudioIntegration(section) {
     return;
   }
   try {
-    const res = await fetch(apiUrl(`/api/studio/integrations/${section}`), { method: "DELETE" });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      throw new Error(data.detail || "Clear failed");
-    }
-    await loadStudioSummary();
-    await loadSharepointConfig();
-    await loadGoogleDriveConfig();
-    await loadDropboxConfig();
-    await loadS3Config();
-    await loadAzureBlobConfig();
-    await loadGcsConfig();
-    await loadLlmConfig();
+    setStudioPageStatus(`Removing saved ${labels[section] || section} settings…`, "muted");
+    await requestJson(`/api/studio/integrations/${section}`, { method: "DELETE" });
+    studioFormValuesHydrated.value = false;
+    await refreshStudioAdmin({ hydrateForms: true });
+    setStudioPageStatus(`Removed saved ${labels[section] || section} settings.`, "ok");
   } catch (e) {
-    window.alert(e instanceof Error ? e.message : String(e));
+    setStudioPageStatus(e instanceof Error ? e.message : String(e), "warn");
   }
 }
 
@@ -1510,6 +1657,13 @@ async function saveRecording() {
 let syncSourcesPollId = null;
 let avatarVideoPollId = null;
 
+function onStudioVisibilityChange() {
+  if (!pageIsVisible()) return;
+  void refreshStudioAdmin();
+  void loadAvatarTasks();
+  void pollAvatarVideoJob();
+}
+
 function onAvatarVideoImage(ev) {
   const f = ev.target.files?.[0];
   ev.target.value = "";
@@ -1542,11 +1696,10 @@ function stopAvatarVideoPolling() {
 }
 
 async function pollAvatarVideoJob() {
-  if (!avatarVideoJobId.value) return;
+  if (!avatarVideoJobId.value || avatarVideoPollInFlight || !pageIsVisible()) return;
+  avatarVideoPollInFlight = true;
   try {
-    const res = await fetch(apiUrl(`/api/avatar/video/jobs/${avatarVideoJobId.value}`));
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.detail || data.error || `Status check failed (${res.status})`);
+    const data = await requestJson(`/api/avatar/video/jobs/${avatarVideoJobId.value}`);
     avatarVideoJobStatus.value = String(data.status || "");
     if (data.status === "succeeded") {
       avatarVideoUrl.value = apiUrl(`/api/avatar/video/jobs/${avatarVideoJobId.value}/video`);
@@ -1569,6 +1722,8 @@ async function pollAvatarVideoJob() {
     avatarVideoStatus.value = e instanceof Error ? e.message : String(e);
     stopAvatarVideoPolling();
     avatarVideoBusy.value = false;
+  } finally {
+    avatarVideoPollInFlight = false;
   }
 }
 
@@ -1609,30 +1764,16 @@ async function startAvatarVideo() {
 }
 
 onMounted(() => {
-  void syncSelectedAvatarFromServer().then((id) => {
-    if (id) selectedLiveAvatarId.value = id;
-  });
-  void loadConfig();
+  setStudioPageStatus("Loading saved Studio config…", "muted");
+  void refreshStudioAdmin({ hydrateForms: true });
   startAvatarTasksPolling();
   window.addEventListener("hologram-avatar-selected", onHologramAvatarSelected);
-  void loadRagStatus();
-  void loadSharepointConfig();
-  void loadGoogleDriveConfig();
-  void loadDropboxConfig();
-  void loadS3Config();
-  void loadAzureBlobConfig();
-  void loadGcsConfig();
-  void loadStudioSummary();
-  void loadLlmConfig();
+  if (typeof document !== "undefined") {
+    document.addEventListener("visibilitychange", onStudioVisibilityChange);
+  }
   syncSourcesPollId = window.setInterval(() => {
-    void loadSharepointConfig();
-    void loadGoogleDriveConfig();
-    void loadDropboxConfig();
-    void loadS3Config();
-    void loadAzureBlobConfig();
-    void loadGcsConfig();
-    void loadStudioSummary();
-    void loadLlmConfig();
+    if (!pageIsVisible()) return;
+    void refreshStudioAdmin();
   }, 12000);
 });
 
@@ -1640,6 +1781,9 @@ onUnmounted(() => {
   stopAvatarVideoPolling();
   stopAvatarTasksPolling();
   window.removeEventListener("hologram-avatar-selected", onHologramAvatarSelected);
+  if (typeof document !== "undefined") {
+    document.removeEventListener("visibilitychange", onStudioVisibilityChange);
+  }
   if (syncSourcesPollId != null) {
     window.clearInterval(syncSourcesPollId);
     syncSourcesPollId = null;
@@ -1673,8 +1817,35 @@ function formatIso(iso) {
         </nav>
         <div class="hero__title-row">
           <h1>Avatar Studio</h1>
+          <span v-if="studioReady && studioLastUpdatedAt" class="chip">
+            Updated {{ formatIso(studioLastUpdatedAt) }}
+          </span>
+          <span v-if="studioRefreshing" class="chip">Refreshing…</span>
         </div>
         <p class="hero__lede">Configure avatar, voice, and knowledge base.</p>
+        <div class="hero__toolbar">
+          <div class="actions hero__actions">
+            <button
+              type="button"
+              class="btn btn--secondary"
+              :disabled="studioRefreshing"
+              @click="refreshStudioAdmin({ announce: true })"
+            >
+              {{ studioRefreshing ? "Refreshing…" : "Refresh Studio" }}
+            </button>
+          </div>
+          <p
+            v-if="studioPageStatus"
+            class="status hero__status"
+            :class="{
+              'status--warn': studioPageStatusTone === 'warn',
+              'status--ok': studioPageStatusTone === 'ok',
+              'status--muted': studioPageStatusTone === 'muted',
+            }"
+          >
+            {{ studioPageStatus }}
+          </p>
+        </div>
       </header>
 
       <div class="studio-stack">
@@ -3605,6 +3776,23 @@ function formatIso(iso) {
   color: var(--muted);
 }
 
+.hero__toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.65rem 1rem;
+  margin-top: 0.9rem;
+}
+
+.hero__actions {
+  margin: 0;
+}
+
+.hero__status {
+  margin: 0;
+}
+
 .pill {
   display: inline-flex;
   align-items: center;
@@ -4023,6 +4211,10 @@ input[type="number"]:focus {
 
 .status--warn {
   color: #b45309;
+}
+
+.status--ok {
+  color: #047857;
 }
 
 .mini-check {

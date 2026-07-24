@@ -212,8 +212,8 @@ def find_high_confidence_match(user_query: str) -> dict[str, Any] | None:
 
         video_url = public_video_url(full)
         trace(
-            f"Video Q&A match: HIT id={item_id} → play cached video {video_url} "
-            f"(skip LiveTalking)"
+            f"Video Q&A match: HIT id={item_id} → reuse cached answer via WebRTC stream "
+            f"source={video_url}"
         )
         return {
             **full,
@@ -226,7 +226,7 @@ def find_high_confidence_match(user_query: str) -> dict[str, Any] | None:
             "vector_score": round(vector_score, 4),
             "match_threshold": threshold,
             "search_method": search_method,
-            "playback_mode": "cached_video",
+            "playback_mode": "webrtc_stream",
         }
 
     trace("Video Q&A match: no candidate met both scores → LiveTalking path")

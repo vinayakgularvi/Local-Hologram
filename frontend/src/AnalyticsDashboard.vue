@@ -2,6 +2,8 @@
 import { computed, onMounted, onUnmounted, ref } from "vue";
 
 const loading = ref(true);
+const refreshBusy = ref(false);
+const resetBusy = ref(false);
 const err = ref("");
 const summary = ref(null);
 const recent = ref([]);
@@ -9,7 +11,14 @@ const resetSecret = ref("");
 const resetMsg = ref("");
 const streamState = ref("connecting");
 const lastUpdatedAt = ref("");
+const streamSupported =
+  typeof window !== "undefined" && typeof window.EventSource !== "undefined";
+const STREAM_RECONNECT_MAX_MS = 30_000;
 let es = null;
+let reconnectTimer = null;
+let streamRetryCount = 0;
+let bootstrapRunId = 0;
+let analyticsMounted = false;
 
 function apiUrl(path) {
   const p = path.startsWith("/") ? path : `/${path}`;
@@ -25,6 +34,25 @@ function apiUrl(path) {
   return p;
 }
 
+function apiErrorMessage(data, status) {
+  const d = data?.detail;
+  if (typeof d === "string" && d.trim()) return d.trim();
+  if (Array.isArray(d)) {
+    const parts = d.map((x) => x?.msg || String(x)).filter(Boolean);
+    if (parts.length) return parts.join(" ");
+  }
+  if (typeof data?.error === "string" && data.error.trim()) return data.error.trim();
+  return `Request failed (${status})`;
+}
+
+async function fetchJson(path, init = {}) {
+  const headers = { Accept: "application/json", ...(init.headers || {}) };
+  const res = await fetch(apiUrl(path), { ...init, headers });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(apiErrorMessage(data, res.status));
+  return data;
+}
+
 function applySnapshot(payload) {
   summary.value = payload.summary || null;
   recent.value = Array.isArray(payload.recent) ? payload.recent : [];
@@ -33,29 +61,88 @@ function applySnapshot(payload) {
   loading.value = false;
 }
 
-async function loadBootstrap() {
-  loading.value = true;
+async function loadBootstrap({ showSpinner = true } = {}) {
+  const runId = ++bootstrapRunId;
+  if (showSpinner) loading.value = true;
+  refreshBusy.value = true;
   try {
-    const [s, r] = await Promise.all([
-      fetch(apiUrl("/api/analytics/summary")),
-      fetch(apiUrl("/api/analytics/voice-turns?limit=40")),
+    const [sumResult, rowsResult] = await Promise.allSettled([
+      fetchJson("/api/analytics/summary"),
+      fetchJson("/api/analytics/voice-turns?limit=40"),
     ]);
-    if (!s.ok) throw new Error(await s.text());
-    if (!r.ok) throw new Error(await r.text());
-    const sum = await s.json();
-    const rows = await r.json();
-    applySnapshot({ summary: sum, recent: rows.items || [] });
+
+    if (!analyticsMounted || runId !== bootstrapRunId) return false;
+
+    let nextSummary = summary.value;
+    let nextRecent = recent.value;
+    const loadErrors = [];
+
+    if (sumResult.status === "fulfilled") {
+      nextSummary = sumResult.value;
+    } else {
+      loadErrors.push(sumResult.reason instanceof Error ? sumResult.reason.message : String(sumResult.reason));
+    }
+
+    if (rowsResult.status === "fulfilled") {
+      nextRecent = Array.isArray(rowsResult.value?.items) ? rowsResult.value.items : [];
+    } else {
+      loadErrors.push(rowsResult.reason instanceof Error ? rowsResult.reason.message : String(rowsResult.reason));
+    }
+
+    if (!nextSummary && !nextRecent.length && loadErrors.length) {
+      throw new Error(loadErrors.join(" "));
+    }
+
+    applySnapshot({ summary: nextSummary, recent: nextRecent });
+    return true;
   } catch (e) {
+    if (!analyticsMounted || runId !== bootstrapRunId) return false;
     err.value = e instanceof Error ? e.message : String(e);
     loading.value = false;
+    return false;
+  } finally {
+    if (analyticsMounted && runId === bootstrapRunId) {
+      refreshBusy.value = false;
+    }
   }
 }
 
+function clearReconnectTimer() {
+  if (reconnectTimer != null) {
+    window.clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+}
+
+function closeStreamConnection() {
+  if (es) {
+    es.close();
+    es = null;
+  }
+}
+
+function scheduleStreamReconnect() {
+  if (!streamSupported || !analyticsMounted || reconnectTimer != null) return;
+  const delay = Math.min(STREAM_RECONNECT_MAX_MS, 1000 * 2 ** Math.min(streamRetryCount, 5));
+  streamRetryCount += 1;
+  reconnectTimer = window.setTimeout(() => {
+    reconnectTimer = null;
+    startStream();
+  }, delay);
+}
+
 function startStream() {
-  if (es) es.close();
+  if (!streamSupported) {
+    streamState.value = "unsupported";
+    return;
+  }
+  clearReconnectTimer();
+  closeStreamConnection();
   streamState.value = "connecting";
   es = new EventSource(apiUrl("/api/analytics/stream"));
   es.onopen = () => {
+    if (!analyticsMounted) return;
+    streamRetryCount = 0;
     streamState.value = "live";
   };
   es.onmessage = (ev) => {
@@ -69,23 +156,43 @@ function startStream() {
     }
   };
   es.onerror = () => {
+    if (!analyticsMounted) return;
+    closeStreamConnection();
     streamState.value = "reconnecting";
+    scheduleStreamReconnect();
   };
 }
 
 function stopStream() {
-  if (es) {
-    es.close();
-    es = null;
+  clearReconnectTimer();
+  closeStreamConnection();
+}
+
+async function refreshDashboard({ restartStream = false, message = "" } = {}) {
+  const loaded = await loadBootstrap({ showSpinner: !summary.value && !recent.value.length });
+  if (restartStream) {
+    streamRetryCount = 0;
+    startStream();
   }
+  if (message) resetMsg.value = message;
+  return loaded;
+}
+
+function retryStream() {
+  resetMsg.value = "";
+  streamRetryCount = 0;
+  startStream();
 }
 
 onMounted(async () => {
-  await loadBootstrap();
+  analyticsMounted = true;
+  await refreshDashboard();
   startStream();
 });
 
 onUnmounted(() => {
+  analyticsMounted = false;
+  bootstrapRunId += 1;
   stopStream();
 });
 
@@ -300,26 +407,29 @@ const totalSentenceRows = computed(() =>
 
 async function submitReset() {
   resetMsg.value = "";
-  if (!resetSecret.value.trim()) {
-    resetMsg.value = "Enter the configured reset secret.";
+  if (resetBusy.value || refreshBusy.value) {
     return;
   }
+  if (!resetSecret.value.trim()) {
+    await refreshDashboard({ restartStream: true, message: "Analytics refreshed." });
+    return;
+  }
+  resetBusy.value = true;
   try {
-    const res = await fetch(apiUrl("/api/analytics/reset"), {
+    const data = await fetchJson("/api/analytics/reset", {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify({ secret: resetSecret.value.trim() }),
     });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      const d = data.detail;
-      const msg = Array.isArray(d) ? d.map((x) => x.msg || x).join(" ") : d;
-      throw new Error(msg || res.statusText || "Reset failed");
-    }
-    resetMsg.value = `Cleared ${data.cleared ?? 0} record(s).`;
     resetSecret.value = "";
+    await refreshDashboard({
+      restartStream: true,
+      message: `Cleared ${data.cleared ?? 0} record(s).`,
+    });
   } catch (e) {
     resetMsg.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    resetBusy.value = false;
   }
 }
 </script>
@@ -329,16 +439,46 @@ async function submitReset() {
     <div class="dash__head">
       <div class="dash__head-main">
         <h1 class="dash__title">Analytics</h1>
-        <nav class="dash__nav" aria-label="App sections">
-          <router-link class="dash-link dash-link--ghost" to="/hologram">Live hologram</router-link>
-          <router-link class="dash-link dash-link--ghost" to="/avatar">Avatar Studio</router-link>
-          <router-link class="dash-link dash-link--ghost" to="/video-rag">Video RAG</router-link>
-        </nav>
+        <div class="dash__head-tools">
+          <nav class="dash__nav" aria-label="App sections">
+            <router-link class="dash-link dash-link--ghost" to="/hologram">Live hologram</router-link>
+            <router-link class="dash-link dash-link--ghost" to="/avatar">Avatar Studio</router-link>
+            <router-link class="dash-link dash-link--ghost" to="/video-rag">Video RAG</router-link>
+          </nav>
+          <div class="dash__actions">
+            <button
+              type="button"
+              class="dash-btn dash-btn--ghost"
+              :disabled="refreshBusy || resetBusy"
+              @click="refreshDashboard({ restartStream: false })"
+            >
+              {{ refreshBusy ? "Refreshing…" : "Refresh" }}
+            </button>
+            <button
+              v-if="streamSupported"
+              type="button"
+              class="dash-btn dash-btn--ghost"
+              :disabled="resetBusy"
+              @click="retryStream"
+            >
+              {{ streamState === "live" ? "Reconnect stream" : "Retry stream" }}
+            </button>
+          </div>
+        </div>
       </div>
       <div class="dash__live">
-        <span class="dash__dot" :class="`dash__dot--${streamState}`" />
+        <span v-if="streamSupported" class="dash__dot" :class="`dash__dot--${streamState}`" />
+        <span v-else class="dash__dot dash__dot--unsupported" />
         <span>
-          {{ streamState === "live" ? "Live updates" : streamState === "connecting" ? "Connecting stream…" : "Reconnecting…" }}
+          {{
+            !streamSupported
+              ? "Live stream unavailable in this browser"
+              : streamState === "live"
+                ? "Live updates"
+                : streamState === "connecting"
+                  ? "Connecting stream…"
+                  : "Reconnecting…"
+          }}
         </span>
         <span v-if="lastUpdatedAt" class="dash__updated">Last update: {{ fmtTs(lastUpdatedAt) }}</span>
       </div>
@@ -522,7 +662,7 @@ async function submitReset() {
     <section class="reset-zone">
       <h2 class="reset-zone__title">Reset data</h2>
       <p class="reset-zone__hint">
-        Requires <code>ANALYTICS_RESET_SECRET</code> on the server. Leave empty to only refresh stats.
+        Requires <code>ANALYTICS_RESET_SECRET</code> on the server. Leave empty to refresh the dashboard without clearing stored analytics.
       </p>
       <div class="reset-zone__row">
         <input
@@ -532,7 +672,20 @@ async function submitReset() {
           placeholder="Reset secret"
           autocomplete="off"
         />
-        <button type="button" class="btn btn--danger" @click="submitReset">Clear all analytics</button>
+        <button
+          type="button"
+          class="btn btn--danger"
+          :disabled="resetBusy || refreshBusy"
+          @click="submitReset"
+        >
+          {{
+            resetBusy
+              ? "Working…"
+              : resetSecret.trim()
+                ? "Clear all analytics"
+                : "Refresh analytics"
+          }}
+        </button>
       </div>
       <p v-if="resetMsg" class="reset-zone__msg">{{ resetMsg }}</p>
     </section>
@@ -577,10 +730,24 @@ async function submitReset() {
   margin-bottom: 0.6rem;
 }
 
+.dash__head-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.55rem 0.75rem;
+}
+
 .dash__nav {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
+  gap: 0.45rem;
+}
+
+.dash__actions {
+  display: flex;
+  flex-wrap: wrap;
   gap: 0.45rem;
 }
 
@@ -639,12 +806,49 @@ async function submitReset() {
   box-shadow: 0 0 0 4px rgba(217, 119, 6, 0.15);
 }
 
+.dash__dot--unsupported {
+  background: #64748b;
+  box-shadow: 0 0 0 4px rgba(100, 116, 139, 0.12);
+}
+
 .dash__title {
   margin: 0;
   font-size: clamp(1.55rem, 2.7vw, 2.4rem);
   font-weight: 700;
   color: #111827;
   letter-spacing: 0.01em;
+}
+
+.dash-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 2.2rem;
+  padding: 0.45rem 0.9rem;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  background: #fff;
+  color: #0f172a;
+  font: inherit;
+  font-size: 0.82rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, transform 0.12s ease;
+}
+
+.dash-btn:hover:not(:disabled) {
+  background: #f8fafc;
+  border-color: rgba(20, 184, 166, 0.4);
+  transform: translateY(-1px);
+}
+
+.dash-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.dash-btn--ghost {
+  background: rgba(255, 255, 255, 0.78);
 }
 
 .dash__err {

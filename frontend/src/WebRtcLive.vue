@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted, onUnmounted, nextTick } from "vue";
+import { ref, computed, onMounted, onUnmounted } from "vue";
 import {
   getSelectedAvatarId,
   SELECTED_AVATAR_STORAGE_KEY,
@@ -20,81 +20,21 @@ const sessionId = ref(getHologramSessionId() || "0");
 const webrtcError = ref("");
 
 const videoEl = ref(null);
-const idleLoopEl = ref(null);
-const cachedVideoEl = ref(null);
-const cachedVideoActive = ref(false);
-/** WebRTC lip-sync overlay — only while voice-stream answer audio is playing. */
+/** Tracks whether WebRTC answer playback is active for end-of-playback timing. */
 const voiceStreamOverlayActive = ref(false);
-const webrtcOverlayVisible = computed(() => voiceStreamOverlayActive.value);
-/** Bumps when an in-flight startIdleLoop() should abort (e.g. new src load). */
-let idleLoopGeneration = 0;
 const audioEl = ref(null);
 
-/** Normalize env path → browser URL (files in frontend/public/ are served at /). */
-function resolveIdleLoopVideoUrl(raw) {
-  const s = String(raw || "").trim();
-  if (!s) return "/Videofile.mp4";
-  if (/^https?:\/\//i.test(s)) return s;
-  let path = s.replace(/\\/g, "/");
-  const fromPublicDir = path.match(/(?:^|\/)public\/(.+)$/i);
-  if (fromPublicDir) path = fromPublicDir[1];
-  path = path.replace(/^\.\//, "").replace(/^frontend\/public\//i, "");
-  if (!path.startsWith("/")) path = `/${path}`;
-  return path;
-}
-
-const IDLE_LOOP_VIDEO_SRC = resolveIdleLoopVideoUrl(
-  import.meta.env.VITE_IDLE_LOOP_VIDEO || "/Videofile.mp4"
-);
-const IDLE_LOOP_FALLBACK_SRC = resolveIdleLoopVideoUrl("/Videofile.mp4");
-/** Runtime override from GET /api/webrtc (Docker / root .env without frontend rebuild). */
-let idleLoopVideoFromServer = null;
-/** Set when user picks an avatar in Studio → frontend/public/{id}.mp4 */
-let idleLoopVideoFromAvatar = null;
-
-function getIdleLoopVideoSrc() {
-  return idleLoopVideoFromAvatar || idleLoopVideoFromServer || IDLE_LOOP_VIDEO_SRC;
-}
-
-async function hologramMp4Exists(url) {
-  try {
-    // Vite dev server returns 405 for HEAD on public/ MP4s — use a tiny ranged GET instead.
-    const ranged = await fetch(url, {
-      method: "GET",
-      headers: { Range: "bytes=0-0" },
-    });
-    if (ranged.ok || ranged.status === 206) return true;
-    if (ranged.status !== 405 && ranged.status !== 416) return false;
-    const full = await fetch(url, { method: "GET" });
-    return full.ok;
-  } catch {
-    return false;
-  }
-}
-
-async function applySelectedAvatarIdleVideo(avatarId) {
-  const id = String(avatarId || "").trim();
-  if (!id) return;
-  const path = resolveIdleLoopVideoUrl(`/${id}.mp4`);
-  if (!(await hologramMp4Exists(path))) {
-    console.warn("[idle-loop] avatar mp4 missing, using default", { path, id });
-    idleLoopVideoFromAvatar = null;
-    void ensureIdleLoopPlaying(IDLE_LOOP_FALLBACK_SRC);
-    return;
-  }
-  if (idleLoopVideoFromAvatar === path) return;
-  idleLoopVideoFromAvatar = path;
-  idleLoopGeneration += 1;
-  void ensureIdleLoopPlaying(path);
-}
-
 function onHologramAvatarSelected(ev) {
-  void applySelectedAvatarIdleVideo(ev?.detail?.avatarId || getSelectedAvatarId());
+  const avatarId = String(ev?.detail?.avatarId || getSelectedAvatarId() || "").trim();
+  if (!avatarId) return;
+  lastPolledSelectedAvatarId = avatarId;
+  applySelectedAvatarToCurrentSession(avatarId);
 }
 
 function onHologramAvatarStorage(ev) {
   if (ev.key !== SELECTED_AVATAR_STORAGE_KEY || !ev.newValue) return;
-  void applySelectedAvatarIdleVideo(ev.newValue);
+  lastPolledSelectedAvatarId = ev.newValue;
+  applySelectedAvatarToCurrentSession(ev.newValue);
 }
 
 /** @type {RTCPeerConnection | null} */
@@ -147,7 +87,6 @@ const transcribeConfigured = ref(false);
 const transcribeBackend = ref("parakeet");
 const micListening = ref(false);
 const voiceThinking = ref(false);
-const mediaVisible = ref(false);
 const ENV_MIC_LANG_RAW = String(import.meta.env.VITE_VOICE_DEFAULT_LANG || "en-US").trim();
 /** Voice pipeline API (default: TTS → humanaudio; does not use /api/voice-turn). */
 const VOICE_PIPELINE_API = String(
@@ -723,116 +662,14 @@ function resolveMicLang() {
   return preferred || navigator.language || "en-US";
 }
 
-function showMedia() {
-  mediaVisible.value = true;
-  nextTick(() => {
-    void ensureIdleLoopPlaying();
-  });
-}
-
-/** No-op: selected avatar / idle MP4 keeps playing under WebRTC and cached Q&A overlays. */
-function pauseIdleLoop() {}
-
-async function ensureIdleLoopPlaying(explicitPath = null) {
-  if (!mediaVisible.value) return;
-  const el = idleLoopEl.value;
-  const path = explicitPath || getIdleLoopVideoSrc();
-  if (!el || !path) return;
-  const current = String(el.currentSrc || el.src || "");
-  const onPath =
-    current.endsWith(path) || current.includes(path) || current.includes(encodeURI(path));
-  if (!onPath) {
-    await startIdleLoop(path);
-    return;
-  }
-  if (el.paused || el.ended) {
-    try {
-      await el.play();
-    } catch {
-      await startIdleLoop(path);
-    }
-  }
-}
-
-async function startIdleLoop(explicitPath = null) {
-  const el = idleLoopEl.value;
-  const path = explicitPath || getIdleLoopVideoSrc();
-  if (!el || !path) return;
-  const generation = idleLoopGeneration;
-  const switching = !el.src || (!el.src.endsWith(path) && !el.src.includes(path));
-  if (switching) {
-    el.loop = true;
-    el.muted = true;
-    el.playsInline = true;
-    el.setAttribute("webkit-playsinline", "true");
-    el.src = path;
-    el.load();
-    try {
-      await new Promise((resolve, reject) => {
-        const timer = window.setTimeout(() => {
-          cleanup();
-          reject(new Error("idle loop load timeout"));
-        }, 15000);
-        const onReady = () => {
-          cleanup();
-          resolve();
-        };
-        const onErr = () => {
-          cleanup();
-          reject(new Error(`idle loop failed to load: ${path}`));
-        };
-        const cleanup = () => {
-          window.clearTimeout(timer);
-          el.removeEventListener("loadeddata", onReady);
-          el.removeEventListener("canplay", onReady);
-          el.removeEventListener("error", onErr);
-        };
-        if (el.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
-          cleanup();
-          resolve();
-          return;
-        }
-        el.addEventListener("loadeddata", onReady, { once: true });
-        el.addEventListener("canplay", onReady, { once: true });
-        el.addEventListener("error", onErr, { once: true });
-      });
-    } catch (e) {
-      console.warn("[idle-loop]", e.message, { path, resolvedSrc: el.currentSrc || el.src });
-      if (path !== IDLE_LOOP_FALLBACK_SRC) {
-        idleLoopVideoFromAvatar = null;
-        return startIdleLoop(IDLE_LOOP_FALLBACK_SRC);
-      }
-      return;
-    }
-  }
-  if (generation !== idleLoopGeneration) {
-    return;
-  }
-  try {
-    await el.play();
-    if (generation !== idleLoopGeneration) {
-      return;
-    }
-    console.info("[idle-loop] playing (base layer)", path);
-  } catch (e) {
-    console.warn("[idle-loop] playback failed", path, e);
-    if (path !== IDLE_LOOP_FALLBACK_SRC) {
-      idleLoopVideoFromAvatar = null;
-      return startIdleLoop(IDLE_LOOP_FALLBACK_SRC);
-    }
-  }
-}
-
 function showVoiceStreamOverlay() {
   if (voiceStreamOverlayActive.value) return;
   voiceStreamOverlayActive.value = true;
-  void ensureIdleLoopPlaying();
 }
 
 function hideVoiceStreamOverlay() {
   if (!voiceStreamOverlayActive.value) return;
   voiceStreamOverlayActive.value = false;
-  void ensureIdleLoopPlaying();
 }
 
 function teardownAnswerAudioAnalyser() {
@@ -1032,22 +869,12 @@ function applyWebrtcStatusPayload(d) {
   ) {
     transcribeBackend.value = "parakeet";
   }
-  if (d.idle_loop_video) {
-    const resolved = resolveIdleLoopVideoUrl(d.idle_loop_video);
-    if (resolved !== idleLoopVideoFromServer) {
-      idleLoopVideoFromServer = resolved;
-      idleLoopGeneration += 1;
-      if (mediaVisible.value && !idleLoopVideoFromAvatar) {
-        void startIdleLoop();
-      }
-    }
-  }
   const remoteAvatar = String(d.selected_avatar_id || "").trim();
   if (remoteAvatar && remoteAvatar !== lastPolledSelectedAvatarId) {
     lastPolledSelectedAvatarId = remoteAvatar;
     if (remoteAvatar !== getSelectedAvatarId()) {
       void syncSelectedAvatarFromServer().then((id) => {
-        if (id) void applySelectedAvatarIdleVideo(id);
+        if (id) applySelectedAvatarToCurrentSession(id);
       });
     }
   }
@@ -1117,6 +944,13 @@ async function applySessionAvatar(avatarId, sessionid) {
   } catch (e) {
     console.warn("[session/avatar] error:", e);
   }
+}
+
+function applySelectedAvatarToCurrentSession(avatarId) {
+  const id = String(avatarId || "").trim();
+  const sid = String(sessionId.value || getHologramSessionId() || "").trim();
+  if (!id || !started.value || !sid || sid === "0") return;
+  void applySessionAvatar(id, sid);
 }
 
 async function negotiate() {
@@ -1647,9 +1481,8 @@ function liveTalkingSessionIdPayload() {
   return { sessionid: sid };
 }
 
-/** Stop LiveTalking speech + local cached Q&A clip when user taps mic to interrupt. */
+/** Stop LiveTalking speech when user taps mic to interrupt. */
 async function interruptAvatarSpeech() {
-  stopCachedVideoQa();
   deactivateWebRtcStage();
   clearWebRtcTtfaPending();
   pendingVoiceAnalytics = null;
@@ -2296,7 +2129,6 @@ async function runVoicePipeline(userText, stt = null) {
   webrtcError.value = "";
   clearWebRtcTtfaPending();
   pendingVoiceAnalytics = null;
-  void ensureIdleLoopPlaying();
   const requestSentMs = performance.now();
   beginVoiceTurnTtfaWatch(requestSentMs);
   const sid = String(sessionId.value || getHologramSessionId() || "").trim();
@@ -2332,39 +2164,6 @@ async function runVoicePipeline(userText, stt = null) {
     const data = await res.json();
     const voiceTurnCompleteMs = performance.now();
     const clientVoiceTurnMs = Math.max(0, voiceTurnCompleteMs - requestSentMs);
-
-    if (data.video_qa_cached?.video_url) {
-      deactivateWebRtcStage();
-      const cached = data.video_qa_cached;
-      const answer = String(cached.answer || data.answer || "").trim();
-      clearCaptionHideTimer();
-      finalTranscript.value = "";
-      interimTranscript.value = "";
-      voiceThinking.value = false;
-      clearWebRtcTtfaPending();
-      pendingVoiceAnalytics = null;
-      try {
-        await playCachedVideoQa(cached);
-        await nextTick();
-        applyShowImageFromVoiceTurn(data);
-      } catch {
-        clearFeaturedMenuImage();
-        if (answer && VOICE_PIPELINE_API.includes("voice-turn")) {
-          const sidCached = String(sessionId.value || "").trim();
-          if (sidCached && sidCached !== "0") {
-            postHuman(stripReceiptForSpeech(answer));
-          }
-        }
-      }
-      let receipt = data.receipt && typeof data.receipt === "object" ? data.receipt : null;
-      if (!receipt?.items?.length && answer) {
-        receipt = tryParseReceiptFromAnswer(answer);
-      }
-      if (receipt?.items?.length) {
-        liveBill.value = { items: receipt.items };
-      }
-      return;
-    }
 
     const answer = String(data.answer || "").trim();
     applyShowImageFromVoiceTurn(data);
@@ -2904,101 +2703,6 @@ function showCaptionThenHide(text) {
   }, CAPTION_HIDE_MS);
 }
 
-function stopCachedVideoQa() {
-  cachedVideoActive.value = false;
-  const el = cachedVideoEl.value;
-  if (!el) return;
-  el.pause();
-  el.removeAttribute("src");
-  el.load();
-  void ensureIdleLoopPlaying();
-}
-
-function waitCachedVideoReady(el, timeoutMs = 12000) {
-  return new Promise((resolve, reject) => {
-    if (el.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
-      resolve();
-      return;
-    }
-    const timer = window.setTimeout(() => {
-      cleanup();
-      reject(new Error("cached video load timeout"));
-    }, timeoutMs);
-    const onReady = () => {
-      cleanup();
-      resolve();
-    };
-    const onErr = () => {
-      cleanup();
-      reject(new Error("cached video failed to load"));
-    };
-    const cleanup = () => {
-      window.clearTimeout(timer);
-      el.removeEventListener("loadeddata", onReady);
-      el.removeEventListener("canplay", onReady);
-      el.removeEventListener("error", onErr);
-    };
-    el.addEventListener("loadeddata", onReady, { once: true });
-    el.addEventListener("canplay", onReady, { once: true });
-    el.addEventListener("error", onErr, { once: true });
-  });
-}
-
-function resolveVideoPlaybackUrl(videoUrlOrPath, itemId) {
-  const raw = String(videoUrlOrPath || "").trim();
-  if (raw) {
-    if (/^https?:\/\//i.test(raw)) return raw;
-    const path = raw.startsWith("/") ? raw : `/${raw}`;
-    return signalingUrl(path);
-  }
-  if (itemId) return signalingUrl(`/api/video-qa/${itemId}/video`);
-  return "";
-}
-
-async function playCachedVideoQa(hit) {
-  const url = resolveVideoPlaybackUrl(hit?.video_url, hit?.id);
-  if (!url) return;
-  const el = cachedVideoEl.value;
-  if (!el) return;
-
-  pauseIdleLoop();
-  const switching = !el.src || el.src !== url;
-  if (switching) {
-    el.pause();
-    el.src = url;
-    el.load();
-  }
-  cachedVideoActive.value = true;
-  el.currentTime = 0;
-  void ensureIdleLoopPlaying();
-
-  await waitCachedVideoReady(el);
-
-  const tryPlay = async (muted) => {
-    el.muted = muted;
-    await el.play();
-  };
-
-  try {
-    await tryPlay(false);
-  } catch (e1) {
-    try {
-      await tryPlay(true);
-      el.muted = false;
-    } catch (e2) {
-      console.warn("[video-qa] cached playback failed", e1, e2);
-      stopCachedVideoQa();
-      throw e2;
-    }
-  }
-
-  console.info("[video-qa] playing cached clip behind featured image", {
-    id: hit?.id,
-    question_score: hit?.question_score,
-    answer_score: hit?.answer_score,
-  });
-}
-
 const CAPTION_STATUS_PHRASES = new Set([
   "listening…",
   "listening...",
@@ -3078,23 +2782,15 @@ function formatBillMoney(n) {
   return x.toFixed(2);
 }
 
-let idleKeepaliveId = null;
-
 onMounted(() => {
-  showMedia();
   void syncSelectedAvatarFromServer().then((id) => {
     const avatarId = id || getSelectedAvatarId();
     if (avatarId) {
       lastPolledSelectedAvatarId = avatarId;
-      void applySelectedAvatarIdleVideo(avatarId);
-    } else {
-      void ensureIdleLoopPlaying();
+      applySelectedAvatarToCurrentSession(avatarId);
     }
   });
   webrtcStatusPollId = window.setInterval(() => void refreshWebrtcStatus(), 8000);
-  idleKeepaliveId = window.setInterval(() => {
-    void ensureIdleLoopPlaying();
-  }, 1200);
   window.addEventListener("hologram-avatar-selected", onHologramAvatarSelected);
   window.addEventListener("storage", onHologramAvatarStorage);
   void connect();
@@ -3104,10 +2800,6 @@ onUnmounted(() => {
   if (webrtcStatusPollId != null) {
     window.clearInterval(webrtcStatusPollId);
     webrtcStatusPollId = null;
-  }
-  if (idleKeepaliveId != null) {
-    window.clearInterval(idleKeepaliveId);
-    idleKeepaliveId = null;
   }
   window.removeEventListener("hologram-avatar-selected", onHologramAvatarSelected);
   window.removeEventListener("storage", onHologramAvatarStorage);
@@ -3130,64 +2822,14 @@ onUnmounted(() => {
       <router-link class="panel-nav__link" to="/video-rag">Video RAG</router-link>
     </nav>
 
-    <div v-if="!mediaVisible" class="lang-picker">
-      <label class="lang-picker__label" for="top-lang-select">Language</label>
-      <select id="top-lang-select" class="lang-picker__select" v-model="selectedMicLang">
-        <option v-for="opt in micLangOptions" :key="opt.value" :value="opt.value">
-          {{ opt.label }}
-        </option>
-      </select>
-    </div>
     <div class="media-stack">
       <div
         class="video-wrap"
         :class="{
           'video-wrap--featured-image': SHOW_IMAGE_ENABLED && featuredMenuImages.length > 0,
-          'video-wrap--cached-playing': cachedVideoActive,
-          'video-wrap--webrtc-overlay': webrtcOverlayVisible,
         }"
       >
-        <div
-          v-if="!mediaVisible"
-          class="start-overlay"
-          role="dialog"
-          aria-modal="true"
-          aria-label="Start media"
-        >
-          <div class="start-overlay__card">
-            <img
-              class="start-overlay__logo"
-              src="/favicon.svg"
-              alt="App logo"
-              width="56"
-              height="56"
-            />
-            <h2 class="start-overlay__title">Ready to view media</h2>
-            <p class="start-overlay__sub">
-              Connection starts in the background automatically. Tap Start to view media.
-            </p>
-            <button type="button" class="start-overlay__btn" @click="showMedia">
-              {{ started ? "Start" : "Start (stream is connecting…)" }}
-            </button>
-          </div>
-        </div>
-
-        <video
-          ref="idleLoopEl"
-          class="video video--idle-loop"
-          autoplay
-          playsinline
-          muted
-          loop
-        />
         <video ref="videoEl" class="video video--webrtc" autoplay playsinline />
-        <video
-          ref="cachedVideoEl"
-          class="video video--cached"
-          :class="{ 'video--cached-active': cachedVideoActive }"
-          playsinline
-          @ended="stopCachedVideoQa"
-        />
         <div class="video-rail video-rail--left" aria-hidden="true" />
         <div class="video-rail video-rail--right" aria-hidden="true" />
         <audio ref="audioEl" class="sr-only" autoplay />
@@ -3233,7 +2875,6 @@ onUnmounted(() => {
           class="menu-featured"
           :class="{
             'menu-featured--multi': featuredMenuImages.length > 1,
-            'menu-featured--over-cached-video': cachedVideoActive,
           }"
           role="group"
           aria-label="Featured menu items"
@@ -3500,36 +3141,9 @@ onUnmounted(() => {
   object-position: center center;
 }
 
-/* Base layer: selected avatar / idle MP4 always visible; WebRTC + cached Q&A stack on top */
-.video--idle-loop {
-  z-index: 0;
-  opacity: 1;
-  visibility: visible;
-  pointer-events: none;
-}
-
+/* WebRTC stream is the only video layer on stage. */
 .video--webrtc {
   z-index: 1;
-  opacity: 0;
-  visibility: hidden;
-  pointer-events: none;
-  transition: opacity 0.18s ease;
-}
-
-.video-wrap--webrtc-overlay .video--webrtc {
-  opacity: 1;
-  visibility: visible;
-}
-
-.video--cached {
-  z-index: 2;
-  opacity: 0;
-  visibility: hidden;
-  pointer-events: none;
-  transition: opacity 0.2s ease;
-}
-
-.video--cached-active {
   opacity: 1;
   visibility: visible;
   pointer-events: none;
@@ -3860,16 +3474,6 @@ onUnmounted(() => {
   transform-style: preserve-3d;
   filter: none;
   box-shadow: none;
-}
-
-/* Full-screen cached clip is bright — screen blend washes out; use normal + shadow */
-.menu-featured--over-cached-video {
-  z-index: 12;
-}
-
-.menu-featured--over-cached-video .menu-featured__img {
-  mix-blend-mode: normal;
-  filter: drop-shadow(0 12px 32px rgba(0, 0, 0, 0.55));
 }
 
 .menu-featured__caption {

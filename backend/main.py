@@ -3356,7 +3356,7 @@ async def _voice_pipeline(body: VoiceTurnBody, *, humanaudio_only: bool = False)
         video_hit = await asyncio.to_thread(find_high_confidence_match, user_text)
     if video_hit:
         hologram_trace(
-            f"voice-turn: CACHED VIDEO path id={video_hit.get('id')} "
+            f"{pipeline_label}: CACHED ANSWER path id={video_hit.get('id')} "
             f"q={video_hit.get('question_score')} a={video_hit.get('answer_score')}"
         )
         answer = str(video_hit.get("answer") or "").strip()
@@ -3403,6 +3403,71 @@ async def _voice_pipeline(body: VoiceTurnBody, *, humanaudio_only: bool = False)
                 stt_first_chunk_latency_ms=stt_first_ms,
                 stt_chunk_count=stt_chunks,
             )
+        speak_len = len(speak_text.strip())
+        human_dispatched = False
+        if (
+            humanaudio_only
+            and WEBRTC_SIGNALING_BASE
+            and speak_len > 0
+            and sid
+            and sid != "0"
+        ):
+            asyncio.create_task(
+                _enqueue_livetalking_human(
+                    speak_text,
+                    sid,
+                    analytics_turn_id=analytics_turn_id,
+                )
+            )
+            human_dispatched = True
+            if analytics_turn_id is not None:
+                mark_voice_turn_human_dispatched(analytics_turn_id)
+                schedule_sync_avatar_turn(analytics_turn_id)
+            hologram_trace(
+                "voice-stream: cached answer queued TTS→humanaudiowithpath "
+                f"sessionid={sid} speak_chars={speak_len}"
+            )
+            logger.info(
+                "voice-stream: cached answer queued TTS→humanaudiowithpath "
+                "sessionid=%s speak_chars=%d",
+                sid,
+                speak_len,
+            )
+        elif (
+            not humanaudio_only
+            and VOICE_DISPATCH_HUMAN
+            and WEBRTC_SIGNALING_BASE
+            and speak_len > 0
+            and sid
+            and sid != "0"
+        ):
+            asyncio.create_task(
+                _enqueue_livetalking_human(
+                    speak_text,
+                    sid,
+                    analytics_turn_id=analytics_turn_id,
+                )
+            )
+            human_dispatched = True
+            if analytics_turn_id is not None:
+                mark_voice_turn_human_dispatched(analytics_turn_id)
+                schedule_sync_avatar_turn(analytics_turn_id)
+            hologram_trace(
+                f"voice-turn: cached answer queued LiveTalking /human sessionid={sid} "
+                f"speak_chars={speak_len}"
+            )
+            logger.info(
+                "voice-turn: cached answer queued LiveTalking /human "
+                "sessionid=%s speak_chars=%d",
+                sid,
+                speak_len,
+            )
+        elif speak_len > 0 and (not sid or sid == "0"):
+            hologram_trace("voice-turn: cached answer skip /human (no valid sessionid)")
+            logger.warning(
+                "voice-turn: cached answer skip server /human — invalid sessionid=%r",
+                sid or None,
+            )
         if analytics_turn_id is not None:
             await _publish_analytics_snapshot()
         schedule_record_avatar_turn(
@@ -3412,11 +3477,11 @@ async def _voice_pipeline(body: VoiceTurnBody, *, humanaudio_only: bool = False)
             answer=answer,
             speak_text=speak_text,
             rag=rag_meta,
-            human_dispatched=False,
+            human_dispatched=human_dispatched,
             total_request_ms=round(total_ms, 1),
             analytics={
                 "heard_chars": len(user_text),
-                "answer_chars": len(speak_text.strip()),
+                "answer_chars": speak_len,
                 "total_request_ms": round(total_ms, 1),
                 "rag_latency_ms": round(total_ms, 1),
                 "stt_latency_ms": stt_ms,
@@ -3425,8 +3490,8 @@ async def _voice_pipeline(body: VoiceTurnBody, *, humanaudio_only: bool = False)
             },
         )
         hologram_trace(
-            f"voice-turn: DONE cached video total_ms={round(total_ms, 1)} "
-            f"human_dispatched=False"
+            f"{pipeline_label}: DONE cached answer total_ms={round(total_ms, 1)} "
+            f"human_dispatched={human_dispatched}"
         )
         logger.info(
             "voice-turn: Video Q&A cache hit id=%s q_score=%s a_score=%s",
@@ -3444,12 +3509,11 @@ async def _voice_pipeline(body: VoiceTurnBody, *, humanaudio_only: bool = False)
             "rag": rag_meta,
             "analytics_turn_id": analytics_turn_id,
             "total_request_ms": round(total_ms, 1),
-            "human_dispatched": False,
+            "human_dispatched": human_dispatched,
             "video_qa_cached": {
                 "id": video_hit.get("id"),
                 "question": video_hit.get("question") or user_text,
                 "answer": answer,
-                "video_url": video_hit.get("video_url"),
                 "question_score": video_hit.get("question_score"),
                 "answer_score": video_hit.get("answer_score"),
                 "vector_score": video_hit.get("vector_score"),
@@ -4677,6 +4741,109 @@ async def llm_config():
 async def studio_integrations_status():
     """Which connector settings are saved locally (no secret values)."""
     return studio_integrations_summary()
+
+
+def _studio_integrations_form_values() -> dict[str, Any]:
+    """Non-secret saved values that Studio can safely rehydrate into admin forms."""
+
+    def section_values(section: str) -> dict[str, str]:
+        try:
+            return studio_read_section_strings(section)
+        except Exception:
+            return {}
+
+    sp = section_values("sharepoint")
+    gd = section_values("google_drive")
+    dbx = section_values("dropbox")
+    s3 = section_values("s3")
+    az = section_values("azure_blob")
+    gcs = section_values("gcs")
+    pinecone = section_values("pinecone")
+    milvus = section_values("milvus")
+    weaviate = section_values("weaviate")
+    qdrant = section_values("qdrant")
+    elastic = section_values("elasticsearch")
+    azure_ai = section_values("azure_ai_search")
+
+    return {
+        "sharepoint": {
+            "azure_tenant_id": sp.get("AZURE_TENANT_ID", ""),
+            "azure_client_id": sp.get("AZURE_CLIENT_ID", ""),
+            "sharepoint_site_url": sp.get("SHAREPOINT_SITE_URL", ""),
+            "sharepoint_folder_path": sp.get("SHAREPOINT_FOLDER_PATH", ""),
+            "has_client_secret": bool(sp.get("AZURE_CLIENT_SECRET", "")),
+        },
+        "google_drive": {
+            "folder_id": gd.get("GOOGLE_DRIVE_FOLDER_ID", ""),
+            "credentials_path": gd.get("GOOGLE_DRIVE_CREDENTIALS_PATH", ""),
+        },
+        "dropbox": {
+            "dropbox_folder_path": dbx.get("DROPBOX_FOLDER_PATH", ""),
+            "dropbox_app_key": dbx.get("DROPBOX_APP_KEY", ""),
+            "has_access_token": bool(dbx.get("DROPBOX_ACCESS_TOKEN", "")),
+            "has_refresh_token": bool(dbx.get("DROPBOX_REFRESH_TOKEN", "")),
+            "has_app_secret": bool(dbx.get("DROPBOX_APP_SECRET", "")),
+        },
+        "s3": {
+            "s3_bucket": s3.get("S3_BUCKET", ""),
+            "s3_prefix": s3.get("S3_PREFIX", ""),
+            "aws_region": s3.get("AWS_REGION", "") or s3.get("AWS_DEFAULT_REGION", ""),
+            "s3_use_default_credential_chain": s3.get("S3_USE_DEFAULT_CREDENTIAL_CHAIN", ""),
+            "has_access_key_id": bool(s3.get("AWS_ACCESS_KEY_ID", "")),
+            "has_secret_access_key": bool(s3.get("AWS_SECRET_ACCESS_KEY", "")),
+            "has_session_token": bool(s3.get("AWS_SESSION_TOKEN", "")),
+        },
+        "azure_blob": {
+            "azure_storage_account_name": az.get("AZURE_STORAGE_ACCOUNT_NAME", ""),
+            "azure_blob_container": az.get("AZURE_BLOB_CONTAINER", ""),
+            "azure_blob_prefix": az.get("AZURE_BLOB_PREFIX", ""),
+            "has_connection_string": bool(az.get("AZURE_STORAGE_CONNECTION_STRING", "")),
+            "has_account_key": bool(az.get("AZURE_STORAGE_ACCOUNT_KEY", "")),
+        },
+        "gcs": {
+            "bucket": gcs.get("GCS_BUCKET", ""),
+            "prefix": gcs.get("GCS_PREFIX", ""),
+            "credentials_path": gcs.get("GCS_CREDENTIALS_PATH", ""),
+            "use_adc": gcs.get("GCS_USE_ADC", "").strip().lower() in ("1", "true", "yes"),
+        },
+        "pinecone": {
+            "pinecone_index_name": pinecone.get("PINECONE_INDEX_NAME", ""),
+            "pinecone_host": pinecone.get("PINECONE_HOST", ""),
+            "has_api_key": bool(pinecone.get("PINECONE_API_KEY", "")),
+        },
+        "milvus": {
+            "milvus_uri": milvus.get("MILVUS_URI", ""),
+            "milvus_db_name": milvus.get("MILVUS_DB_NAME", ""),
+            "milvus_collection_name": milvus.get("MILVUS_COLLECTION_NAME", ""),
+            "has_token": bool(milvus.get("MILVUS_TOKEN", "")),
+        },
+        "weaviate": {
+            "weaviate_url": weaviate.get("WEAVIATE_URL", ""),
+            "weaviate_class_name": weaviate.get("WEAVIATE_CLASS_NAME", ""),
+            "has_api_key": bool(weaviate.get("WEAVIATE_API_KEY", "")),
+        },
+        "qdrant": {
+            "qdrant_url": qdrant.get("QDRANT_URL", ""),
+            "qdrant_collection_name": qdrant.get("QDRANT_COLLECTION_NAME", ""),
+            "has_api_key": bool(qdrant.get("QDRANT_API_KEY", "")),
+        },
+        "elasticsearch": {
+            "elasticsearch_url": elastic.get("ELASTICSEARCH_URL", ""),
+            "elasticsearch_index_name": elastic.get("ELASTICSEARCH_INDEX_NAME", ""),
+            "has_api_key": bool(elastic.get("ELASTICSEARCH_API_KEY", "")),
+        },
+        "azure_ai_search": {
+            "azure_ai_search_endpoint": azure_ai.get("AZURE_AI_SEARCH_ENDPOINT", ""),
+            "azure_ai_search_index_name": azure_ai.get("AZURE_AI_SEARCH_INDEX_NAME", ""),
+            "has_api_key": bool(azure_ai.get("AZURE_AI_SEARCH_API_KEY", "")),
+        },
+    }
+
+
+@app.get("/api/studio/integrations/values")
+async def studio_integrations_values():
+    """Non-secret saved values for rehydrating Studio forms."""
+    return _studio_integrations_form_values()
 
 
 class StudioLiveSyncBody(BaseModel):
