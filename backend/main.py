@@ -382,29 +382,85 @@ AVATAR_VIDEO_API_BASE = os.environ.get("AVATAR_VIDEO_API_BASE", "http://10.29.14
 AVATAR_VIDEO_GENERATE_TIMEOUT_SEC = max(60.0, float(_env_first_int("AVATAR_VIDEO_GENERATE_TIMEOUT_SEC", default=600)))
 AVATAR_VIDEO_JOB_TIMEOUT_SEC = max(30.0, float(_env_first_int("AVATAR_VIDEO_JOB_TIMEOUT_SEC", default=120)))
 _AVATAR_VIDEO_JOB_ID_RE = re.compile(r"^[a-f0-9]{32}$")
-AVATAR_VIDEO_PROMPT = (
+_AVATAR_VIDEO_PROMPT_DEFAULT = (
     "Preserve the exact same person from the source image with identical face structure, eyes, "
     "nose, skin tone, hairstyle, and clothing. Do not change identity or facial features. Apply "
     "only the body motion and camera movement from the reference video. Maintain consistent facial "
-    "appearance across all frames with realistic anatomy, cinematic lighting, and natural motion. copy exact same motion do not add extra motion or anything else. keep smiling face as reference video."
+    "appearance across all frames with realistic anatomy, cinematic lighting, and natural motion. "
+    "copy exact same motion do not add extra motion or anything else. keep smiling face as reference video."
 )
-AVATAR_VIDEO_NEGATIVE_PROMPT = (
+_AVATAR_VIDEO_NEGATIVE_PROMPT_DEFAULT = (
     "different person, face distortion, identity change, different face, mutated face, blurry face, "
     "extra limbs, unrealistic face, deformed anatomy"
 )
-AVATAR_VIDEO_FIXED_FORM: dict[str, str] = {
-    "prompt": AVATAR_VIDEO_PROMPT,
-    "negative_prompt": AVATAR_VIDEO_NEGATIVE_PROMPT,
-    "height": "1280",
-    "width": "768",
-    "num_frames": "240",
-    "frame_rate": "30",
-    "seed": "42",
-    "image_frame_index": "0",
-    "image_strength": "0.9",
-    "control_strength": "0.5",
-    "lora_strength": "0.6",
+
+
+def avatar_video_prompt() -> str:
+    raw = (os.environ.get("AVATAR_VIDEO_PROMPT") or "").strip()
+    return raw or _AVATAR_VIDEO_PROMPT_DEFAULT
+
+
+def avatar_video_negative_prompt() -> str:
+    raw = (os.environ.get("AVATAR_VIDEO_NEGATIVE_PROMPT") or "").strip()
+    return raw or _AVATAR_VIDEO_NEGATIVE_PROMPT_DEFAULT
+
+
+# Portrait output (≈2490∶3840). IC-LoRA requires width and height divisible by 128.
+AVATAR_VIDEO_QUALITY_PRESETS: dict[str, tuple[int, int]] = {
+    "1k": (768, 1280),
+    "2k": (1280, 1920),
+    "4k": (2432, 3840),
 }
+_AVATAR_VIDEO_DIM_ALIGN = 128
+
+
+def _avatar_video_dims_valid(width: int, height: int) -> bool:
+    a = _AVATAR_VIDEO_DIM_ALIGN
+    return width > 0 and height > 0 and width % a == 0 and height % a == 0
+
+
+def avatar_video_quality_presets_public() -> list[dict[str, int | str]]:
+    return [
+        {"id": key, "width": w, "height": h}
+        for key, (w, h) in AVATAR_VIDEO_QUALITY_PRESETS.items()
+    ]
+
+
+def avatar_video_quality_dimensions(quality: str | None = None) -> tuple[str, str]:
+    key = (quality or os.environ.get("AVATAR_VIDEO_QUALITY") or "1k").strip().lower()
+    if key not in AVATAR_VIDEO_QUALITY_PRESETS:
+        key = "1k"
+    width, height = AVATAR_VIDEO_QUALITY_PRESETS[key]
+    if not _avatar_video_dims_valid(width, height):
+        raise RuntimeError(f"Invalid avatar video preset {key}: {width}x{height}")
+    return str(width), str(height)
+
+
+def avatar_video_generate_form(*, quality: str | None = None) -> dict[str, str]:
+    """Form fields for POST {AVATAR_VIDEO_API_BASE}/generate-controlled."""
+    width, height = avatar_video_quality_dimensions(quality)
+    return {
+        "prompt": avatar_video_prompt(),
+        "negative_prompt": avatar_video_negative_prompt(),
+        "height": height,
+        "width": width,
+        "num_frames": (os.environ.get("AVATAR_VIDEO_NUM_FRAMES") or "240").strip() or "240",
+        "frame_rate": (os.environ.get("AVATAR_VIDEO_FRAME_RATE") or "30").strip() or "30",
+        "seed": (os.environ.get("AVATAR_VIDEO_SEED") or "42").strip() or "42",
+        "image_frame_index": (
+            os.environ.get("AVATAR_VIDEO_IMAGE_FRAME_INDEX") or "0"
+        ).strip()
+        or "0",
+        "image_strength": (
+            os.environ.get("AVATAR_VIDEO_IMAGE_STRENGTH") or "0.9"
+        ).strip()
+        or "0.9",
+        "control_strength": (
+            os.environ.get("AVATAR_VIDEO_CONTROL_STRENGTH") or "0.5"
+        ).strip()
+        or "0.5",
+        "lora_strength": (os.environ.get("AVATAR_VIDEO_LORA_STRENGTH") or "0.6").strip() or "0.6",
+    }
 AVATAR_SAMPLE_TEXT = os.environ.get(
     "AVATAR_SAMPLE_TEXT",
     (
@@ -5166,6 +5222,14 @@ async def avatar_config():
             os.environ.get("VOICE_TTS_SPEED") or "0.75"
         ).strip()
         or "0.75",
+        "avatar_video_api_base": AVATAR_VIDEO_API_BASE or None,
+        "avatar_video_prompt": avatar_video_prompt(),
+        "avatar_video_negative_prompt": avatar_video_negative_prompt(),
+        "avatar_video_quality_default": (
+            os.environ.get("AVATAR_VIDEO_QUALITY") or "1k"
+        ).strip().lower()
+        or "1k",
+        "avatar_video_quality_options": avatar_video_quality_presets_public(),
         "selected_avatar_id": get_hologram_selected_avatar_id() or None,
     }
 
@@ -5286,8 +5350,15 @@ def _avatar_video_api_required() -> str:
 async def avatar_video_generate(
     image: UploadFile = File(...),
     reference_video: UploadFile = File(...),
+    quality: str = Form("1k"),
 ):
-    """Forward controlled avatar video generation (fixed prompt/parameters)."""
+    """Forward controlled avatar video generation (prompt/parameters from env + quality preset)."""
+    q = (quality or "1k").strip().lower()
+    if q not in AVATAR_VIDEO_QUALITY_PRESETS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"quality must be one of: {', '.join(AVATAR_VIDEO_QUALITY_PRESETS)}",
+        )
     base = _avatar_video_api_required()
     work = Path(tempfile.mkdtemp(prefix="avatar_video_"))
     try:
@@ -5325,7 +5396,7 @@ async def avatar_video_generate(
                 async with httpx.AsyncClient(timeout=timeout) as client:
                     r = await client.post(
                         f"{base}/generate-controlled",
-                        data=AVATAR_VIDEO_FIXED_FORM,
+                        data=avatar_video_generate_form(quality=q),
                         files=files,
                     )
         except httpx.HTTPError as e:
@@ -5398,6 +5469,8 @@ async def avatar_video_job_video(job_id: str):
         out_headers["content-type"] = v
     if v := r.headers.get("content-disposition"):
         out_headers["content-disposition"] = v
+    else:
+        out_headers["content-disposition"] = f'attachment; filename="{jid}.mp4"'
     return Response(content=r.content, status_code=200, headers=out_headers)
 
 

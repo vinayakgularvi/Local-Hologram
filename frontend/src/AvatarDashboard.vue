@@ -67,6 +67,21 @@ const avatarVideoStatus = ref("");
 const avatarVideoJobId = ref("");
 const avatarVideoJobStatus = ref("");
 const avatarVideoUrl = ref("");
+const downloadAvatarVideoBusy = ref(false);
+const avatarVideoQuality = ref("1k");
+const avatarVideoQualityOptions = ref([
+  { id: "1k", width: 768, height: 1280 },
+  { id: "2k", width: 1280, height: 1920 },
+  { id: "4k", width: 2432, height: 3840 },
+]);
+
+const avatarVideoQualityDimensions = computed(() => {
+  const opt = avatarVideoQualityOptions.value.find(
+    (o) => o.id === avatarVideoQuality.value,
+  );
+  if (!opt) return { width: 768, height: 1280 };
+  return { width: opt.width, height: opt.height };
+});
 
 const hologramAvatarConfigured = ref(false);
 const hologramGeneratedVideoId = ref("gen_video_1");
@@ -388,6 +403,46 @@ function onHologramAvatarSelected(ev) {
   selectedLiveAvatarId.value = String(ev?.detail?.avatarId || getSelectedAvatarId());
 }
 
+async function fetchAvatarVideoBlob() {
+  if (!avatarVideoUrl.value) {
+    throw new Error("No generated video available.");
+  }
+  const res = await fetch(avatarVideoUrl.value);
+  if (!res.ok) throw new Error(`Unable to fetch generated video (${res.status}).`);
+  return res.blob();
+}
+
+function avatarVideoDownloadName() {
+  const jobPart = avatarVideoJobId.value.trim().slice(0, 8) || "output";
+  return `avatar-video-${jobPart}.mp4`;
+}
+
+async function downloadGeneratedAvatarVideo() {
+  if (!avatarVideoUrl.value) {
+    avatarVideoStatus.value = "Generate a video first.";
+    return;
+  }
+  downloadAvatarVideoBusy.value = true;
+  try {
+    const blob = await fetchAvatarVideoBlob();
+    const name = avatarVideoDownloadName();
+    const objectUrl = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = objectUrl;
+    anchor.download = name;
+    anchor.rel = "noopener";
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(objectUrl);
+    avatarVideoStatus.value = `Downloaded ${name}.`;
+  } catch (e) {
+    avatarVideoStatus.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    downloadAvatarVideoBusy.value = false;
+  }
+}
+
 async function uploadHologramGeneratedVideo() {
   if (!avatarVideoSucceeded.value) {
     hologramUploadGeneratedVideoStatus.value = "Wait until generated video status is succeeded.";
@@ -401,14 +456,12 @@ async function uploadHologramGeneratedVideo() {
   hologramUploadGeneratedVideoBusy.value = true;
   hologramUploadGeneratedVideoStatus.value = "Uploading generated video…";
   try {
-    const res = await fetch(avatarVideoUrl.value);
-    if (!res.ok) throw new Error(`Unable to download generated video (${res.status}).`);
-    const blob = await res.blob();
+    const blob = await fetchAvatarVideoBlob();
     const file = new File([blob], `${vid}.mp4`, { type: blob.type || "video/mp4" });
     const fd = new FormData();
     fd.append("file", file);
     fd.append("video_id", vid);
-    const out = await postForm("/api/avatar/hologram/upload/video", fd);
+    await postForm("/api/avatar/hologram/upload/video", fd);
     hologramUploadGeneratedVideoStatus.value = `Saved as "${vid}".`;
   } catch (e) {
     hologramUploadGeneratedVideoStatus.value = e instanceof Error ? e.message : String(e);
@@ -439,6 +492,17 @@ async function loadConfig() {
     const speed = Number.isFinite(speedRaw) ? speedRaw : 0.75;
     voiceTtsSpeed.value = speed;
     activeVoiceTtsSpeed.value = String(speed);
+    if (Array.isArray(data.avatar_video_quality_options) && data.avatar_video_quality_options.length) {
+      avatarVideoQualityOptions.value = data.avatar_video_quality_options.map((o) => ({
+        id: String(o.id || "1k"),
+        width: Number(o.width) || 768,
+        height: Number(o.height) || 1280,
+      }));
+    }
+    const defaultQuality = String(data.avatar_video_quality_default || "1k").trim().toLowerCase();
+    if (avatarVideoQualityOptions.value.some((o) => o.id === defaultQuality)) {
+      avatarVideoQuality.value = defaultQuality;
+    }
   } catch {
     promptText.value = "Please read this script clearly while recording your voice.";
     hologramAvatarConfigured.value = false;
@@ -1528,11 +1592,13 @@ async function startAvatarVideo() {
     const fd = new FormData();
     fd.append("image", avatarVideoImageFile.value);
     fd.append("reference_video", avatarVideoRefFile.value);
+    fd.append("quality", avatarVideoQuality.value);
+    const dims = avatarVideoQualityDimensions.value;
     const out = await postForm("/api/avatar/video/generate", fd);
     avatarVideoJobId.value = String(out.id || "");
     avatarVideoJobStatus.value = String(out.status || "queued");
     avatarVideoStatus.value = avatarVideoJobId.value
-      ? `Job queued (${avatarVideoJobId.value}). Waiting for render…`
+      ? `Job queued (${avatarVideoJobId.value}) at ${avatarVideoQuality.value.toUpperCase()} (${dims.width}×${dims.height}). Waiting for render…`
       : "Job submitted.";
     if (avatarVideoJobId.value) startAvatarVideoPolling();
     else avatarVideoBusy.value = false;
@@ -1625,6 +1691,7 @@ function formatIso(iso) {
               <div class="video-hub-slot">
                 <label class="field field--video-slot">
                   <span>Source image</span>
+                  <span class="field-hint field-hint--inline">2490 × 3840 px</span>
                   <input type="file" accept="image/*" @change="onAvatarVideoImage" />
                 </label>
                 <div
@@ -1644,10 +1711,11 @@ function formatIso(iso) {
               <div class="video-hub-slot">
                 <label class="field field--video-slot">
                   <span>Reference video (motion)</span>
+                  <span class="field-hint field-hint--inline">2490 × 3840 px</span>
                   <input type="file" accept="video/*" @change="onAvatarVideoRef" />
                 </label>
                 <div
-                  class="video-hub-preview"
+                  class="video-hub-preview video-hub-preview--stage"
                   :class="{ 'video-hub-preview--empty': !avatarVideoRefPreview }"
                 >
                   <video
@@ -1663,10 +1731,32 @@ function formatIso(iso) {
               <div class="video-hub-slot">
                 <label class="field field--video-slot">
                   <span>Generated video</span>
+                  <span class="field-hint field-hint--inline">
+                    {{ avatarVideoQualityDimensions.width }} ×
+                    {{ avatarVideoQualityDimensions.height }} px
+                  </span>
                   <span v-if="avatarVideoJobStatus" class="video-hub-slot__status">{{ avatarVideoJobStatus }}</span>
                 </label>
+                <div class="video-quality-picker" role="radiogroup" aria-label="Output quality">
+                  <span class="video-quality-picker__label">Quality</span>
+                  <div class="video-quality-picker__opts">
+                    <button
+                      v-for="opt in avatarVideoQualityOptions"
+                      :key="opt.id"
+                      type="button"
+                      class="video-quality-picker__btn"
+                      :class="{ 'video-quality-picker__btn--active': avatarVideoQuality === opt.id }"
+                      :disabled="avatarVideoBusy"
+                      role="radio"
+                      :aria-checked="avatarVideoQuality === opt.id"
+                      @click="avatarVideoQuality = opt.id"
+                    >
+                      {{ opt.id.toUpperCase() }}
+                    </button>
+                  </div>
+                </div>
                 <div
-                  class="video-hub-preview"
+                  class="video-hub-preview video-hub-preview--stage"
                   :class="{ 'video-hub-preview--empty': !avatarVideoUrl }"
                 >
                   <video
@@ -1678,6 +1768,16 @@ function formatIso(iso) {
                   <span v-else class="video-hub-preview__placeholder">
                     {{ avatarVideoBusy ? "Rendering…" : "Output appears here" }}
                   </span>
+                </div>
+                <div v-if="avatarVideoUrl" class="actions actions--slot">
+                  <button
+                    type="button"
+                    class="btn btn--secondary btn--compact"
+                    :disabled="downloadAvatarVideoBusy"
+                    @click="downloadGeneratedAvatarVideo"
+                  >
+                    {{ downloadAvatarVideoBusy ? "Downloading…" : "Download MP4" }}
+                  </button>
                 </div>
                 <template v-if="avatarVideoSucceeded">
                   <label class="field field--video-slot field--compact">
@@ -1708,16 +1808,6 @@ function formatIso(iso) {
               <button type="button" class="btn" :disabled="avatarVideoBusy" @click="startAvatarVideo">
                 {{ avatarVideoBusy ? "Generating…" : "Generate" }}
               </button>
-              <a
-                v-if="avatarVideoUrl"
-                class="pill pill--link"
-                :href="avatarVideoUrl"
-                download
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                Download MP4
-              </a>
             </div>
             <p v-if="avatarVideoStatus" class="status">{{ avatarVideoStatus }}</p>
           </div>
@@ -4030,6 +4120,65 @@ input[type="number"]:focus {
   font-weight: 600;
 }
 
+.flow-card--video-hub .field-hint--inline {
+  display: block;
+  margin: 0.1rem 0 0;
+  font-size: 0.72rem;
+  font-weight: 500;
+  color: var(--muted);
+}
+
+.video-quality-picker {
+  display: grid;
+  gap: 0.35rem;
+  margin-bottom: 0.35rem;
+}
+
+.video-quality-picker__label {
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #475569;
+}
+
+.video-quality-picker__opts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.35rem;
+}
+
+.video-quality-picker__btn {
+  border: 1px solid rgba(148, 163, 184, 0.55);
+  border-radius: 10px;
+  background: var(--card-solid, #fff);
+  color: var(--ink, #0f172a);
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 700;
+  padding: 0.42rem 0.35rem;
+  cursor: pointer;
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease,
+    color 0.15s ease;
+}
+
+.video-quality-picker__btn:hover:not(:disabled) {
+  border-color: rgba(20, 184, 166, 0.45);
+}
+
+.video-quality-picker__btn--active {
+  border-color: rgba(13, 148, 136, 0.55);
+  background: rgba(13, 148, 136, 0.12);
+  color: #0f766e;
+}
+
+.video-quality-picker__btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .flow-card--video-hub .video-hub-slot__status {
   display: block;
   margin-top: 0.15rem;
@@ -4046,25 +4195,24 @@ input[type="number"]:focus {
 .flow-card--video-hub .video-hub-preview {
   position: relative;
   width: 100%;
-  flex: 1 1 auto;
-  aspect-ratio: 16 / 9;
+  flex: 0 0 auto;
+  aspect-ratio: 2490 / 3840;
   border-radius: 12px;
   overflow: hidden;
   border: 1px solid var(--line);
-  background: rgba(15, 23, 42, 0.06);
+  background: #e4e2e2;
   display: flex;
   align-items: center;
   justify-content: center;
 }
 
 .flow-card--video-hub .video-hub-preview--stage {
-  aspect-ratio: 2490 / 3840;
-  max-width: 12rem;
-  background: #e4e2e2;
+  max-width: 100%;
 }
 
 .flow-card--video-hub .video-hub-preview--stage .video-hub-preview__media {
-  object-fit: contain;
+  object-fit: cover;
+  object-position: center center;
   background: #e4e2e2;
 }
 
@@ -4087,9 +4235,13 @@ input[type="number"]:focus {
   height: 100%;
   max-width: 100%;
   max-height: 100%;
+  object-fit: cover;
+  object-position: center center;
+  background: #e4e2e2;
+}
+
+.flow-card--video-hub .video-hub-preview--stage img.video-hub-preview__media {
   object-fit: contain;
-  object-position: center;
-  background: rgba(15, 23, 42, 0.92);
 }
 
 .flow-card--video-hub .field--compact {
@@ -4101,6 +4253,14 @@ input[type="number"]:focus {
   padding: 0.4rem 0.65rem;
   font-size: 0.78rem;
   margin-bottom: 0.35rem;
+}
+
+.flow-card--video-hub .actions--slot {
+  margin: 0.35rem 0 0.5rem;
+}
+
+.flow-card--video-hub .actions--slot .btn {
+  width: 100%;
 }
 
 .flow-card--video-hub .status--compact {
